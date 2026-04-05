@@ -95,6 +95,7 @@ __device__ unsigned int d_spawn_count = 0;
 
 __global__ void siphonDiskKernel(
     GPUDisk* disk,
+    const uint8_t* __restrict__ in_active_region,
     int N,
     float time,
     float dt,
@@ -102,7 +103,10 @@ __global__ void siphonDiskKernel(
     float global_bias)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N || !particle_active(disk, i)) return;
+    // Step 3: skip passive particles (in_active_region[i] == 0).
+    // The passive kernel owns them. See active_region.cuh for the
+    // threshold-based classification that decides which is which.
+    if (i >= N || !particle_active(disk, i) || !in_active_region[i]) return;
 
     // ========================================================================
     // STEP 1: LOAD PARTICLE STATE (Single Coalesced Read)

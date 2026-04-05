@@ -85,9 +85,9 @@ struct ActiveRegion {
 // compared to siphonDiskKernel. Step 3 may need an acceleration
 // structure if MAX_ACTIVE_REGIONS × N becomes expensive.
 __global__ void computeInActiveRegionMask(
-    const GPUDisk* disk,
-    const ActiveRegion* __restrict__ regions,
-    int num_regions,
+    GPUDisk* disk,                                     // non-const: velocity fix-up writes vel_x/vel_z
+    const ActiveRegion* __restrict__ regions,           // unused in Step 3a threshold path; kept for Step 3c region lifecycle
+    int num_regions,                                    // unused in Step 3a threshold path
     uint8_t* __restrict__ in_active_region,
     int N)
 {
@@ -101,26 +101,53 @@ __global__ void computeInActiveRegionMask(
     }
 
     float px = disk->pos_x[i];
-    float py = disk->pos_y[i];
     float pz = disk->pos_z[i];
 
-    uint8_t inside = 0;
-    for (int r = 0; r < num_regions; r++) {
-        if (regions[r].state != REGION_STATE_ACTIVE) continue;
+    // ================================================================
+    // Step 3b: per-particle threshold classification.
+    // Uses previous frame's pump_residual (one-frame lag, acceptable).
+    // ================================================================
+    float residual = disk->pump_residual[i];
+    float r_cyl_sq = px * px + pz * pz;
+    float r_cyl = sqrtf(r_cyl_sq);
 
-        // Step 2 bounding-box test: gate[0]=min corner, gate[1]=max corner.
-        float3 box_min = regions[r].gate_positions[0];
-        float3 box_max = regions[r].gate_positions[1];
-        bool inside_this =
-            (px >= box_min.x) && (px <= box_max.x) &&
-            (py >= box_min.y) && (py <= box_max.y) &&
-            (pz >= box_min.z) && (pz <= box_max.z);
+    // Force active (siphon owns) if ANY of these hold:
+    //   - |pump_residual| > CORNER_THRESHOLD: dynamic, needs full physics
+    //   - r_cyl near ISCO or at boundary: violent physics / recycle territory
+    //   - ejected: in Aizawa jet, siphon owns entirely
+    //   - pump_history < 0.7: still warming up / newborn (cf. SPAWN_COHERENCE_THRESH in disk.cuh:114)
+    bool force_active = (fabsf(residual) > CORNER_THRESHOLD)
+                     || (r_cyl < PASSIVE_R_MIN)
+                     || (r_cyl > PASSIVE_R_MAX)
+                     || particle_ejected(disk, i)
+                     || (disk->pump_history[i] < 0.7f);
 
-        if (inside_this) {
-            inside = 1;
-            break;
-        }
+    uint8_t new_val = force_active ? 1 : 0;
+    uint8_t old_val = in_active_region[i];  // previous frame's classification
+
+    // Hysteresis: once active, stay active until residual drops well below
+    // threshold. Prevents frame-to-frame oscillation for particles hovering
+    // near CORNER_THRESHOLD. The "stay active" band is [0.5 * threshold, threshold].
+    if (old_val != 0 && !force_active) {
+        if (fabsf(residual) > CORNER_THRESHOLD * 0.5f)
+            new_val = 1;
     }
 
-    in_active_region[i] = inside;
+    // Velocity fix-up on passive→active promotion.
+    // The passive kernel doesn't update vel_x/vel_z (it advances position
+    // azimuthally at fixed radius using Keplerian omega_kep, but leaves
+    // the tangential velocity stale). After K frames of passive advection
+    // the velocity direction is wrong by K*omega_kep*dt radians. Snap to
+    // Keplerian tangential on promotion so siphon gets a consistent state.
+    if (new_val == 1 && old_val == 0) {
+        float inv_r = rsqrtf(r_cyl_sq + 1e-8f);
+        float v_kep = sqrtf(BH_MASS * inv_r);  // Keplerian speed at this radius
+        // Prograde tangent direction in the XZ plane: (-z/r, 0, x/r)
+        float tx = -pz * inv_r;
+        float tz =  px * inv_r;
+        disk->vel_x[i] = tx * v_kep;
+        disk->vel_z[i] = tz * v_kep;
+    }
+
+    in_active_region[i] = new_val;
 }

@@ -2011,6 +2011,7 @@ __global__ void gatherCellForcesToParticles(
     const float* __restrict__ phase_sin,
     const float* __restrict__ phase_cos,
     const uint32_t* __restrict__ particle_cell,
+    const uint8_t* __restrict__ in_active_region,  // Step 3: skip passive particles (may be nullptr if disabled)
     uint32_t N,
     float dt,
     float substrate_k,  // Keplerian substrate coupling (competes with Kuramoto)
@@ -2025,6 +2026,12 @@ __global__ void gatherCellForcesToParticles(
 
     uint32_t cell = particle_cell[i];
     if (cell == UINT32_MAX) return;  // Inactive particle
+
+    // Step 3: passive particles get their physics from advectPassiveParticles.
+    // Applying pressure/vorticity/Kuramoto here would corrupt their velocity
+    // (passive kernel advances pos azimuthally but doesn't rewrite vel_x/vel_z,
+    // so gather increments to stale velocity would cause unbounded divergence).
+    if (in_active_region && !in_active_region[i]) return;
 
     // O(1) direct read — no binary search!
     float press_x = pressure_x[cell];
@@ -2875,6 +2882,7 @@ __global__ void applyPressureVorticityKernel(
     uint32_t hash_mask,
     uint32_t num_leaves,
     uint32_t num_active,
+    const uint8_t* __restrict__ in_active_region,  // Step 3: skip passive particles
     float dt,
     float pressure_k,    // Pressure coefficient (~0.03)
     float vorticity_k    // Vorticity coefficient (~0.01)
@@ -2884,6 +2892,8 @@ __global__ void applyPressureVorticityKernel(
 
     uint32_t orig_idx = particle_ids[sorted_idx];
     if (!particle_active(disk, orig_idx)) return;
+    // Step 3: passive particles get physics from advectPassiveParticles.
+    if (in_active_region && !in_active_region[orig_idx]) return;
 
     uint64_t my_key = morton_keys[sorted_idx];
 
@@ -4969,7 +4979,7 @@ int main(int argc, char** argv) {
                 d_in_active_region, N_current);
 #endif
 
-            siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
+            siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, d_in_active_region, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
 
 #if ENABLE_PASSIVE_ADVECTION
             advectPassiveParticles<<<spawn_blocks, threads>>>(
@@ -5209,6 +5219,7 @@ int main(int argc, char** argv) {
                     h_leaf_hash_size - 1, // Hash mask
                     h_leaf_node_count,
                     h_num_active,
+                    d_in_active_region,   // Step 3: skip passive particles
                     dt_sim,
                     pressure_k,
                     vorticity_k
@@ -5563,12 +5574,13 @@ int main(int argc, char** argv) {
                             g_kuramoto_k, g_n12_envelope ? 1 : 0, g_envelope_scale
                         );
                     } else {
-                        // Full gather to all particles
+                        // Full gather to all particles (Step 3: passive particles skipped inside kernel)
                         gatherCellForcesToParticles<<<blocks, threads>>>(
                             d_disk, d_grid_density, d_grid_pressure_x, d_grid_pressure_y, d_grid_pressure_z,
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
                             d_grid_phase_sin, d_grid_phase_cos,
-                            d_particle_cell, N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
+                            d_particle_cell, d_in_active_region,
+                            N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
                             g_kuramoto_k, g_n12_envelope ? 1 : 0, g_envelope_scale
                         );
                     }
@@ -5650,6 +5662,7 @@ int main(int argc, char** argv) {
                     }
 
                     // Pass 3: Gather cell forces to particles (every frame, O(1) lookup)
+                    // Step 3: passive particles skipped inside kernel via in_active_region check.
                     float shear_rho_ref_cadence = (float)N / (float)GRID_CELLS * 8.0f;
                     gatherCellForcesToParticles<<<blocks, threads>>>(
                         d_disk,
@@ -5663,6 +5676,7 @@ int main(int argc, char** argv) {
                         d_grid_phase_sin,
                         d_grid_phase_cos,
                         d_particle_cell,
+                        d_in_active_region,
                         N,
                         dt_sim,
                         substrate_k,
