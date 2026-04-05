@@ -670,6 +670,14 @@ __global__ void spawnParticlesKernel(
     disk->pump_history[new_idx] = history * 0.3f;  // Inherit 30% of parent's history
     disk->jet_phase[new_idx] = disk->jet_phase[i];  // Inherit parent's phase coherence
 
+    // Kuramoto state: child inherits parent's theta + random offset, same ω
+    // (keeps children loosely phase-coupled to parent, lets drift decorrelate)
+    rng = rng * 1664525u + 1013904223u;
+    float theta_offset = ((float)(rng & 0xFFFF) / 65536.0f) * 6.28318f;
+    float parent_theta = disk->theta[i];
+    disk->theta[new_idx] = fmodf(parent_theta + theta_offset, 6.28318f);
+    disk->omega_nat[new_idx] = disk->omega_nat[i];
+
     // Activate the new particle
     disk->ejected[new_idx] = false;
     disk->active[new_idx] = true;
@@ -2101,11 +2109,12 @@ __global__ void gatherCellForcesToParticles(
     disk->vel_z[i] = vz;
 
     // === KURAMOTO PHASE UPDATE (math.md Step 8, Step 10, Step 11) ===
-    // Free-running natural frequency + mean-field coupling to the cell's
-    // averaged phase (read from grid phase_sin/phase_cos fields).
-    //   dθ/dt = ω_i + K_local · sin(θ_cell − θ_i)
-    // K_local is modulated by the N12 envelope (math.md Step 11), which
-    // has natural period LCM(3,4) = 12 derived from the theta mixer.
+    // Classical Kuramoto mean-field coupling via the grid phase_sin/cos:
+    //   dθ/dt = ω_i + K · envelope · R_local · sin(θ_cell − θ_i)
+    // The R_local · sin(Δθ) factor comes for free from the cell-averaged
+    // phase sums because (mean_sin · cos θ_i − mean_cos · sin θ_i) already
+    // has magnitude R_local = |⟨e^{iθ}⟩|. The N12 envelope (math.md Step 11,
+    // period LCM(3,4) = 12) modulates coupling strength.
     {
         float theta_i = disk->theta[i];
         float omega_i = disk->omega_nat[i];
@@ -2119,13 +2128,10 @@ __global__ void gatherCellForcesToParticles(
                 float inv_rho = 1.0f / rho_cell;
                 float mean_sin = ps * inv_rho;  // ⟨sin θ⟩ over cell
                 float mean_cos = pc * inv_rho;  // ⟨cos θ⟩ over cell
-                // sin(θ_cell − θ_i) = mean_sin · cos(θ_i) − mean_cos · sin(θ_i)
+                // coupling = R_local · sin(θ_cell − θ_i)
                 float sin_i = cuda_lut_sin(theta_i);
                 float cos_i = cuda_lut_cos(theta_i);
                 float coupling = mean_sin * cos_i - mean_cos * sin_i;
-
-                // R_local = |⟨e^{iθ}⟩|, measures how coherent this cell is
-                float R_local = sqrtf(mean_sin * mean_sin + mean_cos * mean_cos);
 
                 // N12 envelope: 0.5 + 0.5·cos(3θ)·cos(4θ), period LCM(3,4)=12
                 float envelope = 1.0f;
@@ -2135,7 +2141,7 @@ __global__ void gatherCellForcesToParticles(
                     envelope = 0.5f + 0.5f * c3 * c4;
                 }
 
-                dtheta += kuramoto_k * R_local * envelope * coupling;
+                dtheta += kuramoto_k * envelope * coupling;
             }
         }
 
@@ -2145,6 +2151,84 @@ __global__ void gatherCellForcesToParticles(
         if (theta_i < 0.0f) theta_i += TWO_PI;
         disk->theta[i] = theta_i;
     }
+}
+
+// ============================================================================
+// PER-CELL KURAMOTO ORDER PARAMETER
+// ============================================================================
+// Computes R_cell = |⟨e^{iθ}⟩| per grid cell from the accumulated
+// phase_sin/phase_cos/density fields. Unlike the global R, this exposes
+// spatial structure: chimera states (coherent + incoherent coexisting),
+// traveling coherence packets, radial coherence waves, and localized
+// destabilization events. Nearly free — one sqrt + two mul + one div per cell.
+
+__global__ void computeRcell(
+    const float* __restrict__ density,
+    const float* __restrict__ phase_sin,
+    const float* __restrict__ phase_cos,
+    float* __restrict__ R_cell,
+    int n_cells
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_cells) return;
+
+    float rho = density[idx];
+    if (rho < 1e-6f) {
+        R_cell[idx] = 0.0f;
+        return;
+    }
+    float inv_rho = 1.0f / rho;
+    float s = phase_sin[idx] * inv_rho;
+    float c = phase_cos[idx] * inv_rho;
+    R_cell[idx] = sqrtf(s * s + c * c);
+}
+
+// Radial profile reduction: bins cells by distance from grid center.
+// Finite-sample bias: R_cell for low-density cells is dominated by 1/√ρ
+// noise, not real coherence. We correct by subtracting the expected noise
+// floor (√(1/ρ) for ρ particles) and clamping to [0, 1]. Only cells with
+// ρ ≥ MIN_RHO contribute to avoid noise domination entirely.
+__global__ void reduceRcellRadialProfile(
+    const float* __restrict__ R_cell,
+    const float* __restrict__ density,
+    int grid_dim,
+    int n_bins,
+    float grid_cell_size,
+    float* __restrict__ bin_R_sum,       // [n_bins] sum of bias-corrected R * density
+    float* __restrict__ bin_weight_sum,  // [n_bins] sum of density (dense cells only)
+    float* __restrict__ bin_cell_count   // [n_bins] count of dense cells (for diagnostics)
+) {
+    int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    int n_cells = grid_dim * grid_dim * grid_dim;
+    if (cell >= n_cells) return;
+
+    float rho = density[cell];
+    const float MIN_RHO = 10.0f;  // Reject noise-dominated cells
+    if (rho < MIN_RHO) return;
+
+    // Cell coords (grid-center origin)
+    int cx = cell % grid_dim;
+    int cy = (cell / grid_dim) % grid_dim;
+    int cz = cell / (grid_dim * grid_dim);
+    float fx = ((float)cx - 0.5f * (float)grid_dim) * grid_cell_size;
+    float fy = ((float)cy - 0.5f * (float)grid_dim) * grid_cell_size;
+    float fz = ((float)cz - 0.5f * (float)grid_dim) * grid_cell_size;
+    float r = sqrtf(fx * fx + fy * fy + fz * fz);
+
+    float r_max = 0.5f * grid_dim * grid_cell_size;
+    int bin = (int)(r / r_max * n_bins);
+    if (bin < 0) bin = 0;
+    if (bin >= n_bins) bin = n_bins - 1;
+
+    // Bias-corrected R: subtract noise floor 1/√ρ, clamp ≥ 0
+    float R = R_cell[cell];
+    float noise_floor = rsqrtf(rho);
+    float R_corrected = R - noise_floor;
+    if (R_corrected < 0.0f) R_corrected = 0.0f;
+
+    atomicAdd(&bin_R_sum[bin], R_corrected * rho);
+    atomicAdd(&bin_weight_sum[bin], rho);
+    atomicAdd(&bin_cell_count[bin], 1.0f);
 }
 
 // ============================================================================
@@ -2286,7 +2370,7 @@ __global__ void scatterActiveParticles(
     atomicAdd(&momentum_y[cell], disk->vel_y[i]);
     atomicAdd(&momentum_z[cell], disk->vel_z[i]);
 
-    float phase = disk->pump_residual[i] * 6.28318f;
+    float phase = disk->theta[i];
     atomicAdd(&phase_sin[cell], cuda_lut_sin(phase));
     atomicAdd(&phase_cos[cell], cuda_lut_cos(phase));
 }
@@ -2446,14 +2530,13 @@ __global__ void gatherToActiveParticles(
                 float sin_i = cuda_lut_sin(theta_i);
                 float cos_i = cuda_lut_cos(theta_i);
                 float coupling = mean_sin * cos_i - mean_cos * sin_i;
-                float R_local = sqrtf(mean_sin * mean_sin + mean_cos * mean_cos);
                 float envelope = 1.0f;
                 if (use_n12) {
                     float c3 = cuda_lut_cos(3.0f * theta_i);
                     float c4 = cuda_lut_cos(4.0f * theta_i);
                     envelope = 0.5f + 0.5f * c3 * c4;
                 }
-                dtheta += kuramoto_k * R_local * envelope * coupling;
+                dtheta += kuramoto_k * envelope * coupling;
             }
         }
 
@@ -2532,7 +2615,7 @@ __global__ void scatterWithTileFlags(
     atomicAdd(&momentum_z[cell], disk->vel_z[i] * alpha);
 
     // Phase: encode as sin/cos for proper averaging
-    float phase = disk->pump_residual[i] * 6.28318f;
+    float phase = disk->theta[i];
     atomicAdd(&phase_sin[cell], cuda_lut_sin(phase) * alpha);
     atomicAdd(&phase_cos[cell], cuda_lut_cos(phase) * alpha);
 
@@ -3344,6 +3427,9 @@ float g_omega_base = 1.0f;        // Mean natural frequency ω₀
 float g_omega_spread = 0.05f;     // Gaussian std-dev σ for ω distribution
 bool  g_n12_envelope = true;      // Apply N12 mixer envelope to coupling (math.md Step 11)
 
+// Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
+int g_r_export_interval = 0;
+
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
 #define ARM_WIDTH_DEG 45.0f         // Width of each arm in degrees
 #define ARM_TRAP_STRENGTH 0.15f     // Angular momentum barrier strength
@@ -3596,6 +3682,11 @@ int main(int argc, char** argv) {
             g_n12_envelope = false;
             printf("[kuramoto] N12 envelope DISABLED (constant K)\n");
         }
+        else if (strcmp(argv[i], "--r-export-interval") == 0 && i+1 < argc) {
+            extern int g_r_export_interval;
+            g_r_export_interval = atoi(argv[++i]);
+            printf("[kuramoto] Per-cell R export every %d frames\n", g_r_export_interval);
+        }
         else if (strcmp(argv[i], "--headless") == 0) {
             extern bool g_headless;
             g_headless = true;
@@ -3706,6 +3797,7 @@ int main(int argc, char** argv) {
             printf("  --omega-base <ω₀>  Mean natural frequency (default 1.0)\n");
             printf("  --omega-spread <σ> Gaussian σ for ω distribution (default 0.05; K_c ≈ 2σ/π)\n");
             printf("  --no-n12           Disable N12 mixer envelope on Kuramoto coupling\n");
+            printf("  --r-export-interval <N>  Dump per-cell R grid to r_export/frame_NNNNN.bin every N frames (0=off)\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -4199,6 +4291,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < N; i++) if (h_active[i]) active_count++;
     printf("[lattice] %d particles initialized in %.0f×%.0f×%.0f box (active=%d)\n",
            N, box_half*2, box_height*2, box_half*2, active_count);
+    printf("[kuramoto-init] theta uniform[0,2π), omega_nat ~ N(%.2f, %.2f)\n",
+           g_omega_base, g_omega_spread);
 
     // GPU allocation
     GPUDisk* d_disk;
@@ -4437,7 +4531,17 @@ int main(int argc, char** argv) {
     float* d_grid_vorticity_x = nullptr;
     float* d_grid_vorticity_y = nullptr;
     float* d_grid_vorticity_z = nullptr;
+    float* d_grid_R_cell = nullptr;      // per-cell Kuramoto order parameter
     uint32_t* d_particle_cell = nullptr;
+
+    // Radial profile of R_cell — 16 bins from center to box edge
+    const int RC_RADIAL_BINS = 16;
+    float* d_rc_bin_R = nullptr;
+    float* d_rc_bin_W = nullptr;
+    float* d_rc_bin_N = nullptr;  // cell count per bin
+    std::vector<float> h_rc_bin_R(RC_RADIAL_BINS);
+    std::vector<float> h_rc_bin_W(RC_RADIAL_BINS);
+    std::vector<float> h_rc_bin_N(RC_RADIAL_BINS);
 
     if (g_grid_physics) {
         size_t cell_array_size = GRID_CELLS * sizeof(float);
@@ -4460,6 +4564,12 @@ int main(int argc, char** argv) {
         cudaMalloc(&d_grid_vorticity_x, cell_array_size);
         cudaMalloc(&d_grid_vorticity_y, cell_array_size);
         cudaMalloc(&d_grid_vorticity_z, cell_array_size);
+
+        // Per-cell Kuramoto order parameter and radial profile bins
+        cudaMalloc(&d_grid_R_cell, cell_array_size);
+        cudaMalloc(&d_rc_bin_R, RC_RADIAL_BINS * sizeof(float));
+        cudaMalloc(&d_rc_bin_W, RC_RADIAL_BINS * sizeof(float));
+        cudaMalloc(&d_rc_bin_N, RC_RADIAL_BINS * sizeof(float));
 
         // Per-particle cell assignment
         cudaMalloc(&d_particle_cell, particle_cell_size);
@@ -5766,13 +5876,70 @@ int main(int argc, char** argv) {
                 R_global_cached = (float)sqrt(mean_sin * mean_sin + mean_cos * mean_cos);
             }
 
+            // === Compute per-cell R and radial profile ===
+            float r_inner = 0.0f, r_mid = 0.0f, r_outer = 0.0f;
+            if (g_grid_physics && d_grid_R_cell != nullptr) {
+                int cell_blocks = (GRID_CELLS + 255) / 256;
+                computeRcell<<<cell_blocks, 256>>>(
+                    d_grid_density, d_grid_phase_sin, d_grid_phase_cos,
+                    d_grid_R_cell, GRID_CELLS);
+
+                // Radial profile: 16 bins from center to edge, noise-floor corrected
+                cudaMemsetAsync(d_rc_bin_R, 0, RC_RADIAL_BINS * sizeof(float));
+                cudaMemsetAsync(d_rc_bin_W, 0, RC_RADIAL_BINS * sizeof(float));
+                cudaMemsetAsync(d_rc_bin_N, 0, RC_RADIAL_BINS * sizeof(float));
+                reduceRcellRadialProfile<<<cell_blocks, 256>>>(
+                    d_grid_R_cell, d_grid_density,
+                    g_grid_dim, RC_RADIAL_BINS, g_grid_cell_size,
+                    d_rc_bin_R, d_rc_bin_W, d_rc_bin_N);
+                cudaMemcpy(h_rc_bin_R.data(), d_rc_bin_R, RC_RADIAL_BINS * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_rc_bin_W.data(), d_rc_bin_W, RC_RADIAL_BINS * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_rc_bin_N.data(), d_rc_bin_N, RC_RADIAL_BINS * sizeof(float), cudaMemcpyDeviceToHost);
+
+                // Collapse 16 bins into 3 zones (inner / mid / outer) for printing
+                float sum_R[3] = {0.0f, 0.0f, 0.0f};
+                float sum_W[3] = {0.0f, 0.0f, 0.0f};
+                for (int b = 0; b < RC_RADIAL_BINS; b++) {
+                    int zone = (b < 6) ? 0 : (b < 12) ? 1 : 2;
+                    sum_R[zone] += h_rc_bin_R[b];
+                    sum_W[zone] += h_rc_bin_W[b];
+                }
+                r_inner = (sum_W[0] > 0.0f) ? sum_R[0] / sum_W[0] : 0.0f;
+                r_mid   = (sum_W[1] > 0.0f) ? sum_R[1] / sum_W[1] : 0.0f;
+                r_outer = (sum_W[2] > 0.0f) ? sum_R[2] / sum_W[2] : 0.0f;
+
+                // Optional: dump full R_cell grid to disk for offline analysis
+                if (g_r_export_interval > 0 && (frame % g_r_export_interval == 0)) {
+                    system("mkdir -p r_export");
+                    char fname[256];
+                    snprintf(fname, sizeof(fname), "r_export/frame_%05d.bin", frame);
+                    std::vector<float> h_R(GRID_CELLS);
+                    cudaMemcpy(h_R.data(), d_grid_R_cell, GRID_CELLS * sizeof(float), cudaMemcpyDeviceToHost);
+                    FILE* fp = fopen(fname, "wb");
+                    if (fp) {
+                        // Header: grid_dim (int), grid_cell_size (float), frame (int), 4 bytes pad
+                        int hdr_dim = g_grid_dim;
+                        float hdr_cell = g_grid_cell_size;
+                        int hdr_frame = frame;
+                        int hdr_pad = 0;
+                        fwrite(&hdr_dim, sizeof(int), 1, fp);
+                        fwrite(&hdr_cell, sizeof(float), 1, fp);
+                        fwrite(&hdr_frame, sizeof(int), 1, fp);
+                        fwrite(&hdr_pad, sizeof(int), 1, fp);
+                        fwrite(h_R.data(), sizeof(float), GRID_CELLS, fp);
+                        fclose(fp);
+                        printf("[r-export] Wrote %s (%.1f MB)\n", fname, GRID_CELLS * sizeof(float) / 1.0e6);
+                    }
+                }
+            }
+
             printf("[frame %5d] fps=%.0f | particles=%d "
-            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f",
+            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f [%.3f/%.3f/%.3f]",
                    frame, fps_acc > 0 ? fps_frames / fps_acc : 0.0,
                    N_current,
                    h_sample_metrics->avg_scale, h_sample_metrics->avg_scale,
                    pump_bridge.avg_scale, pump_bridge.avg_residual, pump_bridge.heartbeat,
-                   R_global_cached);
+                   R_global_cached, r_inner, r_mid, r_outer);
 
 #ifdef VULKAN_INTEROP
             // Show hybrid LOD stats (visible particle count and culling percentage)
