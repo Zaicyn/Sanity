@@ -3652,7 +3652,13 @@ struct ActiveParticleState {
     static constexpr int REBAKE_INTERVAL = 256;         // Re-bake static grid periodically
 };
 ActiveParticleState g_active_particles = {};
-bool g_active_compaction = true;  // Enable active particle compaction by default
+#if ENABLE_PASSIVE_ADVECTION
+bool g_active_compaction = false;  // Step 3: passive kernel replaces scatter-skip optimization.
+                                   // The baked static grid would go stale because passive particles
+                                   // move azimuthally. Siphon-skip savings dwarf scatter-skip savings.
+#else
+bool g_active_compaction = true;   // Pre-passive: active particle compaction for scatter optimization.
+#endif
 
 // ============================================================================
 // Seam Drift Tracking - Time-Resolved m=3 Phase Logging
