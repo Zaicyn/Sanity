@@ -1967,10 +1967,14 @@ __global__ void gatherCellForcesToParticles(
     const float* __restrict__ vorticity_x,
     const float* __restrict__ vorticity_y,
     const float* __restrict__ vorticity_z,
+    const float* __restrict__ phase_sin,
+    const float* __restrict__ phase_cos,
     const uint32_t* __restrict__ particle_cell,
     uint32_t N,
     float dt,
-    float substrate_k  // Keplerian substrate coupling (competes with Kuramoto)
+    float substrate_k,  // Keplerian substrate coupling (competes with Kuramoto)
+    float shear_k,      // Phase-misalignment shear (non-monotonic magnetic friction)
+    float rho_ref       // Reference density for shear normalization (mean × 8)
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -2018,6 +2022,57 @@ __global__ void gatherCellForcesToParticles(
         vx += cross_x * omega_mag * dt;
         vy += cross_y * omega_mag * dt;
         vz += cross_z * omega_mag * dt;
+    }
+
+    // === FRICTIONAL SHEAR — DENSITY × ANGULAR HYBRID ===
+    // Gu/Lüders/Bechinger arXiv:2602.11526v1 continuum analog.
+    //   effective_k = shear_k × rho_factor × angular_profile
+    //
+    // rho_factor ∈ [0, 2]: density-weighting (Gemini) — only particles inside
+    //   dense shell regions feel friction; inter-shell vacuum stays superfluid.
+    //   Scale-invariant: rho_ref is passed from host as mean_density × 8.
+    //
+    // angular_profile = |sin(2φ)| where φ = atan2(|v_θ − v_Kep|, |v_r|)
+    //   (Deepseek's non-monotonic profile) — friction vanishes for pure
+    //   circular orbits (φ=0) AND pure radial infall (φ=90°), peaks at 45°
+    //   where motion is mixed. This recovers the paper's hysteretic
+    //   non-monotonic behavior using a signal that stays nonzero in steady
+    //   state: v_r and v_θ − v_Kep are both small but nonzero everywhere.
+    //
+    // Combined: friction only inside shells AND only where motion is shear-mixed.
+    if (shear_k > 0.0f) {
+        float rho_cell = density[cell];
+        float rho_factor = rho_cell / rho_ref;
+        if (rho_factor > 2.0f) rho_factor = 2.0f;
+
+        if (rho_factor > 0.0f) {
+            float r2 = pos_x * pos_x + pos_z * pos_z + 1e-6f;
+            float inv_r = rsqrtf(r2);
+            float r_cyl = r2 * inv_r;
+            float rx_hat = pos_x * inv_r;
+            float rz_hat = pos_z * inv_r;
+            float tx_kep = -rz_hat;  // prograde tangent in XZ
+            float tz_kep =  rx_hat;
+
+            float v_theta = vx * tx_kep + vz * tz_kep;
+            float v_r = vx * rx_hat + vz * rz_hat;
+
+            // Keplerian orbital speed at this radius: v_K = √(M/r)
+            float v_kep = (r_cyl > ISCO_R * 0.5f) ? sqrtf(BH_MASS * inv_r) : 0.0f;
+            float dv_tan = fabsf(v_theta - v_kep);
+            float abs_vr = fabsf(v_r);
+
+            // Angular profile: sin(2φ) = 2 sin(φ) cos(φ) = 2·dv_tan·|v_r|/(dv_tan² + v_r²)
+            // Computed directly from components, no atan2 needed.
+            float denom = dv_tan * dv_tan + abs_vr * abs_vr + 1e-8f;
+            float angular_profile = 2.0f * dv_tan * abs_vr / denom;  // ∈ [0, 1]
+
+            float drag = shear_k * rho_factor * angular_profile * dt;
+            if (drag > 0.5f) drag = 0.5f;  // stability clamp
+            float dv = v_theta * drag;
+            vx -= dv * tx_kep;
+            vz -= dv * tz_kep;
+        }
     }
 
     // === KEPLERIAN SUBSTRATE TORQUE (Competing Interaction) ===
@@ -2174,11 +2229,15 @@ __global__ void gatherToActiveParticles(
     const float* __restrict__ vorticity_x,
     const float* __restrict__ vorticity_y,
     const float* __restrict__ vorticity_z,
+    const float* __restrict__ phase_sin,
+    const float* __restrict__ phase_cos,
     const uint32_t* __restrict__ particle_cell,
     const uint32_t* __restrict__ active_list,
     uint32_t active_count,
     float dt,
-    float substrate_k
+    float substrate_k,
+    float shear_k,
+    float rho_ref
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= active_count) return;
@@ -2217,6 +2276,35 @@ __global__ void gatherToActiveParticles(
         vx += cross_x * omega_mag * dt;
         vy += cross_y * omega_mag * dt;
         vz += cross_z * omega_mag * dt;
+    }
+
+    // === FRICTIONAL SHEAR — DENSITY × ANGULAR HYBRID (see gatherCellForcesToParticles) ===
+    if (shear_k > 0.0f) {
+        float rho_cell = density[cell];
+        float rho_factor = rho_cell / rho_ref;
+        if (rho_factor > 2.0f) rho_factor = 2.0f;
+
+        if (rho_factor > 0.0f) {
+            float r2 = pos_x * pos_x + pos_z * pos_z + 1e-6f;
+            float inv_r = rsqrtf(r2);
+            float r_cyl = r2 * inv_r;
+            float rx_hat = pos_x * inv_r;
+            float rz_hat = pos_z * inv_r;
+            float tx_kep = -rz_hat;
+            float tz_kep =  rx_hat;
+            float v_theta = vx * tx_kep + vz * tz_kep;
+            float v_r = vx * rx_hat + vz * rz_hat;
+            float v_kep = (r_cyl > ISCO_R * 0.5f) ? sqrtf(BH_MASS * inv_r) : 0.0f;
+            float dv_tan = fabsf(v_theta - v_kep);
+            float abs_vr = fabsf(v_r);
+            float denom = dv_tan * dv_tan + abs_vr * abs_vr + 1e-8f;
+            float angular_profile = 2.0f * dv_tan * abs_vr / denom;
+            float drag = shear_k * rho_factor * angular_profile * dt;
+            if (drag > 0.5f) drag = 0.5f;
+            float dv = v_theta * drag;
+            vx -= dv * tx_kep;
+            vz -= dv * tz_kep;
+        }
     }
 
     if (substrate_k > 0.0f) {
@@ -3098,6 +3186,12 @@ bool g_use_hopfion_topology = true;
 bool g_enable_arms = false;         // Enable/disable arm structure (off by default, use --discrete-arms or --smooth-arms)
 bool g_use_arm_topology = true;     // true = discrete, false = smooth
 
+// Phase-misalignment shear (non-monotonic magnetic friction analog)
+// Based on Gu/Lüders/Bechinger arXiv:2602.11526v1 — friction peaks in the
+// competing regime where FM and AFM phase orderings frustrate each other.
+// Drives collapse in turbulent/frustrated regions, leaves locked shells alone.
+float g_shear_k = 0.0f;
+
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
 #define ARM_WIDTH_DEG 45.0f         // Width of each arm in degrees
 #define ARM_TRAP_STRENGTH 0.15f     // Angular momentum barrier strength
@@ -3325,6 +3419,11 @@ int main(int argc, char** argv) {
             extern bool g_enable_arms;
             g_enable_arms = false;
         }
+        else if (strcmp(argv[i], "--shear-k") == 0 && i+1 < argc) {
+            extern float g_shear_k;
+            g_shear_k = (float)atof(argv[++i]);
+            printf("[shear] Phase-misalignment shear coefficient: %.4f\n", g_shear_k);
+        }
         else if (strcmp(argv[i], "--headless") == 0) {
             extern bool g_headless;
             g_headless = true;
@@ -3430,6 +3529,7 @@ int main(int argc, char** argv) {
             printf("  --smooth-arms      Start with smooth arm density waves\n");
             printf("  --no-arm-topology  Alias for --smooth-arms\n");
             printf("  --no-arms          Disable spiral arm structure entirely\n");
+            printf("  --shear-k <k>      Frictional shear: density × sin(2φ) hybrid (default 0, try 2-10; scale-invariant)\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -4912,6 +5012,10 @@ int main(int argc, char** argv) {
                     bool skip_gather = use_active_gather && (gather_phase & 1);
                     gather_phase++;
 
+                    // Scale-invariant reference density for shear weighting:
+                    // mean density × 8 (shells are ~8× denser than grid average)
+                    float shear_rho_ref = (float)N_current / (float)GRID_CELLS * 8.0f;
+
                     if (skip_gather) {
                         // Skip gather this frame - particles extrapolate from last frame's forces
                         // (Static counter to log occasionally)
@@ -4926,15 +5030,17 @@ int main(int argc, char** argv) {
                             d_disk, d_grid_density,
                             d_grid_pressure_x, d_grid_pressure_y, d_grid_pressure_z,
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
+                            d_grid_phase_sin, d_grid_phase_cos,
                             d_particle_cell, g_active_particles.d_active_list,
-                            g_active_particles.h_active_count, dt_sim, substrate_k
+                            g_active_particles.h_active_count, dt_sim, substrate_k, g_shear_k, shear_rho_ref
                         );
                     } else {
                         // Full gather to all particles
                         gatherCellForcesToParticles<<<blocks, threads>>>(
                             d_disk, d_grid_density, d_grid_pressure_x, d_grid_pressure_y, d_grid_pressure_z,
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
-                            d_particle_cell, N_current, dt_sim, substrate_k
+                            d_grid_phase_sin, d_grid_phase_cos,
+                            d_particle_cell, N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref
                         );
                     }
                     cudaEventRecord(e_gather_end);
@@ -5015,6 +5121,7 @@ int main(int argc, char** argv) {
                     }
 
                     // Pass 3: Gather cell forces to particles (every frame, O(1) lookup)
+                    float shear_rho_ref_cadence = (float)N / (float)GRID_CELLS * 8.0f;
                     gatherCellForcesToParticles<<<blocks, threads>>>(
                         d_disk,
                         d_grid_density,
@@ -5024,10 +5131,14 @@ int main(int argc, char** argv) {
                         d_grid_vorticity_x,
                         d_grid_vorticity_y,
                         d_grid_vorticity_z,
+                        d_grid_phase_sin,
+                        d_grid_phase_cos,
                         d_particle_cell,
                         N,
                         dt_sim,
-                        substrate_k
+                        substrate_k,
+                        g_shear_k,
+                        shear_rho_ref_cadence
                     );
 
                     // Debug stats every 900 frames
