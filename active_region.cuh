@@ -42,6 +42,15 @@
 #define MAX_ACTIVE_REGIONS 64
 #endif
 
+// Per-particle pump_residual threshold for active/passive classification.
+// Particles with |pump_residual| > CORNER_THRESHOLD need full siphon
+// physics. Particles below threshold are "settled" and use the cheap
+// Keplerian advection kernel. Step 4 runtime candidate — tune empirically
+// from headless sweep data before wiring to a CLI flag or keybinding.
+#ifndef CORNER_THRESHOLD
+#define CORNER_THRESHOLD 0.15f
+#endif
+
 // State machine for an active region's lifecycle. Step 2 only uses
 // UNUSED and ACTIVE; the intermediate states are reserved for Step 3.
 #define REGION_STATE_UNUSED      0

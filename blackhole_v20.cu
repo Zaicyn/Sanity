@@ -4953,28 +4953,25 @@ int main(int argc, char** argv) {
 
             // Use dynamic particle count (N_current grows via spawning)
             int spawn_blocks = (N_current + threads - 1) / threads;
-            siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
 
 #if ENABLE_PASSIVE_ADVECTION
-            // Tree Architecture Step 2: passive/active region dispatch.
-            // 1. computeInActiveRegionMask writes in_active_region[i] = 1
-            //    if particle i is inside any ACTIVE region, else 0. In
-            //    Step 2 the bootstrap region covers the whole simulation,
-            //    so every alive particle is marked 1.
-            // 2. advectPassiveParticles processes particles with mask == 0.
-            //    In Step 2 this set is empty, so the kernel does no writes.
-            // ORDERING: siphonDiskKernel launched above, then mask, then
-            // passive advect. Default-stream serialization ensures the
-            // sequence is consistent with the subsequent scatter/gather
-            // pipeline that reads disk->pos_* via d_particle_cell.
-            // INVARIANT: for every particle, exactly one of siphon or
-            // passive does a position/theta write per frame. Step 2
-            // enforces this trivially (passive early-returns everywhere).
-            // Step 3 will enforce it by adding `|| in_active_region[i]`
-            // to siphonDiskKernel's entry guard (physics.cu:105).
+            // Tree Architecture Step 3 dispatch ordering:
+            // 1. computeInActiveRegionMask reads PREVIOUS frame's pump_residual
+            //    to classify particles as active (siphon) or passive (advect).
+            //    The one-frame lag is acceptable — pump_residual changes slowly.
+            // 2. siphonDiskKernel reads the mask and skips passive particles.
+            // 3. advectPassiveParticles reads the mask and processes passive ones.
+            // INVARIANT: for every alive particle, exactly one of siphon or
+            // passive does position/theta writes per frame. Both kernels'
+            // early-return conditions are mutually exclusive on in_active_region.
             computeInActiveRegionMask<<<spawn_blocks, threads>>>(
                 d_disk, d_active_regions, h_num_active_regions,
                 d_in_active_region, N_current);
+#endif
+
+            siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
+
+#if ENABLE_PASSIVE_ADVECTION
             advectPassiveParticles<<<spawn_blocks, threads>>>(
                 d_disk, d_in_active_region, N_current,
                 dt_sim * 2.0f, PASSIVE_RESIDUAL_TAU);
