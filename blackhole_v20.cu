@@ -224,9 +224,19 @@ inline void initVRAMConfig() {
     printf("[VRAM] Grid size: %d³ = %d cells (%.1f MB)\n",
            g_grid_dim, g_grid_cells, g_grid_cells * 12 * 4 / 1e6);
 
+    // Determine whether the octree subsystem will be allocated at all.
+    // The morton/octree_nodes/leaf_* buffers are only needed if either the
+    // rebuild path or the render path is active. With both off (the default),
+    // the analytic tree build, the stochastic rebuild, and the V3 render
+    // traversal are all no-ops, and we can reclaim ~320 MB of morton/xor/ids
+    // plus ~88 MB of octree_nodes + leaf buffers.
+    extern bool g_octree_rebuild;
+    extern bool g_octree_render;
+    const bool octree_needed = g_octree_rebuild || g_octree_render;
+
     // Calculate fixed overhead (with scaled grid)
     size_t grid_overhead = (size_t)g_grid_cells * 12 * sizeof(float);
-    size_t octree_overhead = 88ULL * 1024 * 1024;   // 88 MB (fixed)
+    size_t octree_overhead = octree_needed ? (88ULL * 1024 * 1024) : 0;  // 88 MB fixed, skipped when octree disabled
     size_t sparse_overhead = 12ULL * 1024 * 1024;   // 12 MB (fixed)
     size_t misc_overhead = 5ULL * 1024 * 1024;      // 5 MB (fixed)
     size_t fixed_overhead = grid_overhead + octree_overhead + sparse_overhead + misc_overhead;
@@ -234,9 +244,10 @@ inline void initVRAMConfig() {
     // Calculate safe particle cap. Derive per-particle bytes from the struct
     // so a future field addition/removal updates the calculator automatically.
     //   GPUDisk:  sizeof(GPUDisk) / MAX_DISK_PTS  (struct size + alignment)
-    //   Auxiliary: morton (8) + xor (4) + ids (4) + cell (4) = 20 bytes
+    //   Auxiliary (always): cell index (4 bytes — used by grid physics)
+    //   Auxiliary (octree-only, 16 bytes): morton (8) + xor (4) + ids (4)
     const size_t gpudisk_bytes = sizeof(GPUDisk) / (size_t)MAX_DISK_PTS;
-    const size_t aux_bytes = 20;
+    const size_t aux_bytes = octree_needed ? 20 : 4;  // 20 with octree, 4 without
     size_t bytes_per_particle = gpudisk_bytes + aux_bytes;
     int max_particles = (int)((usable_mem - fixed_overhead) / bytes_per_particle);
 
@@ -249,28 +260,33 @@ inline void initVRAMConfig() {
 
     g_runtime_particle_cap = max_particles;
 
-    printf("[VRAM] Safe particle cap: %d (%.1f MB for particles)\n",
-           g_runtime_particle_cap, (float)g_runtime_particle_cap * bytes_per_particle / 1e6);
+    printf("[VRAM] Safe particle cap: %d (%.1f MB for particles%s)\n",
+           g_runtime_particle_cap, (float)g_runtime_particle_cap * bytes_per_particle / 1e6,
+           octree_needed ? "" : ", octree disabled");
 
-    // Calculate octree particle capacity (separate from GPUDisk cap)
-    // Thrust radix_sort needs ~24 bytes temporary per element
-    // Morton buffers: 8 (keys) + 4 (xor) + 4 (ids) = 16 bytes/particle
-    // Total: 16 + 24 = 40 bytes/particle for octree rebuild
-    size_t gpudisk_overhead = (size_t)g_runtime_particle_cap * gpudisk_bytes;  // GPUDisk struct (computed above)
-    size_t octree_budget = usable_mem - grid_overhead - octree_overhead - sparse_overhead - misc_overhead - gpudisk_overhead;
-    size_t bytes_per_particle_octree = 40;  // morton + thrust temp
-    int octree_cap = (int)(octree_budget / bytes_per_particle_octree);
-
-    // Round to warp boundary, clamp to particle cap
-    octree_cap = (octree_cap / 32) * 32;
-    if (octree_cap > g_runtime_particle_cap) octree_cap = g_runtime_particle_cap;
-    if (octree_cap < 32) octree_cap = 32;
-
-    g_octree_particle_cap = octree_cap;
-
-    printf("[VRAM] Octree cap: %d particles (%.1f MB budget, thrust temp: %.1f MB)\n",
-           g_octree_particle_cap, octree_budget / 1e6,
-           (float)g_octree_particle_cap * 24 / 1e6);
+    // Octree particle capacity — only relevant if octree is actually enabled.
+    // When disabled, g_octree_particle_cap is set to g_runtime_particle_cap so
+    // any code path that reads it has a sensible upper bound, but no buffers
+    // will actually be sized by it.
+    if (octree_needed) {
+        // Thrust radix_sort needs ~24 bytes temporary per element
+        // Morton buffers: 8 (keys) + 4 (xor) + 4 (ids) = 16 bytes/particle
+        // Total: 16 + 24 = 40 bytes/particle for octree rebuild
+        size_t gpudisk_overhead = (size_t)g_runtime_particle_cap * gpudisk_bytes;
+        size_t octree_budget = usable_mem - grid_overhead - octree_overhead - sparse_overhead - misc_overhead - gpudisk_overhead;
+        size_t bytes_per_particle_octree = 40;  // morton + thrust temp
+        int octree_cap = (int)(octree_budget / bytes_per_particle_octree);
+        octree_cap = (octree_cap / 32) * 32;
+        if (octree_cap > g_runtime_particle_cap) octree_cap = g_runtime_particle_cap;
+        if (octree_cap < 32) octree_cap = 32;
+        g_octree_particle_cap = octree_cap;
+        printf("[VRAM] Octree cap: %d particles (%.1f MB budget, thrust temp: %.1f MB)\n",
+               g_octree_particle_cap, octree_budget / 1e6,
+               (float)g_octree_particle_cap * 24 / 1e6);
+    } else {
+        g_octree_particle_cap = g_runtime_particle_cap;
+        printf("[VRAM] Octree subsystem DISABLED — no morton/node/leaf buffers allocated\n");
+    }
 
     // Copy grid constants to device
     int stride_y = g_grid_dim;
@@ -4533,8 +4549,16 @@ int main(int argc, char** argv) {
     uint32_t* d_leaf_offsets = nullptr;      // Exclusive scan of counts (output positions)
     uint32_t* d_leaf_node_indices = nullptr; // Original node indices for level-13 nodes
     uint32_t* d_leaf_node_count = nullptr;   // Number of level-13 nodes
-    bool octreeEnabled = true;  // TODO: add --octree flag
+    extern bool g_octree_rebuild;
     extern bool g_octree_render;
+    // Octree subsystem is lazy-allocated: only built if either the rebuild
+    // path or the render traversal is opted into via CLI flag. With neither
+    // flag set (the default), the entire octree block at line ~4570 is
+    // skipped and ~320 MB of morton/xor/ids buffers plus ~88 MB of
+    // node/leaf/hash buffers stay unallocated. Downstream guards at
+    // g_octree_rebuild && octreeEnabled and h_leaf_node_count > 0 ensure
+    // no kernel tries to read null pointers.
+    const bool octreeEnabled = (g_octree_rebuild || g_octree_render);
     bool useOctreeTraversal = g_octree_render;  // Toggle to use octree-based compaction
     uint32_t h_analytic_node_count = 0;
     uint32_t h_total_node_count = 0;  // Updated after each stochastic rebuild
