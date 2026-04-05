@@ -3430,6 +3430,9 @@ bool  g_n12_envelope = true;      // Apply N12 mixer envelope to coupling (math.
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
 
+// Dense R(t) logging: prints R_global every N frames (0 = only every 90 like normal stats)
+int g_r_log_interval = 0;
+
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
 #define ARM_WIDTH_DEG 45.0f         // Width of each arm in degrees
 #define ARM_TRAP_STRENGTH 0.15f     // Angular momentum barrier strength
@@ -3687,6 +3690,11 @@ int main(int argc, char** argv) {
             g_r_export_interval = atoi(argv[++i]);
             printf("[kuramoto] Per-cell R export every %d frames\n", g_r_export_interval);
         }
+        else if (strcmp(argv[i], "--r-log-interval") == 0 && i+1 < argc) {
+            extern int g_r_log_interval;
+            g_r_log_interval = atoi(argv[++i]);
+            printf("[kuramoto] Dense R(t) logging every %d frames\n", g_r_log_interval);
+        }
         else if (strcmp(argv[i], "--headless") == 0) {
             extern bool g_headless;
             g_headless = true;
@@ -3798,6 +3806,7 @@ int main(int argc, char** argv) {
             printf("  --omega-spread <σ> Gaussian σ for ω distribution (default 0.05; K_c ≈ 2σ/π)\n");
             printf("  --no-n12           Disable N12 mixer envelope on Kuramoto coupling\n");
             printf("  --r-export-interval <N>  Dump per-cell R grid to r_export/frame_NNNNN.bin every N frames (0=off)\n");
+            printf("  --r-log-interval <N>     Print dense R(t) samples every N frames for time-series analysis (0=off)\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -5852,6 +5861,33 @@ int main(int argc, char** argv) {
             }
         }
 
+        // === Dense R(t) logging (optional) ===
+        // Compact per-frame Kuramoto order parameter print for time-series
+        // analysis. Minimal overhead (one block reduce + small DtoH).
+        if (g_r_log_interval > 0 && frame % g_r_log_interval == 0 && frame > 0) {
+            int kr_blocks = (N_current + KR_THREADS - 1) / KR_THREADS;
+            if (kr_blocks > kr_max_blocks) kr_blocks = kr_max_blocks;
+            reduceKuramotoR<<<kr_blocks, KR_THREADS>>>(
+                d_disk, N_current, d_kr_sin_sum, d_kr_cos_sum, d_kr_count);
+            cudaMemcpy(h_kr_sin_sum.data(), d_kr_sin_sum, kr_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_kr_cos_sum.data(), d_kr_cos_sum, kr_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_kr_count.data(), d_kr_count, kr_blocks * sizeof(int), cudaMemcpyDeviceToHost);
+            double sum_sin = 0.0, sum_cos = 0.0;
+            long long total_count = 0;
+            for (int b = 0; b < kr_blocks; b++) {
+                sum_sin += h_kr_sin_sum[b];
+                sum_cos += h_kr_cos_sum[b];
+                total_count += h_kr_count[b];
+            }
+            if (total_count > 0) {
+                double inv_n = 1.0 / (double)total_count;
+                double mean_sin = sum_sin * inv_n;
+                double mean_cos = sum_cos * inv_n;
+                float R_t = (float)sqrt(mean_sin * mean_sin + mean_cos * mean_cos);
+                printf("[rt] frame=%d R=%.6f\n", frame, R_t);
+            }
+        }
+
         // Print stats every 90 frames using sample metrics (no stall)
         if (frame % 90 == 0) {
             // === Compute Kuramoto order parameter R = |⟨e^{iθ}⟩| ===
@@ -5878,11 +5914,39 @@ int main(int argc, char** argv) {
 
             // === Compute per-cell R and radial profile ===
             float r_inner = 0.0f, r_mid = 0.0f, r_outer = 0.0f;
+            float R_recon = 0.0f;  // grid-reconstructed global R for consistency check
             if (g_grid_physics && d_grid_R_cell != nullptr) {
                 int cell_blocks = (GRID_CELLS + 255) / 256;
                 computeRcell<<<cell_blocks, 256>>>(
                     d_grid_density, d_grid_phase_sin, d_grid_phase_cos,
                     d_grid_R_cell, GRID_CELLS);
+
+                // === CONSISTENCY CHECK: R_recon from grid vector sums ===
+                // Summing phase_sin[cell] across cells gives total Σ sin(θ_i).
+                // Dividing by total density gives ⟨sin θ⟩. R_recon must equal
+                // R_global (particle-level reduction) if the grid and particle
+                // paths agree. Any discrepancy flags inconsistency (inactive
+                // particles, double-counting, sampling bias, etc.).
+                {
+                    std::vector<float> h_grid_ps(GRID_CELLS);
+                    std::vector<float> h_grid_pc(GRID_CELLS);
+                    std::vector<float> h_grid_rho(GRID_CELLS);
+                    cudaMemcpy(h_grid_ps.data(), d_grid_phase_sin, GRID_CELLS * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_grid_pc.data(), d_grid_phase_cos, GRID_CELLS * sizeof(float), cudaMemcpyDeviceToHost);
+                    cudaMemcpy(h_grid_rho.data(), d_grid_density, GRID_CELLS * sizeof(float), cudaMemcpyDeviceToHost);
+                    double tot_s = 0.0, tot_c = 0.0, tot_rho = 0.0;
+                    for (int c = 0; c < GRID_CELLS; c++) {
+                        tot_s += h_grid_ps[c];
+                        tot_c += h_grid_pc[c];
+                        tot_rho += h_grid_rho[c];
+                    }
+                    if (tot_rho > 0.0) {
+                        double inv_rho = 1.0 / tot_rho;
+                        double ms = tot_s * inv_rho;
+                        double mc = tot_c * inv_rho;
+                        R_recon = (float)sqrt(ms * ms + mc * mc);
+                    }
+                }
 
                 // Radial profile: 16 bins from center to edge, noise-floor corrected
                 cudaMemsetAsync(d_rc_bin_R, 0, RC_RADIAL_BINS * sizeof(float));
@@ -5934,12 +5998,12 @@ int main(int argc, char** argv) {
             }
 
             printf("[frame %5d] fps=%.0f | particles=%d "
-            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f [%.3f/%.3f/%.3f]",
+            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f/Rrec=%.4f [%.3f/%.3f/%.3f]",
                    frame, fps_acc > 0 ? fps_frames / fps_acc : 0.0,
                    N_current,
                    h_sample_metrics->avg_scale, h_sample_metrics->avg_scale,
                    pump_bridge.avg_scale, pump_bridge.avg_residual, pump_bridge.heartbeat,
-                   R_global_cached, r_inner, r_mid, r_outer);
+                   R_global_cached, R_recon, r_inner, r_mid, r_outer);
 
 #ifdef VULKAN_INTEROP
             // Show hybrid LOD stats (visible particle count and culling percentage)
