@@ -1,0 +1,174 @@
+// harmonic_attractor.comp
+// Pure parametric harmonic attractor - generates positions on GPU without particle data.
+// Samples the quartic harmonic attractor directly to a density buffer.
+// No particle buffer. No CUDA data. Pure mathematical evaluation.
+//
+// Dispatch: ceil(N_SAMPLES / 256) workgroups of 256 threads
+// Each thread owns one theta sample across one shell.
+
+#version 450
+#define PI  3.14159265358979323846
+#define TAU 6.28318530717958647692
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Attractor State UBO - Updated by CUDA physics kernel each frame
+// ============================================================================
+// This captures the global "pump" state from the simulation.
+// w and s_theta encode the 4D projection; phase drives rotation.
+
+layout(set = 0, binding = 0) uniform AttractorStateUBO {
+    float w;         // accumulated w-component [0, 1]
+    float s_theta;   // sqrt(1 - w^2), precomputed CPU-side
+    float phase;     // global pump phase mod 2pi
+    float residual;  // bifurcation proximity (dr/dt predictor)
+} state;
+
+// Density accumulation buffer - R32_UINT, cleared each frame
+layout(set = 0, binding = 1, r32ui) uniform uimage2D density_buf;
+
+// Camera / projection uniforms
+layout(set = 0, binding = 2) uniform CameraUBO {
+    mat4  view_proj;   // combined view-projection matrix
+    float zoom;        // zoom factor (1.0 = default)
+    float aspect;      // width / height
+    int   width;       // framebuffer width (px)
+    int   height;      // framebuffer height (px)
+} cam;
+
+// Render params - push constants for cheap per-frame updates
+layout(push_constant) uniform PushConstants {
+    int   n_samples;         // total theta samples this frame
+    float shell_bias;        // >1 = more inner-shell samples
+    float brightness;        // pre-tone-map scale
+    float time;              // elapsed time (for animation)
+} pc;
+
+// ============================================================================
+// Shell Configuration - Matches simulation shell radii
+// ============================================================================
+// These are the equilibrium radii from the hopfion shell structure.
+// Actual rendered radius = r0[shell] * state.s_theta (contracts as w->1)
+
+const int   N_SHELLS = 8;
+const float r0[N_SHELLS] = float[](
+    6.0,    // Shell 0: ISCO
+    9.7,    // Shell 1
+    15.7,   // Shell 2
+    25.4,   // Shell 3
+    41.1,   // Shell 4
+    66.5,   // Shell 5
+    107.5,  // Shell 6
+    174.0   // Shell 7
+);
+
+// Sample weight per shell: inner shells are brighter / denser structure
+const float shell_weight[N_SHELLS] = float[](
+    1.00, 0.85, 0.70, 0.55, 0.45, 0.35, 0.28, 0.22
+);
+
+// ============================================================================
+// Harmonic Parametrisation - Quartic Hopf Fibration
+// ============================================================================
+// x(theta) = sin(theta) - 0.5 * sin(3*theta)
+// y(theta) = -cos(theta) + 0.5 * cos(3*theta)
+// z(theta) = cos(theta) * cos(3*theta)   <- mixer: generates 2w and 4w
+//
+// All scaled by s_theta to apply w-component projection.
+// As w -> 1, s_theta -> 0, all shells contract toward origin.
+
+vec3 harmonic_point(float theta, float s) {
+    float s1 = sin(theta),   c1 = cos(theta);
+    float s3 = sin(3.0*theta), c3 = cos(3.0*theta);
+
+    return vec3(
+        (s1 - 0.5 * s3) * s,
+        (-c1 + 0.5 * c3) * s,
+        (c1 * c3) * s    // mixer term, already amplitude-correct
+    );
+}
+
+// ============================================================================
+// Enhanced Harmonic with Shell Modulation
+// ============================================================================
+// Adds per-shell phase offset and amplitude modulation for richer structure
+
+vec3 harmonic_point_modulated(float theta, float s, int shell) {
+    // Shell-dependent phase offset creates interleaved structure
+    float shell_phase = float(shell) * (PI / float(N_SHELLS));
+    float t = theta + shell_phase;
+
+    // Odd/even shells have opposite rotation sense
+    float sign = (shell % 2 == 0) ? 1.0 : -1.0;
+
+    float s1 = sin(t),   c1 = cos(t);
+    float s3 = sin(3.0*t), c3 = cos(3.0*t);
+
+    // Third harmonic amplitude varies by shell (inner = stronger coupling)
+    float h3_amp = 0.5 + 0.2 * (1.0 - float(shell) / float(N_SHELLS));
+
+    return vec3(
+        (s1 - h3_amp * s3) * s * sign,
+        (-c1 + h3_amp * c3) * s,
+        (c1 * c3) * s * 0.3  // reduced z for disk-like appearance
+    );
+}
+
+// ============================================================================
+// Project world-space point to integer pixel coordinate
+// ============================================================================
+bool project_to_pixel(vec3 world, out ivec2 px) {
+    vec4 clip = cam.view_proj * vec4(world, 1.0);
+    if (clip.w <= 0.0) return false;
+
+    vec3 ndc = clip.xyz / clip.w;
+    if (any(greaterThan(abs(ndc.xy), vec2(1.0)))) return false;
+
+    px = ivec2(
+        int((ndc.x * 0.5 + 0.5) * float(cam.width)),
+        int((ndc.y * 0.5 + 0.5) * float(cam.height))
+    );
+    return all(greaterThanEqual(px, ivec2(0))) &&
+           all(lessThan(px, ivec2(cam.width, cam.height)));
+}
+
+// ============================================================================
+// Main - Pure Parametric Sampling
+// ============================================================================
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) >= pc.n_samples) return;
+
+    // -------------------------------------------------------------------------
+    // Assign this thread to a shell and a theta offset within that shell.
+    // Shells with higher weight get proportionally more samples.
+    // Simple round-robin weighted distribution.
+    // -------------------------------------------------------------------------
+    int   shell     = int(gid) % N_SHELLS;
+    int   sample_in = int(gid) / N_SHELLS;
+    int   n_per_sh  = pc.n_samples / N_SHELLS;
+
+    float t = float(sample_in) / float(max(n_per_sh, 1));   // [0, 1)
+    float theta = t * TAU + state.phase;
+
+    // -------------------------------------------------------------------------
+    // Evaluate harmonic sum.
+    // s_theta encodes the current w-projection: as w->1, s_theta->0,
+    // all shells contract uniformly toward the origin.
+    // -------------------------------------------------------------------------
+    float s = state.s_theta * r0[shell];   // effective shell radius this frame
+    vec3  p = harmonic_point_modulated(theta, s, shell);
+
+    // -------------------------------------------------------------------------
+    // Project and accumulate into density buffer.
+    // imageAtomicAdd is the only synchronisation point.
+    // Contention is naturally spread by the spatial distribution.
+    // -------------------------------------------------------------------------
+    ivec2 px;
+    if (project_to_pixel(p, px)) {
+        // Weight by shell brightness - inner shells contribute more per sample
+        uint contrib = uint(shell_weight[shell] * pc.brightness * 64.0);
+        imageAtomicAdd(density_buf, px, max(contrib, 1u));
+    }
+}

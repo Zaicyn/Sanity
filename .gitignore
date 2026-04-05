@@ -1,0 +1,68 @@
+# Build artifacts
+build/
+
+# Compiled binaries (if built outside build/)
+test_squaragon
+test_squaragon_v2
+test_siphon
+blackhole
+blackhole_v20
+
+# Object files
+*.o
+*.obj
+
+# CUDA intermediates
+*.cubin
+*.ptx
+*.fatbin
+
+# Logs and profiles
+*.log
+*.nsys-rep
+*.sqlite
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Validation frame exports
+frames/
+
+# Topology dumps and analysis
+topology_dumps/
+*.csv
+*.png
+*.pdf
+
+# Benchmark binaries
+bench_trig
+bench_trig2
+blackhole_v20_test
+blackhole_vulkan
+
+# Benchmark sources (temp experiments)
+bench_trig.cu
+bench_trig2.cu
+
+# Preprocessor intermediates
+*.ii
+
+# Perf data
+perf.data
+perf.data.old
+
+# Compiled shaders (regenerated from source)
+*.spv

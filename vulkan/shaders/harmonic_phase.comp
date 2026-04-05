@@ -1,0 +1,167 @@
+// harmonic_phase.comp
+// Phase-primary density accumulation shader.
+// Reads phase state from SSBO, reconstructs 3D position, projects to density buffer.
+//
+// This is the phase-primary version of harmonic_sample.comp.
+// Instead of reading pre-computed XYZ positions, it reads theta/omega/phase12/etc
+// and reconstructs the position on the GPU.
+//
+// Dispatch: ceil(particleCount / 256) workgroups of 256 threads
+// Each thread processes one particle.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Phase-Primary Particle State (matches SunTrace from sun_trace.cuh)
+// ============================================================================
+// Total: 40 bytes per particle, tightly packed with explicit floats
+
+struct SunTrace {
+    // Phase state (16 bytes)
+    float theta;           // [0, 2π) orbital phase
+    float omega;           // angular frequency
+    float phase12;         // N12 envelope phase
+    uint  packed_state;    // shell_idx (8) + seam_bits (8) + flags (16)
+
+    // Harmonic coefficients (8 bytes)
+    float h1;              // fundamental amplitude
+    float h3;              // third harmonic amplitude
+
+    // Emergent state (12 bytes)
+    float drift;           // radial drift from equilibrium
+    float coherence;       // phase lock strength [0,1]
+    float w_component;     // 4D accumulator
+
+    // Anchor (4 bytes)
+    float r_target;        // equilibrium radius
+};
+
+// Particle buffer — SSBO containing phase-primary state
+layout(std430, set = 0, binding = 0) readonly buffer SunTraceBuffer {
+    SunTrace traces[];
+};
+
+// Density accumulation buffer — R32_UINT, cleared each frame
+layout(set = 0, binding = 1, r32ui) uniform uimage2D density_buf;
+
+// Camera / projection uniforms
+layout(set = 0, binding = 2) uniform CameraUBO {
+    mat4  view_proj;   // combined view-projection matrix
+    float zoom;        // zoom factor (1.0 = default)
+    float aspect;      // width / height
+    int   width;       // framebuffer width  (px)
+    int   height;      // framebuffer height (px)
+} cam;
+
+// Render params — push constants
+layout(push_constant) uniform PushConstants {
+    int   particle_count;    // number of active particles
+    float brightness;        // pre-tone-map scale
+    float temp_scale;        // temperature contribution to brightness
+    float time;              // elapsed time for phase evolution
+} pc;
+
+// ============================================================================
+// Shell Radii (must match sun_trace.cuh d_shell_radii)
+// ============================================================================
+const float shell_radii[8] = float[8](
+    6.0,    // Shell 0: ISCO
+    9.7,    // Shell 1
+    15.7,   // Shell 2
+    25.4,   // Shell 3
+    41.1,   // Shell 4
+    66.5,   // Shell 5
+    107.5,  // Shell 6
+    174.0   // Shell 7
+);
+
+// ============================================================================
+// Position Reconstruction — Phase-to-Geometry
+// ============================================================================
+// Reconstruct orbital position from phase state. This naturally flattens the
+// geometry into a near-2D disk, making shell radii clearly visible as rings.
+// The Y component is only the small N12 breathing oscillation.
+
+vec3 reconstruct_position(SunTrace s) {
+    // Effective radius = shell equilibrium + drift
+    float r = s.r_target + s.drift;
+
+    // Orbital position from base phase
+    float cos_theta = cos(s.theta);
+    float sin_theta = sin(s.theta);
+
+    // Vertical oscillation from N12 envelope (breathing)
+    float breath_amp = 0.8 * (1.0 - s.r_target / 200.0);
+    float z_osc = breath_amp * sin(s.phase12);
+
+    return vec3(
+        r * cos_theta,   // x
+        z_osc,           // y (vertical breathing — flattens to disk)
+        r * sin_theta    // z
+    );
+}
+
+// ============================================================================
+// Temperature from Radius
+// ============================================================================
+float compute_temp(float r) {
+    const float ISCO = 6.0;
+    return (r > ISCO) ? pow(ISCO / r, 0.75) : 1.0;
+}
+
+// ============================================================================
+// Project world-space point → integer pixel coordinate
+// ============================================================================
+bool project_to_pixel(vec3 world, out ivec2 px) {
+    vec4 clip = cam.view_proj * vec4(world, 1.0);
+    if (clip.w <= 0.0) return false;
+
+    vec3 ndc = clip.xyz / clip.w;
+    if (any(greaterThan(abs(ndc.xy), vec2(1.0)))) return false;
+
+    px = ivec2(
+        int((ndc.x * 0.5 + 0.5) * float(cam.width)),
+        int((ndc.y * 0.5 + 0.5) * float(cam.height))
+    );
+    return all(greaterThanEqual(px, ivec2(0))) &&
+           all(lessThan(px, ivec2(cam.width, cam.height)));
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) >= pc.particle_count) return;
+
+    // Read phase-primary state
+    SunTrace s = traces[gid];
+
+    // Unpack flags
+    uint flags = (s.packed_state >> 16) & 0xFFFF;
+    bool is_active = (flags & 0x0001) != 0;
+    bool is_ejected = (flags & 0x0002) != 0;
+
+    // Skip inactive or ejected particles
+    if (!is_active || is_ejected) return;
+
+    // Reconstruct position from phase state (flattened disk view)
+    vec3 position = reconstruct_position(s);
+
+    // Project to screen
+    ivec2 px;
+    if (project_to_pixel(position, px)) {
+        // Compute temperature from radius (r_target now stores actual radius)
+        float temp = compute_temp(s.r_target);
+
+        // Brightness based on temperature, coherence, and h3 (16D closure)
+        float temp_boost = 1.0 + temp * pc.temp_scale;
+        float coherence_boost = 0.5 + 0.5 * s.coherence;
+        float h3_boost = 0.5 + 0.5 * s.h3;  // h3 ~ pump_scale
+
+        uint contrib = uint(pc.brightness * temp_boost * coherence_boost * h3_boost * 32.0);
+        imageAtomicAdd(density_buf, px, max(contrib, 1u));
+    }
+}

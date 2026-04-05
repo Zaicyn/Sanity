@@ -1,0 +1,412 @@
+// forces.cuh — Force Models and Energy Terms
+// ============================================
+//
+// This header contains:
+//   - Viviani field force (topology-derived anisotropic force)
+//   - Angular momentum preservation
+//   - Disk plane damping
+//   - Angular momentum sink
+//   - Ion kick (Langevin noise term)
+//   - Core anchor (1/(1+r²) attractor)
+//
+// Math.md mapping:
+//   - Ion kick: External entropy source (σR(t) term)
+//   - Core anchor: The siphon's "K factor" — increases coupling near center
+//   - These are the INTERACTION terms that enable emergent behavior
+
+#pragma once
+
+#include <cuda_runtime.h>
+#include "disk.cuh"
+
+// Forward declarations for LUT functions
+__device__ float cuda_lut_sin(float x);
+__device__ float cuda_lut_cos(float x);
+__device__ float cuda_lut_cos3(float x);
+__device__ float cuda_lut_repulsion_var(float r, float lambda);
+__device__ float cuda_fast_atan2(float y, float x);
+
+// ============================================================================
+// Viviani Field Force Model
+// ============================================================================
+// Force derived from field line direction, not central mass.
+// Reference: viv/viv_field_trace.comp
+//
+// Physics: The topology of the field creates anisotropic forces:
+//   - POLES (axial): Field converges/diverges → radial push/pull
+//   - SIDES (equatorial): Field runs tangent → rotational force
+//
+// This replaces uniform -GM/r² gravity with context-dependent field forces.
+// The galaxy should "breathe" — poles bind, sides vent, oscillating equilibrium.
+//
+// Arguments:
+//   px, py, pz: position
+//   vx, vy, vz: velocity (used as field direction proxy)
+//   ax, ay, az: output acceleration (added to, not replaced)
+
+__device__ __forceinline__ void apply_viviani_field_force(
+    float px, float py, float pz,
+    float vx, float vy, float vz,
+    float r3d, float inv_r3d,  // Pre-computed: avoids redundant sqrtf
+    float& ax, float& ay, float& az)
+{
+    float r_safe = fmaxf(r3d, SCHW_R * 0.5f);
+    float inv_r = (r3d >= SCHW_R * 0.5f) ? inv_r3d : (1.0f / r_safe);
+
+    // Field direction: use velocity as proxy (rsqrtf avoids sqrtf + division)
+    float v2 = vx*vx + vy*vy + vz*vz;
+    float inv_v = rsqrtf(v2 + 0.0001f);  // +epsilon avoids div by zero
+    float bx = vx * inv_v;
+    float by = vy * inv_v;
+    float bz = vz * inv_v;
+
+    // Radial unit vector (reuse inv_r)
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    // Classify: axial (pole) vs equatorial (side)
+    float cos_theta = py * inv_r;
+    bool is_axial = fabsf(cos_theta) > AXIAL_THRESHOLD;
+
+    // Weight = field_strength / (1 + distance²/falloff)
+    float weight = FIELD_FORCE_STRENGTH / (1.0f + r_safe * r_safe / FIELD_FORCE_FALLOFF);
+
+    if (is_axial) {
+        // AXIAL (poles): Force direction based on field flow
+        float radial_dot = -(bx * rx + by * ry + bz * rz);
+
+        if (radial_dot > 0.0f) {
+            // Field flowing TOWARD center → PULL inward
+            ax += -rx * weight * radial_dot;
+            ay += -ry * weight * radial_dot;
+            az += -rz * weight * radial_dot;
+        } else {
+            // Field flowing AWAY from center → PUSH outward
+            ax += rx * weight * (-radial_dot);
+            ay += ry * weight * (-radial_dot);
+            az += rz * weight * (-radial_dot);
+        }
+    } else {
+        // EQUATORIAL (sides): Tangential force
+        float tx = ry * bz - rz * by;
+        float ty = rz * bx - rx * bz;
+        float tz = rx * by - ry * bx;
+
+        // rsqrtf for normalization (avoids sqrtf + division)
+        float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f) * TANGENT_SCALE;
+        ax += tx * inv_t * weight;
+        ay += ty * inv_t * weight;
+        az += tz * inv_t * weight;
+    }
+}
+
+// ============================================================================
+// Angular Momentum Calculation
+// ============================================================================
+// L = r × v (specific angular momentum)
+// Returns Lx, Ly, Lz and inv_L_mag (using rsqrtf pattern)
+
+__device__ __forceinline__ void compute_angular_momentum(
+    float px, float py, float pz,
+    float vx, float vy, float vz,
+    float& Lx, float& Ly, float& Lz, float& inv_L_mag)
+{
+    Lx = py * vz - pz * vy;
+    Ly = pz * vx - px * vz;
+    Lz = px * vy - py * vx;
+    // rsqrtf pattern: get 1/|L| directly, avoids sqrtf + division
+    inv_L_mag = rsqrtf(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8f);
+}
+
+// Disk alignment factor: Lz / L_mag = Lz * inv_L_mag
+// +1 = prograde (orbiting with disk)
+// -1 = retrograde
+__device__ __forceinline__ float compute_disk_alignment(float Lz, float inv_L_mag) {
+    return Lz * inv_L_mag;
+}
+
+// ============================================================================
+// Disk Plane Damping
+// ============================================================================
+// Particles crossing the disk plane lose vertical momentum (collisional).
+// This naturally flattens trajectories into the disk over time.
+
+__device__ __forceinline__ void apply_disk_damping(
+    float py, float r_cyl,
+    float& vy)
+{
+    if (fabsf(py) < DISK_THICKNESS * 3.0f &&
+        r_cyl > SCHW_R * 2.0f &&
+        r_cyl < 80.0f) {
+        // Inside disk region: damp vertical velocity
+        float disk_damping = 0.02f * cuda_lut_repulsion_var(fabsf(py), DISK_THICKNESS);
+        vy *= (1.0f - disk_damping);
+    }
+}
+
+// ============================================================================
+// Angular Momentum Sink
+// ============================================================================
+// 1% damping per frame at r=50 (scales as r²).
+// Prevents runaway angular momentum accumulation.
+
+__device__ __forceinline__ void apply_angular_momentum_sink(
+    float px, float py, float pz,
+    float r_safe,
+    float& vx, float& vy, float& vz)
+{
+    // Radial unit vector
+    float inv_r = 1.0f / r_safe;
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    // Radial velocity component
+    float v_radial = vx * rx + vy * ry + vz * rz;
+
+    // Tangential velocity
+    float v_tan_x = vx - v_radial * rx;
+    float v_tan_y = vy - v_radial * ry;
+    float v_tan_z = vz - v_radial * rz;
+
+    // Sink strength scales with r²
+    const float L_sink_radius = 50.0f;
+    const float L_sink_strength = 0.01f;
+    float L_sink_factor = L_sink_strength * (r_safe * r_safe) / (L_sink_radius * L_sink_radius);
+    L_sink_factor = fminf(L_sink_factor, 0.05f);  // Cap at 5%
+
+    // Apply sink to tangential velocity only
+    vx -= v_tan_x * L_sink_factor;
+    vy -= v_tan_y * L_sink_factor;
+    vz -= v_tan_z * L_sink_factor;
+}
+
+// ============================================================================
+// Ion Kick: Langevin Noise Term (σR(t))
+// ============================================================================
+// Math.md: This is the energy SOURCE that balances damping.
+// Modulated by period-4 heartbeat: "inject, inject, inject, relax" pattern.
+//
+// Equilibrium: ⟨v²⟩ = σ²/(2γ) — automatic balance, no tuning needed.
+
+__device__ __forceinline__ void apply_ion_kick(
+    float px, float pz, float r_xz,
+    float global_heartbeat,
+    float& vx, float& vz)
+{
+    // Period-4 modulation: on on on off (1110 pattern)
+    float hb_mod = (global_heartbeat > -0.5f) ? 1.0f : 0.0f;
+
+    if (r_xz > ION_KICK_INNER_R && r_xz < ION_KICK_OUTER_R) {
+        // Ion kick region
+        float ion_coupling = (r_xz - ION_KICK_INNER_R) / (ION_KICK_OUTER_R - ION_KICK_INNER_R);
+
+        // Radial inward normal
+        float nx = -px / r_xz;
+        float nz = -pz / r_xz;
+
+        // Langevin noise: σ × heartbeat × coupling × direction
+        float sigma_eff = LANGEVIN_SIGMA * hb_mod;
+        vx += sigma_eff * ion_coupling * nx;
+        vz += sigma_eff * ion_coupling * nz;
+    }
+}
+
+// ============================================================================
+// Boundary Recycling
+// ============================================================================
+// Extreme escapees get respawned at ION_KICK_RESPAWN_R.
+// Preserves jet_phase (coherence memory from jet excursion).
+
+__device__ __forceinline__ bool apply_boundary_recycle(
+    float& px, float& py, float& pz,
+    float& vx, float& vy, float& vz,
+    float r_xz, float global_heartbeat,
+    int& state, int& coherent)
+{
+    if (r_xz > ION_KICK_OUTER_R) {
+        float theta = cuda_fast_atan2(pz, px);
+        px = ION_KICK_RESPAWN_R * cuda_lut_cos(theta);
+        pz = ION_KICK_RESPAWN_R * cuda_lut_sin(theta);
+        py *= 0.3f;
+
+        float hb_mod = (global_heartbeat > -0.5f) ? 1.0f : 0.0f;
+        float sigma = LANGEVIN_SIGMA * hb_mod;
+        vx = -0.1f * cuda_lut_cos(theta) * (0.5f + sigma);
+        vz = -0.1f * cuda_lut_sin(theta) * (0.5f + sigma);
+        vy *= 0.3f;
+
+        state = 0;  // IDLE
+        coherent = 0;
+        return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Core Anchor: 1/(1+r²) Attractor
+// ============================================================================
+// Math.md: The siphon's "K factor" — increases coupling near center.
+// Prevents shell detachment — keeps shells periodically touching core.
+// Creates 3-zone field: core pull + mid drift + outer return.
+
+__device__ __forceinline__ void apply_core_anchor(
+    float px, float pz, float r_xz,
+    float& vx, float& vz)
+{
+    if (r_xz > 1.0f) {
+        // 1/(1 + (r/scale)²) — strongest at origin, weak but persistent at large r
+        float r_scaled = r_xz / CORE_PULL_SCALE;
+        float core_pull = CORE_PULL_STRENGTH / (1.0f + r_scaled * r_scaled);
+        float nx = -px / r_xz;
+        float nz = -pz / r_xz;
+        vx += core_pull * nx;
+        vz += core_pull * nz;
+    }
+}
+
+// ============================================================================
+// Tidal Forces
+// ============================================================================
+// 1. Keplerian shear: |dω/dr| = 1.5 × √(M/r⁵) — disk-plane phenomenon
+// 2. Radial tidal: ∝ 1/r³ — stretches along radial direction
+// Both contribute to destabilization when multiplied by pump history.
+
+__device__ __forceinline__ void compute_tidal_forces(
+    float r_cyl, float r3d,
+    float scale, float L_disk_align,
+    float& shear_out, float& tidal_radial_out)
+{
+    float shear = 0.0f;
+    float tidal_radial = 0.0f;
+
+    // Keplerian shear (disk plane only)
+    if (r_cyl > SCHW_R * 1.5f) {
+        shear = 1.5f * sqrtf(BH_MASS / (r_cyl * r_cyl * r_cyl * r_cyl * r_cyl));
+        shear *= sqrtf(scale);
+        shear *= fmaxf(0.0f, L_disk_align);  // Weight by disk alignment
+    }
+
+    // Radial tidal (always present)
+    if (r3d > SCHW_R * 1.2f) {
+        tidal_radial = BH_MASS / (r3d * r3d * r3d);
+        tidal_radial *= sqrtf(scale);
+    }
+
+    shear_out = shear;
+    tidal_radial_out = tidal_radial;
+}
+
+// ============================================================================
+// Keplerian Substrate Torque (Competing Interaction Model)
+// ============================================================================
+// Based on: "Nonmonotonic Magnetic Friction from Collective Rotor Dynamics"
+// (Gu, Lüders, Bechinger 2024)
+//
+// KEY INSIGHT: Maximum dissipation occurs when competing interactions FRUSTRATE
+// the system, preventing it from settling into either:
+//   - FM (ferromagnetic) = all phases aligned = rigid vortex
+//   - AFM (antiferromagnetic) = alternating phases = locked shear
+//
+// The "competing regime" (CP) where neither wins produces:
+//   - Hysteresis cycles
+//   - Energy dissipation
+//   - Turbulent dynamics
+//   - Spiral structure
+//
+// Physics analogy:
+//   - Kuramoto coupling (neighbor sync) = intralayer FM interaction
+//   - Keplerian substrate = rotating external field (like magnetic substrate)
+//   - When K_kuramoto ≈ K_substrate → frustration → interesting dynamics
+//
+// The substrate "wants" particles at radius r to have angular velocity:
+//   Ω_kepler(r) = √(GM/r³)
+//
+// But Kuramoto coupling "wants" neighbors to sync phases.
+// These are incompatible → system never settles → dissipation.
+//
+// Arguments:
+//   px, pz: position (disk plane)
+//   vx, vz: velocity (modified in place)
+//   orb_phase: current orbital phase θ
+//   substrate_k: substrate coupling strength (compete with kuramoto_k)
+
+__device__ __forceinline__ void apply_keplerian_substrate_torque(
+    float px, float pz,
+    float& vx, float& vz,
+    float orb_phase,
+    float substrate_k)
+{
+    float r_cyl = sqrtf(px * px + pz * pz);
+
+    // Skip particles too close to center (numerical stability)
+    if (r_cyl < ISCO_R * 0.5f) return;
+
+    float inv_r = 1.0f / r_cyl;
+
+    // Keplerian angular velocity: Ω_k = √(GM/r³)
+    float r_eff = fmaxf(r_cyl, ISCO_R);
+    float omega_kepler = sqrtf(BH_MASS / (r_eff * r_eff * r_eff));
+
+    // Current angular velocity: Ω = v_θ / r
+    float v_theta = (-pz * vx + px * vz) * inv_r;
+    float omega_current = v_theta * inv_r;
+
+    // Phase mismatch between current rotation and Keplerian "substrate"
+    // This is the key: we use sin() to create oscillating torque, not linear relaxation
+    // The substrate field rotates at Ω_kepler, particle is at orb_phase
+    // Mismatch creates torque that can overshoot, creating hysteresis
+    float omega_mismatch = omega_kepler - omega_current;
+
+    // Sinusoidal torque: T = S × sin(Δω × τ)
+    // Using sin() creates the hysteresis loops seen in the paper
+    // τ is effective coupling timescale (absorbed into substrate_k)
+    // For small mismatches, sin(x) ≈ x, so this reduces to linear
+    // For large mismatches, sin() saturates, preventing runaway
+    float torque = substrate_k * cuda_lut_sin(omega_mismatch * 10.0f);
+
+    // Tangential unit vector: θ_hat = (-z/r, x/r)
+    float theta_x = -pz * inv_r;
+    float theta_z = px * inv_r;
+
+    // Apply torque as velocity change in tangential direction
+    // This competes with Kuramoto coupling for phase control
+    vx += torque * theta_x;
+    vz += torque * theta_z;
+}
+
+// ============================================================================
+// Simplified Linear Substrate (for comparison/tuning)
+// ============================================================================
+// Linear version without sin() - useful for understanding the dynamics
+// before adding the nonlinear hysteresis effects.
+
+__device__ __forceinline__ void apply_keplerian_substrate_linear(
+    float px, float pz,
+    float& vx, float& vz,
+    float substrate_k)
+{
+    float r_cyl = sqrtf(px * px + pz * pz);
+    if (r_cyl < ISCO_R * 0.5f) return;
+
+    float inv_r = 1.0f / r_cyl;
+
+    // Target Keplerian velocity
+    float r_eff = fmaxf(r_cyl, ISCO_R);
+    float v_kepler = sqrtf(BH_MASS / r_eff);
+
+    // Current tangential velocity
+    float v_theta = (-pz * vx + px * vz) * inv_r;
+
+    // Linear competing force (not relaxation - can overshoot)
+    // Clamped to prevent instability while maintaining competition
+    float delta_v = v_kepler - v_theta;
+    float torque = substrate_k * fminf(fmaxf(delta_v, -1.0f), 1.0f);
+
+    float theta_x = -pz * inv_r;
+    float theta_z = px * inv_r;
+
+    vx += torque * theta_x;
+    vz += torque * theta_z;
+}

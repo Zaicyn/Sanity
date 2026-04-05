@@ -1,0 +1,94 @@
+// harmonic_sample.comp
+// Accumulates actual particle positions into a density buffer for tone-mapped rendering.
+// This replaces the particle vertex shader with a compute-based density accumulation approach.
+//
+// Dispatch: ceil(particleCount / 256) workgroups of 256 threads
+// Each thread processes one particle.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Particle data — matches ParticleVertex layout from vk_types.h (40 bytes)
+// IMPORTANT: Using explicit scalar/float layout to match C++ struct exactly.
+// vec3 in std430 aligns to 16 bytes, but C++ float[3] is packed at 12 bytes.
+// We read as raw floats to avoid alignment mismatch.
+struct Particle {
+    float pos_x, pos_y, pos_z;  // 12 bytes (offset 0)
+    float pump_scale;            // 4 bytes (offset 12)
+    float pump_residual;         // 4 bytes (offset 16)
+    float temp;                  // 4 bytes (offset 20)
+    float vel_x, vel_y, vel_z;  // 12 bytes (offset 24)
+    float elongation;            // 4 bytes (offset 36)
+    // Total: 40 bytes, tightly packed
+};
+
+// Particle buffer — SSBO containing all particles from CUDA
+layout(std430, set = 0, binding = 0) readonly buffer ParticleBuffer {
+    Particle particles[];
+};
+
+// Density accumulation buffer — R32_UINT, cleared each frame
+layout(set = 0, binding = 1, r32ui) uniform uimage2D density_buf;
+
+// Camera / projection uniforms
+layout(set = 0, binding = 2) uniform CameraUBO {
+    mat4  view_proj;   // combined view-projection matrix
+    float zoom;        // zoom factor (1.0 = default)
+    float aspect;      // width / height
+    int   width;       // framebuffer width  (px)
+    int   height;      // framebuffer height (px)
+} cam;
+
+// Render params — push constants
+layout(push_constant) uniform PushConstants {
+    int   particle_count;    // number of active particles
+    float brightness;        // pre-tone-map scale
+    float temp_scale;        // temperature contribution to brightness
+} pc;
+
+// ----------------------------------------------------------------------------
+// Project world-space point → integer pixel coordinate.
+// Returns false if outside the framebuffer or behind camera.
+// ----------------------------------------------------------------------------
+bool project_to_pixel(vec3 world, out ivec2 px) {
+    vec4 clip = cam.view_proj * vec4(world, 1.0);
+    if (clip.w <= 0.0) return false;
+
+    vec3 ndc = clip.xyz / clip.w;
+    if (any(greaterThan(abs(ndc.xy), vec2(1.0)))) return false;
+
+    px = ivec2(
+        int((ndc.x * 0.5 + 0.5) * float(cam.width)),
+        int((ndc.y * 0.5 + 0.5) * float(cam.height))
+    );
+    return all(greaterThanEqual(px, ivec2(0))) &&
+           all(lessThan(px, ivec2(cam.width, cam.height)));
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (int(gid) >= pc.particle_count) return;
+
+    // Read particle data
+    Particle p = particles[gid];
+
+    // Skip particles that are dissolving (high residual = ejected)
+    if (p.pump_residual > 0.95) return;
+
+    // Reconstruct position vec3 from individual floats
+    vec3 position = vec3(p.pos_x, p.pos_y, p.pos_z);
+
+    // Project to screen
+    ivec2 px;
+    if (project_to_pixel(position, px)) {
+        // Brightness based on temperature and pump_scale
+        // Higher temp = brighter (inner disk is hotter)
+        // pump_scale near 1.33 (16D closure) = brighter
+        float temp_boost = 1.0 + p.temp * pc.temp_scale;
+        float scale_boost = 0.5 + 0.5 * p.pump_scale;
+
+        uint contrib = uint(pc.brightness * temp_boost * scale_boost * 32.0);
+        imageAtomicAdd(density_buf, px, max(contrib, 1u));
+    }
+}
