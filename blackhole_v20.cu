@@ -582,10 +582,17 @@ __global__ void spawnParticlesKernel(
     unsigned int* spawn_idx, // Atomic counter for spawn slot allocation
     unsigned int* spawn_success, // V8-style: counts SUCCESSFUL spawns only
     float time,
-    unsigned int seed        // Per-frame random seed
+    unsigned int seed,       // Per-frame random seed
+    const uint8_t* __restrict__ in_active_region  // Step 3: skip passive parents
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_current || !particle_active(disk, i)) return;
+    // Step 3d: passive parents don't spawn. Their pump_history is frozen
+    // (siphon doesn't update them), so a stale high history could trigger
+    // spawning from a settled particle. Also avoids a vel write race:
+    // spawn reduces parent vel on spawn_stream while passive kernel writes
+    // vel_y on default stream.
+    if (in_active_region && !in_active_region[i]) return;
 
     // Only coherent particles can spawn (sustained pumping = gravitationally bound)
     float history = disk->pump_history[i];
@@ -5038,7 +5045,8 @@ int main(int argc, char** argv) {
 
                     unsigned int spawn_seed = (unsigned int)(frame * 12345 + (int)(sim_time * 1000));
                     spawnParticlesKernel<<<spawn_blocks, threads, 0, spawn_stream>>>(
-                        d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed
+                        d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed,
+                        d_in_active_region
                     );
 
                     // Async copy spawn count (will be read NEXT frame)
