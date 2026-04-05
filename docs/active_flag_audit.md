@@ -131,60 +131,50 @@ Total: 14 rows. Every row is `NONE` for Step 2.
   `d_in_active_region[i]` (standalone buffer, local variable in
   `main()`). No aliasing risk.
 
-## Step 3 follow-ups (out of scope for Step 2)
+## Step 3 follow-ups — resolution status
 
-Items discovered during this audit that will need attention in Step 3
-but **must not** land in any Step 2 commit:
+Items discovered during the Step 2 audit, now resolved in Step 3
+(commits 3a–3e):
 
-- **Phase histogram exclusion of passive particles.** The kernel at
-  [blackhole_v20.cu:2332](../blackhole_v20.cu#L2332) counts every alive
-  non-ejected particle toward `peak_frac`. In Step 3 with selective
-  `in_active_region`, passive particles stop contributing to dynamical
-  updates but will still be counted in the histogram. Decision needed:
-  exclude them (changes `peak_frac` trajectory) or include them
-  (dilutes the active-region signal).
-- **`spawnParticlesKernel` `pump_history` freeze bias.** The spawn gate
-  at [physics.cu:378](../physics.cu#L378) → [382](../physics.cu#L382)
-  reads `pump_history[i]` as its primary coherence threshold. Passive
-  particles never update their `pump_history`, so its value freezes at
-  the last siphon-written value. In Step 2 this is moot (all-1s mask
-  means siphon still runs on every particle) but in Step 3 with
-  selective masks, frozen history creates either an under-spawning or
-  over-spawning bias in passive regions. `--no-spawn` baseline runs
-  sidestep the issue for verification.
-- **Static-bake grid staleness (R1 in plan).** `scatterStaticParticles`
-  at [blackhole_v20.cu:2435](../blackhole_v20.cu#L2435) bakes a
-  persistent grid from particles with `active_mask[i] == 0`. If the
-  passive kernel moves those particles in Step 3, the baked grid goes
-  stale until the next `REBAKE_INTERVAL = 256` frame rebake. Four
-  mitigation options exist (force rebake / snap-to-shell / fused mask
-  update / disable active compaction); decision deferred to Step 3
-  design review.
-- **`d_in_active_region[new_idx]` initialization on spawn.**
-  `spawnParticlesKernel` writes newborn particles without touching
-  `in_active_region`. In Step 2 this is fine because the buffer is
-  initialized to all-0xFF at allocation and every particle is "in the
-  bootstrap region." In Step 3 with selective regions, newborns need an
-  explicit initialization decision (default passive, default active, or
-  adopt from parent).
-- **Boundary recycle interaction with passive ownership.**
-  `apply_boundary_recycle` ([forces.cuh:222-245](../forces.cuh#L222))
-  teleports particles past `ION_KICK_OUTER_R = 200` back to
-  `ION_KICK_RESPAWN_R = 150` during siphon execution. In Step 3 a
-  recycled particle may also be in a passive region; the passive
-  kernel must skip it or the siphon's teleport write will race with
-  a passive position write. Mitigation: promote recycled particles to
-  active for one frame, or let the siphon update propagate through
-  `in_active_region` flipping.
-- **Stale comment at [physics.cu:5-12](../physics.cu#L5-L12).** The
-  file header claims "NOT compiled directly" but
-  [blackhole_v20.cu:544](../blackhole_v20.cu#L544) has
-  `#include "physics.cu"`. Trivial doc fix, not part of Step 2.
+- **Phase histogram exclusion of passive particles.** ✅ RESOLVED:
+  **no exclusion.** Passive particles remain in the histogram — they
+  advance theta via `omega_nat` (passive_advection.cuh:144) and their
+  contribution to `peak_frac` is physically meaningful. The grid
+  scatter kernels (which feed the histogram) still include all alive
+  particles.
+- **`spawnParticlesKernel` `pump_history` freeze bias.** ✅ RESOLVED
+  in commit 3d: passive parents skip spawning entirely via
+  `if (!in_active_region[i]) return;` added to the spawn kernel. This
+  prevents stale frozen `pump_history` from triggering spawning from
+  settled particles and eliminates the velocity write race between
+  `spawn_stream` (parent vel reduction) and default stream (passive
+  kernel `vel_y` write).
+- **Static-bake grid staleness (R1).** ✅ RESOLVED in commit 3c:
+  `g_active_compaction = false` when `ENABLE_PASSIVE_ADVECTION = 1`.
+  The passive kernel provides the dominant compute savings (siphon skip);
+  the scatter-skip savings are dwarfed. The baked static grid is
+  disabled to avoid staleness. Step 4 can re-enable with proper
+  rebake logic if profiling shows scatter as a bottleneck.
+- **`d_in_active_region[new_idx]` initialization on spawn.** ✅
+  RESOLVED by design: newborns have `pump_history = parent * 0.3`
+  (always < 0.7), so the mask kernel's `pump_history < 0.7f`
+  forced-active condition classifies them as active on the next frame.
+  No explicit write to `in_active_region[new_idx]` is needed.
+- **Boundary recycle interaction with passive ownership.** ✅ RESOLVED
+  by analysis: passive particles' radius is frozen by the passive
+  kernel (advances azimuthally at fixed `r_cyl`) and the mask kernel's
+  `r_cyl > PASSIVE_R_MAX` forces particles at the boundary to active.
+  Passive particles can never drift past `ION_KICK_OUTER_R = 200`.
+  No code change needed.
+- **Velocity fix-up on passive→active promotion.** ✅ RESOLVED in
+  commit 3b: the mask kernel snaps `vel_x/vel_z` to Keplerian
+  tangential (`v_kep = √(GM/r)`, prograde direction) when a particle
+  transitions from passive (old mask=0) to active (new mask=1).
+- **Stale comment at [physics.cu:5-12](../physics.cu#L5-L12).** Still
+  pending — trivial doc fix, not blocking any functionality.
 - **Stale field comment at
-  [blackhole_v20.cu:3601](../blackhole_v20.cu#L3601).** The
-  `ActiveParticleState` comment block refers to `d_particle_active`
-  but the actual field at line 3609 is named `d_active_mask`. Trivial
-  doc fix, not part of Step 2.
+  [blackhole_v20.cu:3601](../blackhole_v20.cu#L3601).** Still
+  pending — trivial doc fix.
 
 ## Verification
 
