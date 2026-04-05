@@ -2288,6 +2288,35 @@ __global__ void reduceKuramotoR(
 }
 
 // ============================================================================
+// PHASE HISTOGRAM
+// ============================================================================
+// Bins particle θ values into PHASE_HIST_BINS equal-width bins over [0, 2π).
+// A multi-peak histogram confirms multi-domain clustering; a single-peak or
+// smooth unimodal distribution would indicate the R_cell > R_global gap
+// comes from a different mechanism (e.g. spatial phase waves). Cheap:
+// one block-reduce, one small DtoH copy.
+
+#define PHASE_HIST_BINS 32
+
+__global__ void reducePhaseHistogram(
+    const GPUDisk* __restrict__ disk,
+    uint32_t N,
+    int* __restrict__ bin_counts  // [PHASE_HIST_BINS], zeroed before launch
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int)N) return;
+    if (!disk->active[i] || disk->ejected[i]) return;
+
+    float theta = disk->theta[i];
+    // Map to [0, PHASE_HIST_BINS)
+    float t = theta * (float)PHASE_HIST_BINS / 6.28318530718f;
+    int bin = (int)t;
+    if (bin < 0) bin = 0;
+    if (bin >= PHASE_HIST_BINS) bin = PHASE_HIST_BINS - 1;
+    atomicAdd(&bin_counts[bin], 1);
+}
+
+// ============================================================================
 // ACTIVE PARTICLE COMPACTION KERNELS
 // ============================================================================
 // Separate static (shell) particles from active (moving) particles.
@@ -3433,6 +3462,9 @@ int g_r_export_interval = 0;
 // Dense R(t) logging: prints R_global every N frames (0 = only every 90 like normal stats)
 int g_r_log_interval = 0;
 
+// RNG seed for initial particle positions, phases, and natural frequencies
+unsigned int g_rng_seed = 42;
+
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
 #define ARM_WIDTH_DEG 45.0f         // Width of each arm in degrees
 #define ARM_TRAP_STRENGTH 0.15f     // Angular momentum barrier strength
@@ -3694,6 +3726,11 @@ int main(int argc, char** argv) {
             extern int g_r_log_interval;
             g_r_log_interval = atoi(argv[++i]);
             printf("[kuramoto] Dense R(t) logging every %d frames\n", g_r_log_interval);
+        }
+        else if (strcmp(argv[i], "--rng-seed") == 0 && i+1 < argc) {
+            extern unsigned int g_rng_seed;
+            g_rng_seed = (unsigned int)atoi(argv[++i]);
+            printf("[rng] Initial-condition seed: %u\n", g_rng_seed);
         }
         else if (strcmp(argv[i], "--headless") == 0) {
             extern bool g_headless;
@@ -4224,7 +4261,7 @@ int main(int argc, char** argv) {
     std::vector<float> h_omega_nat(N);  // Kuramoto natural freq, Gaussian(ω₀, σ)
     std::vector<uint8_t> h_ejected(N), h_active(N);
 
-    std::mt19937 rng(42);
+    std::mt19937 rng(g_rng_seed);
     std::uniform_real_distribution<float> runif(0.0f, 1.0f);
     std::uniform_real_distribution<float> rphase(0, TWO_PI);
     std::normal_distribution<float> rnorm(0.0f, 1.0f);
@@ -4356,6 +4393,11 @@ int main(int argc, char** argv) {
     std::vector<float> h_kr_cos_sum(kr_max_blocks);
     std::vector<int> h_kr_count(kr_max_blocks);
     float R_global_cached = 0.0f;  // Last computed order parameter
+
+    // Phase histogram (for multi-domain clustering confirmation)
+    int* d_phase_hist;
+    cudaMalloc(&d_phase_hist, PHASE_HIST_BINS * sizeof(int));
+    std::vector<int> h_phase_hist(PHASE_HIST_BINS);
 
     // === NATURAL GROWTH: Spawn counter for atomic allocation ===
     // V8-style: separate counter for attempted slots vs successful spawns
@@ -5997,6 +6039,19 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // === Phase histogram: multi-domain clustering check ===
+            cudaMemsetAsync(d_phase_hist, 0, PHASE_HIST_BINS * sizeof(int));
+            int hist_blocks = (N_current + 255) / 256;
+            reducePhaseHistogram<<<hist_blocks, 256>>>(d_disk, N_current, d_phase_hist);
+            cudaMemcpy(h_phase_hist.data(), d_phase_hist, PHASE_HIST_BINS * sizeof(int), cudaMemcpyDeviceToHost);
+            // Compute max bin for normalization
+            int max_bin_count = 0;
+            long long hist_total = 0;
+            for (int b = 0; b < PHASE_HIST_BINS; b++) {
+                if (h_phase_hist[b] > max_bin_count) max_bin_count = h_phase_hist[b];
+                hist_total += h_phase_hist[b];
+            }
+
             printf("[frame %5d] fps=%.0f | particles=%d "
             "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f/Rrec=%.4f [%.3f/%.3f/%.3f]",
                    frame, fps_acc > 0 ? fps_frames / fps_acc : 0.0,
@@ -6019,6 +6074,50 @@ int main(int argc, char** argv) {
                 printf(" | DISSOLVING: %u (%.1f%%) at >0.95 stress", sc.high_stress_count, dissolution_pct);
             }
             printf("\n");
+
+            // Phase histogram (32 bins, ASCII heat map + numeric peak analysis).
+            // Multi-peak → multi-domain clustering. Flat → uniform. Single
+            // peak → global lock. Bin 0 = θ ∈ [0, 2π/32).
+            if (hist_total > 0 && max_bin_count > 0) {
+                printf("[phase-hist] ");
+                const char* ramps = " .,-:;=+*#%@";
+                int n_ramps = 12;
+                float expected = (float)hist_total / (float)PHASE_HIST_BINS;  // flat baseline
+                for (int b = 0; b < PHASE_HIST_BINS; b++) {
+                    float ratio = (float)h_phase_hist[b] / expected;
+                    if (ratio > 3.0f) ratio = 3.0f;
+                    int r = (int)(ratio * (n_ramps - 1) / 3.0f);
+                    if (r < 0) r = 0;
+                    if (r >= n_ramps) r = n_ramps - 1;
+                    putchar(ramps[r]);
+                }
+                printf(" max/avg=%.2f\n", (float)max_bin_count / expected);
+
+                // Peak detection: count local maxima that are ≥ 1.5× expected
+                // and compute how much of total mass is in peaks vs background.
+                int n_peaks = 0;
+                long long peak_mass = 0;
+                float peak_threshold = 1.5f * expected;
+                for (int b = 0; b < PHASE_HIST_BINS; b++) {
+                    int prev = h_phase_hist[(b + PHASE_HIST_BINS - 1) % PHASE_HIST_BINS];
+                    int curr = h_phase_hist[b];
+                    int next = h_phase_hist[(b + 1) % PHASE_HIST_BINS];
+                    if (curr > prev && curr > next && (float)curr > peak_threshold) {
+                        n_peaks++;
+                        peak_mass += curr;
+                    }
+                }
+                float peak_frac = (float)peak_mass / (float)hist_total;
+                printf("[phase-hist] peaks=%d  peak_mass_frac=%.3f\n", n_peaks, peak_frac);
+
+                // Numeric dump: ratio per bin for quantitative inspection
+                printf("[phase-hist-num] ");
+                for (int b = 0; b < PHASE_HIST_BINS; b++) {
+                    float ratio = (float)h_phase_hist[b] / expected;
+                    printf("%.2f ", ratio);
+                }
+                printf("\n");
+            }
             float latest_Q = topology_recorder_get_latest_Q();
             printf("[%s] num=%d Q=%.2f | ",
                    g_use_hopfion_topology ? "hopfion shells" : "smooth gradient",
