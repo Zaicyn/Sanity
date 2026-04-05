@@ -60,6 +60,7 @@
 #include "aizawa.cuh"
 // topology.cuh moved after device constant definitions (needs d_NUM_ARMS etc.)
 #include "sun_trace.cuh"
+#include "passive_advection.cuh"  // Tree Architecture Step 2: passive Keplerian advection kernel (compiled, not yet launched)
 #include "cuda_primitives.cuh"
 #include "octree.cuh"
 #include "cell_grid.cuh"
