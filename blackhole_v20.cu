@@ -60,7 +60,8 @@
 #include "aizawa.cuh"
 // topology.cuh moved after device constant definitions (needs d_NUM_ARMS etc.)
 #include "sun_trace.cuh"
-#include "passive_advection.cuh"  // Tree Architecture Step 2: passive Keplerian advection kernel (compiled, not yet launched)
+#include "passive_advection.cuh"  // Tree Architecture Step 2: passive Keplerian advection kernel
+#include "active_region.cuh"      // Tree Architecture Step 2: ActiveRegion struct + in-region mask kernel
 #include "cuda_primitives.cuh"
 #include "octree.cuh"
 #include "cell_grid.cuh"
@@ -174,11 +175,12 @@ static int g_octree_particle_cap = 500000;    // Safe default, recalculated from
 #endif
 
 // Tree Architecture Step 2: compile-time guard for passive advection dispatch.
-// Default off in commit 2c; flipped on in commit 2d with the all-encompassing
-// ActiveRegion bootstrap (still zero-behavior-change because the bootstrap
-// mask is all-1s and the passive kernel early-returns on every particle).
+// Flipped ON in commit 2d. Still zero-behavior-change because the
+// all-encompassing bootstrap ActiveRegion makes in_active_region[i] == 1 for
+// every alive particle, so the passive kernel early-returns on every particle
+// and siphonDiskKernel runs unchanged on every particle.
 #ifndef ENABLE_PASSIVE_ADVECTION
-#define ENABLE_PASSIVE_ADVECTION 0
+#define ENABLE_PASSIVE_ADVECTION 1
 #endif
 
 // NOTE: Physics constants (BH_MASS, ISCO_R, PUMP_*, ION_KICK_*, etc.)
@@ -4825,6 +4827,34 @@ int main(int argc, char** argv) {
                in_active_region_size);
     }
 
+    // === TREE ARCHITECTURE STEP 2: bootstrap ActiveRegion ===
+    // Allocate a small fixed-size array of ActiveRegion slots and seed
+    // exactly one all-encompassing region that covers the entire simulation
+    // volume. Every alive particle will test as "inside" this region, so
+    // computeInActiveRegionMask will write 1 to in_active_region[i] for
+    // every alive particle, the passive kernel's third early-return will
+    // trigger on every particle, and behavior is byte-identical to
+    // pre-Step-2. Step 3 will replace this with dynamic region lifecycle.
+    ActiveRegion* d_active_regions = nullptr;
+    int h_num_active_regions = 0;
+    {
+        cudaMalloc(&d_active_regions, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+        cudaMemset(d_active_regions, 0, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+
+        ActiveRegion h_bootstrap = {};
+        h_bootstrap.gate_positions[0] = make_float3(-500.0f, -500.0f, -500.0f);
+        h_bootstrap.gate_positions[1] = make_float3( 500.0f,  500.0f,  500.0f);
+        h_bootstrap.gate_positions[2] = make_float3(0.0f, 0.0f, 0.0f);
+        h_bootstrap.parent_shell = -1;
+        h_bootstrap.birth_frame = 0;
+        h_bootstrap.stability_integral = 0.0f;
+        h_bootstrap.state = REGION_STATE_ACTIVE;
+        cudaMemcpy(d_active_regions, &h_bootstrap, sizeof(ActiveRegion),
+                   cudaMemcpyHostToDevice);
+        h_num_active_regions = 1;
+        printf("[passive] ActiveRegion bootstrap: 1 all-encompassing region seeded (state=ACTIVE, bounds=±500)\n");
+    }
+
     // Timing
     float sim_time = 0.0f;
     int frame = 0;
@@ -4926,13 +4956,25 @@ int main(int argc, char** argv) {
             siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
 
 #if ENABLE_PASSIVE_ADVECTION
-            // Tree Architecture Step 2: passive advection for particles
-            // outside any active region. ORDERING: must complete before the
-            // scatter/activity-mask pipeline reads disk->pos_*. Default-stream
-            // serialization guarantees this. In Step 2 the in_active_region
-            // buffer is all-1s, so this kernel early-returns on every
-            // particle and does no writes — the launch exists only to prove
-            // the dispatch plumbing compiles.
+            // Tree Architecture Step 2: passive/active region dispatch.
+            // 1. computeInActiveRegionMask writes in_active_region[i] = 1
+            //    if particle i is inside any ACTIVE region, else 0. In
+            //    Step 2 the bootstrap region covers the whole simulation,
+            //    so every alive particle is marked 1.
+            // 2. advectPassiveParticles processes particles with mask == 0.
+            //    In Step 2 this set is empty, so the kernel does no writes.
+            // ORDERING: siphonDiskKernel launched above, then mask, then
+            // passive advect. Default-stream serialization ensures the
+            // sequence is consistent with the subsequent scatter/gather
+            // pipeline that reads disk->pos_* via d_particle_cell.
+            // INVARIANT: for every particle, exactly one of siphon or
+            // passive does a position/theta write per frame. Step 2
+            // enforces this trivially (passive early-returns everywhere).
+            // Step 3 will enforce it by adding `|| in_active_region[i]`
+            // to siphonDiskKernel's entry guard (physics.cu:105).
+            computeInActiveRegionMask<<<spawn_blocks, threads>>>(
+                d_disk, d_active_regions, h_num_active_regions,
+                d_in_active_region, N_current);
             advectPassiveParticles<<<spawn_blocks, threads>>>(
                 d_disk, d_in_active_region, N_current,
                 dt_sim * 2.0f, PASSIVE_RESIDUAL_TAU);
