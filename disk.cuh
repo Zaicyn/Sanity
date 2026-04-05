@@ -235,6 +235,13 @@ __device__ float cuda_fast_atan2(float y, float x);
 //   - pump_history: exponentially smoothed activity (emergence metric)
 //   - jet_phase: phase memory through ejection cycle
 
+// Packed flag bits for GPUDisk.flags — replaces separate bool arrays.
+// Bit layout was chosen to leave room for future state bits without
+// widening the byte. Reserved bits must be zero.
+#define PFLAG_ACTIVE    0x01
+#define PFLAG_EJECTED   0x02
+// bits 2-7 reserved
+
 struct GPUDisk {
     // Position (3 floats × N)
     float pos_x[MAX_DISK_PTS];
@@ -249,19 +256,15 @@ struct GPUDisk {
     // NOTE: disk_r, disk_phi, temp, in_disk removed — computed on-demand
     // Saves 13 bytes/particle × 10M = 130 MB VRAM and ~37 GB/s bandwidth
 
-    // Siphon pump state per particle
+    // Siphon pump state per particle — float fields grouped together
+    // to avoid alignment padding around 1-byte fields.
     int   pump_state[MAX_DISK_PTS];      // siphon_state_t (0-7)
     float pump_scale[MAX_DISK_PTS];      // scale_factor (coherence level)
     int   pump_coherent[MAX_DISK_PTS];   // coherent_count
-    uint8_t pump_seam[MAX_DISK_PTS];     // seam phase bits
     float pump_residual[MAX_DISK_PTS];   // current residual
     float pump_work[MAX_DISK_PTS];       // accumulated work
-
-    // Emergence: per-particle pump history for self-organization
-    float pump_history[MAX_DISK_PTS];    // smoothed pump activity
-
-    // Jet phase memory: tracks phase through ejection/Aizawa/return cycle
-    float jet_phase[MAX_DISK_PTS];
+    float pump_history[MAX_DISK_PTS];    // smoothed pump activity (emergence)
+    float jet_phase[MAX_DISK_PTS];       // phase memory through ejection cycle
 
     // Kuramoto phase coupling (math.md Step 8, Step 10, Step 11)
     // theta advances at rate omega_nat per frame, plus mean-field coupling
@@ -270,10 +273,33 @@ struct GPUDisk {
     float theta[MAX_DISK_PTS];       // phase in [0, 2π), continuous rotation
     float omega_nat[MAX_DISK_PTS];   // natural frequency, Gaussian spread
 
-    // Flags
-    bool  ejected[MAX_DISK_PTS];
-    bool  active[MAX_DISK_PTS];
+    // Byte-sized fields packed at the end to avoid alignment padding that
+    // would otherwise cost 3 bytes per particle (previous layout had
+    // pump_seam as a uint8_t between two floats, forcing 3 bytes of pad).
+    uint8_t pump_seam[MAX_DISK_PTS]; // seam phase bits
+    uint8_t flags[MAX_DISK_PTS];     // bit0=active, bit1=ejected (see PFLAG_*)
 };
+
+// Packed-flag accessors for the ejected/active bits previously stored as
+// separate bool arrays. Keeps call sites readable and makes the bit
+// manipulation explicit in one place.
+__device__ __forceinline__ bool particle_active(const GPUDisk* disk, int i) {
+    return (disk->flags[i] & PFLAG_ACTIVE) != 0;
+}
+
+__device__ __forceinline__ bool particle_ejected(const GPUDisk* disk, int i) {
+    return (disk->flags[i] & PFLAG_EJECTED) != 0;
+}
+
+__device__ __forceinline__ void set_particle_active(GPUDisk* disk, int i, bool v) {
+    if (v) disk->flags[i] |= PFLAG_ACTIVE;
+    else   disk->flags[i] &= (uint8_t)~PFLAG_ACTIVE;
+}
+
+__device__ __forceinline__ void set_particle_ejected(GPUDisk* disk, int i, bool v) {
+    if (v) disk->flags[i] |= PFLAG_EJECTED;
+    else   disk->flags[i] &= (uint8_t)~PFLAG_EJECTED;
+}
 
 // ============================================================================
 // Derived Particle Properties — Compute On-Demand

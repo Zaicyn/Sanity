@@ -102,7 +102,7 @@ __global__ void siphonDiskKernel(
     float global_bias)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N || !disk->active[i]) return;
+    if (i >= N || !particle_active(disk, i)) return;
 
     // ========================================================================
     // STEP 1: LOAD PARTICLE STATE (Single Coalesced Read)
@@ -122,7 +122,7 @@ __global__ void siphonDiskKernel(
     float residual = disk->pump_residual[i];
     float work = disk->pump_work[i];
     float history = disk->pump_history[i];
-    bool was_ejected = disk->ejected[i];
+    bool was_ejected = particle_ejected(disk, i);
 
     // ========================================================================
     // STEP 2: COMPUTE DISTANCES AND ANGULAR MOMENTUM
@@ -346,7 +346,7 @@ __global__ void siphonDiskKernel(
     disk->pump_coherent[i] = coherent;
     disk->pump_residual[i] = residual;
     disk->pump_work[i] = work;
-    disk->ejected[i] = eject;
+    set_particle_ejected(disk, i, eject);
 
     // Write back jet_phase delta
     if (was_ejected && jet_phase_delta != 0.0f) {
@@ -375,7 +375,7 @@ __global__ void spawnParticlesKernel(
     unsigned int seed)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N_current || !disk->active[i]) return;
+    if (i >= N_current || !particle_active(disk, i)) return;
 
     // Check spawn eligibility
     float history = disk->pump_history[i];
@@ -469,8 +469,7 @@ __global__ void spawnParticlesKernel(
     disk->pump_work[new_idx] = 0.0f;
     disk->pump_history[new_idx] = history * 0.5f;
     disk->jet_phase[new_idx] = disk->jet_phase[i];
-    disk->ejected[new_idx] = false;
-    disk->active[new_idx] = true;
+    disk->flags[new_idx] = PFLAG_ACTIVE;  // active, not ejected
 
     atomicAdd(&d_spawn_count, 1);
 }

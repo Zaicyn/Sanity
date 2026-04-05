@@ -231,9 +231,13 @@ inline void initVRAMConfig() {
     size_t misc_overhead = 5ULL * 1024 * 1024;      // 5 MB (fixed)
     size_t fixed_overhead = grid_overhead + octree_overhead + sparse_overhead + misc_overhead;
 
-    // Calculate safe particle cap
-    // Memory per particle: 76 (GPUDisk + theta + omega_nat) + 16 (morton/xor/ids/cell) = 92 bytes
-    size_t bytes_per_particle = 92;
+    // Calculate safe particle cap. Derive per-particle bytes from the struct
+    // so a future field addition/removal updates the calculator automatically.
+    //   GPUDisk:  sizeof(GPUDisk) / MAX_DISK_PTS  (struct size + alignment)
+    //   Auxiliary: morton (8) + xor (4) + ids (4) + cell (4) = 20 bytes
+    const size_t gpudisk_bytes = sizeof(GPUDisk) / (size_t)MAX_DISK_PTS;
+    const size_t aux_bytes = 20;
+    size_t bytes_per_particle = gpudisk_bytes + aux_bytes;
     int max_particles = (int)((usable_mem - fixed_overhead) / bytes_per_particle);
 
     // Round down to warp-aligned boundary (V8 style: 32 threads)
@@ -252,7 +256,7 @@ inline void initVRAMConfig() {
     // Thrust radix_sort needs ~24 bytes temporary per element
     // Morton buffers: 8 (keys) + 4 (xor) + 4 (ids) = 16 bytes/particle
     // Total: 16 + 24 = 40 bytes/particle for octree rebuild
-    size_t gpudisk_overhead = (size_t)g_runtime_particle_cap * 68;  // GPUDisk struct
+    size_t gpudisk_overhead = (size_t)g_runtime_particle_cap * gpudisk_bytes;  // GPUDisk struct (computed above)
     size_t octree_budget = usable_mem - grid_overhead - octree_overhead - sparse_overhead - misc_overhead - gpudisk_overhead;
     size_t bytes_per_particle_octree = 40;  // morton + thrust temp
     int octree_cap = (int)(octree_budget / bytes_per_particle_octree);
@@ -554,7 +558,7 @@ __global__ void spawnParticlesKernel(
     unsigned int seed        // Per-frame random seed
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N_current || !disk->active[i]) return;
+    if (i >= N_current || !particle_active(disk, i)) return;
 
     // Only coherent particles can spawn (sustained pumping = gravitationally bound)
     float history = disk->pump_history[i];
@@ -679,8 +683,7 @@ __global__ void spawnParticlesKernel(
     disk->omega_nat[new_idx] = disk->omega_nat[i];
 
     // Activate the new particle
-    disk->ejected[new_idx] = false;
-    disk->active[new_idx] = true;
+    disk->flags[new_idx] = PFLAG_ACTIVE;  // active, not ejected
 
     // V8-style: only count SUCCESSFUL spawns (after all writes complete)
     // This ensures spawn_success == actual initialized particles
@@ -766,7 +769,7 @@ __global__ void fillVulkanParticleBuffer(
 
     // Pack data into Vulkan vertex format
     // Inactive particles get zeroed (will be culled by alpha=0 in shader)
-    if (disk->active[i]) {
+    if (particle_active(disk, i)) {
         float px = disk->pos_x[i];
         float py = disk->pos_y[i];
         float pz = disk->pos_z[i];
@@ -820,7 +823,7 @@ __global__ void fillVulkanSunTraceBuffer(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    if (disk->active[i]) {
+    if (particle_active(disk, i)) {
         // Store actual positions directly for lossless rendering
         // (Reconstruction from phase state had precision issues causing diagonal artifacts)
         float px = disk->pos_x[i];
@@ -835,7 +838,7 @@ __global__ void fillVulkanSunTraceBuffer(
 
         // Pack flags - active particle
         uint32_t flags = SUN_FLAG_ACTIVE;
-        if (disk->ejected[i]) flags |= SUN_FLAG_EJECTED;
+        if (particle_ejected(disk, i)) flags |= SUN_FLAG_EJECTED;
         output[i].packed_state = ((uint32_t)disk->pump_seam[i] << 8) | (flags << 16);
 
         // Store rendering properties
@@ -893,7 +896,7 @@ __global__ void fillVulkanParticleBufferLOD(
     if (i >= N) return;
 
     // Skip inactive particles entirely
-    if (!disk->active[i]) {
+    if (!particle_active(disk, i)) {
         // Zero out this slot
         output[i].position[0] = 0.0f;
         output[i].position[1] = 1e9f;  // Far away, culled by depth
@@ -1040,7 +1043,7 @@ __global__ void compactVisibleParticles(
     if (i >= N) return;
 
     // Skip inactive particles
-    if (!disk->active[i]) return;
+    if (!particle_active(disk, i)) return;
 
     // Get particle position
     float px = disk->pos_x[i];
@@ -1129,7 +1132,7 @@ __global__ void assignMortonKeys(
     float r  = sqrtf(px*px + py*py + pz*pz);
 
     // Outer/inactive particles get max key — sort to end
-    if (!disk->active[i] || r >= HYBRID_R) {
+    if (!particle_active(disk, i) || r >= HYBRID_R) {
         morton_keys[i]  = 0xFFFFFFFFFFFFFFFFULL;
         xor_corners[i]  = 0xFFFFFFFF;
         particle_ids[i] = i;
@@ -1804,7 +1807,7 @@ __global__ void scatterParticlesToCells(
     if (i >= N) return;
 
     // Skip inactive particles (but still mark their cell as invalid)
-    if (!disk->active[i]) {
+    if (!particle_active(disk, i)) {
         particle_cell[i] = UINT32_MAX;
         return;
     }
@@ -2261,7 +2264,7 @@ __global__ void reduceKuramotoR(
 
     float my_sin = 0.0f, my_cos = 0.0f;
     int my_cnt = 0;
-    if (i < (int)N && disk->active[i] && !disk->ejected[i]) {
+    if (i < (int)N && particle_active(disk, i) && !particle_ejected(disk, i)) {
         float theta = disk->theta[i];
         my_sin = cuda_lut_sin(theta);
         my_cos = cuda_lut_cos(theta);
@@ -2310,7 +2313,7 @@ __global__ void reducePhaseHistogram(
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int)N) return;
-    if (!disk->active[i] || disk->ejected[i]) return;
+    if (!particle_active(disk, i) || particle_ejected(disk, i)) return;
 
     float theta = disk->theta[i];
     float t = theta * (float)PHASE_HIST_BINS / 6.28318530718f;
@@ -2342,7 +2345,7 @@ __global__ void computeParticleActivityMask(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    if (!disk->active[i]) {
+    if (!particle_active(disk, i)) {
         active_mask[i] = 0;
         return;
     }
@@ -2428,7 +2431,7 @@ __global__ void scatterStaticParticles(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    if (!disk->active[i] || active_mask[i]) return;  // Skip inactive or active particles
+    if (!particle_active(disk, i) || active_mask[i]) return;  // Skip inactive or active particles
 
     float px = disk->pos_x[i];
     float py = disk->pos_y[i];
@@ -2639,7 +2642,7 @@ __global__ void scatterWithTileFlags(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    if (!disk->active[i]) {
+    if (!particle_active(disk, i)) {
         particle_cell[i] = UINT32_MAX;
         return;
     }
@@ -2853,7 +2856,7 @@ __global__ void applyPressureVorticityKernel(
     if (sorted_idx >= num_active) return;
 
     uint32_t orig_idx = particle_ids[sorted_idx];
-    if (!disk->active[orig_idx]) return;
+    if (!particle_active(disk, orig_idx)) return;
 
     uint64_t my_key = morton_keys[sorted_idx];
 
@@ -3230,7 +3233,7 @@ bool use_hopfion_topology)  // NEW: control experiment parameter
     // Process samples and bin by radius
     for (int i = threadIdx.x; i < N_samples; i += blockDim.x) {
         int idx = sample_indices[i];
-        if (disk->active[idx]) {
+        if (particle_active(disk, idx)) {
             // Global averages
             atomicAdd(&s_scale, disk->pump_scale[idx]);
             atomicAdd(&s_residual, fabsf(disk->pump_residual[idx]));
@@ -3676,8 +3679,7 @@ __global__ void injectEntropyCluster(GPUDisk* disk, int N, float sim_time) {
     disk->pump_coherent[idx] = 0;
     disk->pump_seam[idx] = 0x00;  // Closed (will be forced open by stress)
 
-    disk->ejected[idx] = false;
-    disk->active[idx] = true;
+    disk->flags[idx] = PFLAG_ACTIVE;  // active, not ejected
     // NOTE: disk_r, disk_phi, temp, in_disk no longer stored — computed on-demand
 }
 
@@ -4307,7 +4309,7 @@ int main(int argc, char** argv) {
     std::vector<float> h_history(N);  // pump_history for emergence
     std::vector<float> h_theta(N);      // Kuramoto phase, uniform random [0, 2π)
     std::vector<float> h_omega_nat(N);  // Kuramoto natural freq, Gaussian(ω₀, σ)
-    std::vector<uint8_t> h_ejected(N), h_active(N);
+    std::vector<uint8_t> h_flags(N);    // packed PFLAG_ACTIVE | PFLAG_EJECTED
 
     std::mt19937 rng(g_rng_seed);
     std::uniform_real_distribution<float> runif(0.0f, 1.0f);
@@ -4378,13 +4380,12 @@ int main(int argc, char** argv) {
         h_theta[i] = rphase(rng);
         h_omega_nat[i] = g_omega_base + g_omega_spread * rnorm(rng);
 
-        h_ejected[i] = 0;
-        h_active[i] = 1;
+        h_flags[i] = PFLAG_ACTIVE;  // active, not ejected
     }
 
     // Debug: verify active count
     int active_count = 0;
-    for (int i = 0; i < N; i++) if (h_active[i]) active_count++;
+    for (int i = 0; i < N; i++) if (h_flags[i] & PFLAG_ACTIVE) active_count++;
     printf("[lattice] %d particles initialized in %.0f×%.0f×%.0f box (active=%d)\n",
            N, box_half*2, box_height*2, box_half*2, active_count);
     printf("[kuramoto-init] theta uniform[0,2π), omega_nat ~ N(%.2f, %.2f)\n",
@@ -4420,8 +4421,7 @@ int main(int argc, char** argv) {
     UPLOAD(pump_history, h_history);
     UPLOAD(theta, h_theta);
     UPLOAD(omega_nat, h_omega_nat);
-    UPLOAD(ejected, h_ejected);
-    UPLOAD(active, h_active);
+    UPLOAD(flags, h_flags);
     #undef UPLOAD
 
     StressCounters* d_stress;
