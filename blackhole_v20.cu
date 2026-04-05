@@ -1987,7 +1987,8 @@ __global__ void gatherCellForcesToParticles(
     float shear_k,      // Phase-misalignment shear (non-monotonic magnetic friction)
     float rho_ref,      // Reference density for shear normalization (mean × 8)
     float kuramoto_k,   // Kuramoto phase coupling strength (0 = free-running only)
-    int   use_n12       // 1 = apply N12 mixer envelope to coupling, 0 = constant K
+    int   use_n12,      // 1 = apply N12 mixer envelope to coupling, 0 = constant K
+    float envelope_scale // Harmonic index multiplier: cos(3s·θ)·cos(4s·θ). s=1 is N12 baseline.
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -2136,8 +2137,10 @@ __global__ void gatherCellForcesToParticles(
                 // N12 envelope: 0.5 + 0.5·cos(3θ)·cos(4θ), period LCM(3,4)=12
                 float envelope = 1.0f;
                 if (use_n12) {
-                    float c3 = cuda_lut_cos(3.0f * theta_i);
-                    float c4 = cuda_lut_cos(4.0f * theta_i);
+                    // envelope_scale controls the harmonic indices; s=1 is N12 baseline.
+                    // s=2 → period halves → predicts optimal ω doubles (GPT test).
+                    float c3 = cuda_lut_cos(3.0f * envelope_scale * theta_i);
+                    float c4 = cuda_lut_cos(4.0f * envelope_scale * theta_i);
                     envelope = 0.5f + 0.5f * c3 * c4;
                 }
 
@@ -2464,7 +2467,8 @@ __global__ void gatherToActiveParticles(
     float shear_k,
     float rho_ref,
     float kuramoto_k,
-    int   use_n12
+    int   use_n12,
+    float envelope_scale
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= active_count) return;
@@ -2566,8 +2570,10 @@ __global__ void gatherToActiveParticles(
                 float coupling = mean_sin * cos_i - mean_cos * sin_i;
                 float envelope = 1.0f;
                 if (use_n12) {
-                    float c3 = cuda_lut_cos(3.0f * theta_i);
-                    float c4 = cuda_lut_cos(4.0f * theta_i);
+                    // envelope_scale controls the harmonic indices; s=1 is N12 baseline.
+                    // s=2 → period halves → predicts optimal ω doubles (GPT test).
+                    float c3 = cuda_lut_cos(3.0f * envelope_scale * theta_i);
+                    float c4 = cuda_lut_cos(4.0f * envelope_scale * theta_i);
                     envelope = 0.5f + 0.5f * c3 * c4;
                 }
                 dtheta += kuramoto_k * envelope * coupling;
@@ -3460,6 +3466,9 @@ float g_kuramoto_k = 0.0f;        // Coupling strength K (0 = no coupling)
 float g_omega_base = 1.0f;        // Mean natural frequency ω₀
 float g_omega_spread = 0.05f;     // Gaussian std-dev σ for ω distribution
 bool  g_n12_envelope = true;      // Apply N12 mixer envelope to coupling (math.md Step 11)
+float g_envelope_scale = 1.0f;    // Multiplier on envelope harmonic indices: cos(3s·θ)·cos(4s·θ).
+                                  // s=1 → period 2π (default N12). s=2 → period π (N6). s=0.5 → period 4π (N24).
+                                  // Tests GPT's prediction: optimal ω should scale as 1/envelope_period.
 
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
@@ -3721,6 +3730,12 @@ int main(int argc, char** argv) {
             extern bool g_n12_envelope;
             g_n12_envelope = false;
             printf("[kuramoto] N12 envelope DISABLED (constant K)\n");
+        }
+        else if (strcmp(argv[i], "--envelope-scale") == 0 && i+1 < argc) {
+            extern float g_envelope_scale;
+            g_envelope_scale = (float)atof(argv[++i]);
+            printf("[kuramoto] Envelope harmonic scale: %.3f (period = 2π/%.3f)\n",
+                   g_envelope_scale, g_envelope_scale);
         }
         else if (strcmp(argv[i], "--r-export-interval") == 0 && i+1 < argc) {
             extern int g_r_export_interval;
@@ -5407,7 +5422,7 @@ int main(int argc, char** argv) {
                             d_grid_phase_sin, d_grid_phase_cos,
                             d_particle_cell, g_active_particles.d_active_list,
                             g_active_particles.h_active_count, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
-                            g_kuramoto_k, g_n12_envelope ? 1 : 0
+                            g_kuramoto_k, g_n12_envelope ? 1 : 0, g_envelope_scale
                         );
                     } else {
                         // Full gather to all particles
@@ -5416,7 +5431,7 @@ int main(int argc, char** argv) {
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
                             d_grid_phase_sin, d_grid_phase_cos,
                             d_particle_cell, N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
-                            g_kuramoto_k, g_n12_envelope ? 1 : 0
+                            g_kuramoto_k, g_n12_envelope ? 1 : 0, g_envelope_scale
                         );
                     }
                     cudaEventRecord(e_gather_end);
@@ -5516,7 +5531,8 @@ int main(int argc, char** argv) {
                         g_shear_k,
                         shear_rho_ref_cadence,
                         g_kuramoto_k,
-                        g_n12_envelope ? 1 : 0
+                        g_n12_envelope ? 1 : 0,
+                        g_envelope_scale
                     );
 
                     // Debug stats every 900 frames
