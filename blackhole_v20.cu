@@ -3482,6 +3482,11 @@ int g_r_log_interval = 0;
 // Writes to stdout prefixed with [QR-corr] so the stream can be filtered offline.
 bool g_qr_corr_log = false;
 
+// Initial rotation direction: prograde (default) or retrograde.
+// Used for the chirality / Q-sign test — if Q drift is driven by initial
+// rotation direction, flipping this should flip the sign of Q drift.
+bool g_retrograde_init = false;
+
 // RNG seed for initial particle positions, phases, and natural frequencies
 unsigned int g_rng_seed = 42;
 
@@ -3752,6 +3757,11 @@ int main(int argc, char** argv) {
             extern bool g_qr_corr_log;
             g_qr_corr_log = true;
             printf("[qr-corr] Kuramoto × topology correlation dump ENABLED\n");
+        }
+        else if (strcmp(argv[i], "--retrograde") == 0) {
+            extern bool g_retrograde_init;
+            g_retrograde_init = true;
+            printf("[init] Retrograde initial rotation (counterclockwise → clockwise)\n");
         }
         else if (strcmp(argv[i], "--r-export-interval") == 0 && i+1 < argc) {
             extern int g_r_export_interval;
@@ -4339,7 +4349,9 @@ int main(int argc, char** argv) {
         if (r_xz > 0.1f) {
             // Prograde rotation (counterclockwise when viewed from +Y)
             // v_tangent ~ 0.3 × v_keplerian
-            float v_rot = 0.3f * sqrtf(BH_MASS / fmaxf(r, ISCO_R));
+            // Sign flip via --retrograde for chirality test (Q-drift symmetry)
+            float rot_sign = g_retrograde_init ? -1.0f : 1.0f;
+            float v_rot = rot_sign * 0.3f * sqrtf(BH_MASS / fmaxf(r, ISCO_R));
             h_vx[i] = -v_rot * (z / r_xz) + rnorm(rng) * 0.05f;
             h_vy[i] = rnorm(rng) * 0.03f;
             h_vz[i] = v_rot * (x / r_xz) + rnorm(rng) * 0.05f;
