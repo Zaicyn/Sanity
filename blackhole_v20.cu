@@ -3095,7 +3095,7 @@ bool g_use_hopfion_topology = true;
 // ============================================================================
 // Toggle between discrete arm boundaries vs smooth density waves
 // A key toggles: true = discrete boundaries, false = smooth waves
-bool g_enable_arms = true;          // Enable/disable arm structure entirely
+bool g_enable_arms = false;         // Enable/disable arm structure (off by default, use --discrete-arms or --smooth-arms)
 bool g_use_arm_topology = true;     // true = discrete, false = smooth
 
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
