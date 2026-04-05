@@ -3450,6 +3450,7 @@ bool g_use_hopfion_topology = true;
 // Toggle between discrete arm boundaries vs smooth density waves
 // A key toggles: true = discrete boundaries, false = smooth waves
 bool g_enable_arms = false;         // Enable/disable arm structure (off by default, use --discrete-arms or --smooth-arms)
+bool g_spawn_enabled = true;        // Natural growth spawning (--no-spawn disables for clean Kuramoto measurements)
 bool g_use_arm_topology = true;     // true = discrete, false = smooth
 
 // Phase-misalignment shear (non-monotonic magnetic friction analog)
@@ -3475,6 +3476,11 @@ int g_r_export_interval = 0;
 
 // Dense R(t) logging: prints R_global every N frames (0 = only every 90 like normal stats)
 int g_r_log_interval = 0;
+
+// Kuramoto × topology correlation dump — emits one CSV-friendly row per stats
+// frame with (frame, R, R_recon, n_peaks, peak_mass_frac, Q, num_shells, active_count).
+// Writes to stdout prefixed with [QR-corr] so the stream can be filtered offline.
+bool g_qr_corr_log = false;
 
 // RNG seed for initial particle positions, phases, and natural frequencies
 unsigned int g_rng_seed = 42;
@@ -3737,6 +3743,16 @@ int main(int argc, char** argv) {
             printf("[kuramoto] Envelope harmonic scale: %.3f (period = 2π/%.3f)\n",
                    g_envelope_scale, g_envelope_scale);
         }
+        else if (strcmp(argv[i], "--no-spawn") == 0) {
+            extern bool g_spawn_enabled;
+            g_spawn_enabled = false;
+            printf("[spawn] Natural growth DISABLED — particle count locked\n");
+        }
+        else if (strcmp(argv[i], "--qr-corr") == 0) {
+            extern bool g_qr_corr_log;
+            g_qr_corr_log = true;
+            printf("[qr-corr] Kuramoto × topology correlation dump ENABLED\n");
+        }
         else if (strcmp(argv[i], "--r-export-interval") == 0 && i+1 < argc) {
             extern int g_r_export_interval;
             g_r_export_interval = atoi(argv[++i]);
@@ -3864,6 +3880,8 @@ int main(int argc, char** argv) {
             printf("  --no-n12           Disable N12 mixer envelope on Kuramoto coupling\n");
             printf("  --r-export-interval <N>  Dump per-cell R grid to r_export/frame_NNNNN.bin every N frames (0=off)\n");
             printf("  --r-log-interval <N>     Print dense R(t) samples every N frames for time-series analysis (0=off)\n");
+            printf("  --no-spawn               Disable natural growth — particle count locked for clean measurements\n");
+            printf("  --qr-corr                Dump [QR-corr] CSV rows each stats frame: R, Rrec, peaks, mass_frac, Q, shells, ...\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -4879,20 +4897,22 @@ int main(int argc, char** argv) {
                     // If not ready, just wait until next frame (no stall)
                 }
 
-                // Launch spawn kernel for THIS frame
-                cudaMemsetAsync(d_spawn_idx, 0, sizeof(unsigned int), spawn_stream);
-                cudaMemsetAsync(d_spawn_success, 0, sizeof(unsigned int), spawn_stream);
+                // Launch spawn kernel for THIS frame (unless disabled for clean measurements)
+                if (g_spawn_enabled) {
+                    cudaMemsetAsync(d_spawn_idx, 0, sizeof(unsigned int), spawn_stream);
+                    cudaMemsetAsync(d_spawn_success, 0, sizeof(unsigned int), spawn_stream);
 
-                unsigned int spawn_seed = (unsigned int)(frame * 12345 + (int)(sim_time * 1000));
-                spawnParticlesKernel<<<spawn_blocks, threads, 0, spawn_stream>>>(
-                    d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed
-                );
+                    unsigned int spawn_seed = (unsigned int)(frame * 12345 + (int)(sim_time * 1000));
+                    spawnParticlesKernel<<<spawn_blocks, threads, 0, spawn_stream>>>(
+                        d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed
+                    );
 
-                // Async copy spawn count (will be read NEXT frame)
-                cudaMemcpyAsync(h_spawn_pinned, d_spawn_success, sizeof(unsigned int),
-                               cudaMemcpyDeviceToHost, spawn_stream);
-                cudaEventRecord(spawn_ready, spawn_stream);
-                spawn_pending = true;
+                    // Async copy spawn count (will be read NEXT frame)
+                    cudaMemcpyAsync(h_spawn_pinned, d_spawn_success, sizeof(unsigned int),
+                                   cudaMemcpyDeviceToHost, spawn_stream);
+                    cudaEventRecord(spawn_ready, spawn_stream);
+                    spawn_pending = true;
+                }
             }
             if (do_timing) cudaEventRecord(t_siphon);
 
@@ -6110,6 +6130,11 @@ int main(int argc, char** argv) {
             // Phase histogram (32 bins, ASCII heat map + numeric peak analysis).
             // Multi-peak → multi-domain clustering. Flat → uniform. Single
             // peak → global lock. Bin 0 = θ ∈ [0, 2π/32).
+            //
+            // n_peaks and peak_frac are hoisted to outer scope so the
+            // Kuramoto × topology correlation dump below can read them.
+            int n_peaks = 0;
+            float peak_frac = 0.0f;
             if (hist_total > 0 && max_bin_count > 0) {
                 printf("[phase-hist] ");
                 const char* ramps = " .,-:;=+*#%@";
@@ -6127,7 +6152,6 @@ int main(int argc, char** argv) {
 
                 // Peak detection: count local maxima that are ≥ 1.5× expected
                 // and compute how much of total mass is in peaks vs background.
-                int n_peaks = 0;
                 long long peak_mass = 0;
                 float peak_threshold = 1.5f * expected;
                 for (int b = 0; b < PHASE_HIST_BINS; b++) {
@@ -6139,8 +6163,8 @@ int main(int argc, char** argv) {
                         peak_mass += curr;
                     }
                 }
-                float peak_frac = (float)peak_mass / (float)hist_total;
-                printf("[phase-hist] peaks=%d  peak_mass_frac=%.3f\n", n_peaks, peak_frac);
+                peak_frac = (float)peak_mass / (float)hist_total;
+                printf("[phase-hist] peaks=%d  peak_mass_frac=%.6f  total_hist=%lld\n", n_peaks, peak_frac, hist_total);
 
                 // === Velocity-filter check (Gemini's "Sieve" hypothesis) ===
                 // Do clustered particles have a different ω distribution than
@@ -6195,6 +6219,25 @@ int main(int argc, char** argv) {
                 printf("r=%.1f n=%.3f | ", h_sample_metrics->shell_radii[i], h_sample_metrics->shell_n[i]);
             }
             printf("\n");
+
+            // === Kuramoto × topology correlation dump ===
+            // One CSV-friendly row per stats frame with all scalars needed to
+            // correlate phase-cluster structure with Hopfion invariant Q.
+            // Columns: frame, R_global, R_recon, n_peaks, peak_mass_frac,
+            //          Q, num_shells, active_count, R_inner, R_mid
+            if (g_qr_corr_log) {
+                printf("[QR-corr] %d %.6f %.6f %d %.6f %.4f %d %d %.4f %.4f\n",
+                       frame,
+                       R_global_cached,
+                       R_recon,
+                       n_peaks,
+                       peak_frac,
+                       latest_Q,
+                       h_sample_metrics->num_shells,
+                       N_current,
+                       r_inner,
+                       r_mid);
+            }
 
             // === RING STABILITY DIAGNOSTIC ===
             // Compute observational stability: Δn / (n_avg - 1)
