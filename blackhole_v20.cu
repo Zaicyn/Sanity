@@ -2301,19 +2301,24 @@ __global__ void reduceKuramotoR(
 __global__ void reducePhaseHistogram(
     const GPUDisk* __restrict__ disk,
     uint32_t N,
-    int* __restrict__ bin_counts  // [PHASE_HIST_BINS], zeroed before launch
+    int* __restrict__ bin_counts,       // [PHASE_HIST_BINS]
+    float* __restrict__ bin_omega_sum,  // [PHASE_HIST_BINS] Σ ω per bin
+    float* __restrict__ bin_omega_sq    // [PHASE_HIST_BINS] Σ ω² per bin
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (int)N) return;
     if (!disk->active[i] || disk->ejected[i]) return;
 
     float theta = disk->theta[i];
-    // Map to [0, PHASE_HIST_BINS)
     float t = theta * (float)PHASE_HIST_BINS / 6.28318530718f;
     int bin = (int)t;
     if (bin < 0) bin = 0;
     if (bin >= PHASE_HIST_BINS) bin = PHASE_HIST_BINS - 1;
+
+    float omega = disk->omega_nat[i];
     atomicAdd(&bin_counts[bin], 1);
+    atomicAdd(&bin_omega_sum[bin], omega);
+    atomicAdd(&bin_omega_sq[bin], omega * omega);
 }
 
 // ============================================================================
@@ -4394,10 +4399,17 @@ int main(int argc, char** argv) {
     std::vector<int> h_kr_count(kr_max_blocks);
     float R_global_cached = 0.0f;  // Last computed order parameter
 
-    // Phase histogram (for multi-domain clustering confirmation)
+    // Phase histogram (for multi-domain clustering confirmation) and
+    // per-bin ω statistics (for velocity filter / sieve verification)
     int* d_phase_hist;
+    float* d_phase_omega_sum;
+    float* d_phase_omega_sq;
     cudaMalloc(&d_phase_hist, PHASE_HIST_BINS * sizeof(int));
+    cudaMalloc(&d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float));
+    cudaMalloc(&d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float));
     std::vector<int> h_phase_hist(PHASE_HIST_BINS);
+    std::vector<float> h_phase_omega_sum(PHASE_HIST_BINS);
+    std::vector<float> h_phase_omega_sq(PHASE_HIST_BINS);
 
     // === NATURAL GROWTH: Spawn counter for atomic allocation ===
     // V8-style: separate counter for attempted slots vs successful spawns
@@ -6041,9 +6053,13 @@ int main(int argc, char** argv) {
 
             // === Phase histogram: multi-domain clustering check ===
             cudaMemsetAsync(d_phase_hist, 0, PHASE_HIST_BINS * sizeof(int));
+            cudaMemsetAsync(d_phase_omega_sum, 0, PHASE_HIST_BINS * sizeof(float));
+            cudaMemsetAsync(d_phase_omega_sq, 0, PHASE_HIST_BINS * sizeof(float));
             int hist_blocks = (N_current + 255) / 256;
-            reducePhaseHistogram<<<hist_blocks, 256>>>(d_disk, N_current, d_phase_hist);
+            reducePhaseHistogram<<<hist_blocks, 256>>>(d_disk, N_current, d_phase_hist, d_phase_omega_sum, d_phase_omega_sq);
             cudaMemcpy(h_phase_hist.data(), d_phase_hist, PHASE_HIST_BINS * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_phase_omega_sum.data(), d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_phase_omega_sq.data(), d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float), cudaMemcpyDeviceToHost);
             // Compute max bin for normalization
             int max_bin_count = 0;
             long long hist_total = 0;
@@ -6109,6 +6125,43 @@ int main(int argc, char** argv) {
                 }
                 float peak_frac = (float)peak_mass / (float)hist_total;
                 printf("[phase-hist] peaks=%d  peak_mass_frac=%.3f\n", n_peaks, peak_frac);
+
+                // === Velocity-filter check (Gemini's "Sieve" hypothesis) ===
+                // Do clustered particles have a different ω distribution than
+                // background particles? If the clusters are selecting particles
+                // whose ω matches the envelope beat frequency, the clustered
+                // subset should have a tighter ω variance and a mean ω closer
+                // to the envelope-determined attractor frequency.
+                double cluster_w_sum = 0.0, cluster_w_sq = 0.0;
+                long long cluster_n = 0;
+                double bg_w_sum = 0.0, bg_w_sq = 0.0;
+                long long bg_n = 0;
+                for (int b = 0; b < PHASE_HIST_BINS; b++) {
+                    int prev = h_phase_hist[(b + PHASE_HIST_BINS - 1) % PHASE_HIST_BINS];
+                    int curr = h_phase_hist[b];
+                    int next = h_phase_hist[(b + 1) % PHASE_HIST_BINS];
+                    bool is_peak = (curr > prev && curr > next && (float)curr > peak_threshold);
+                    if (is_peak) {
+                        cluster_w_sum += h_phase_omega_sum[b];
+                        cluster_w_sq += h_phase_omega_sq[b];
+                        cluster_n += curr;
+                    } else {
+                        bg_w_sum += h_phase_omega_sum[b];
+                        bg_w_sq += h_phase_omega_sq[b];
+                        bg_n += curr;
+                    }
+                }
+                if (cluster_n > 0 && bg_n > 0) {
+                    double cluster_mean = cluster_w_sum / cluster_n;
+                    double cluster_var = cluster_w_sq / cluster_n - cluster_mean * cluster_mean;
+                    double cluster_std = (cluster_var > 0) ? sqrt(cluster_var) : 0.0;
+                    double bg_mean = bg_w_sum / bg_n;
+                    double bg_var = bg_w_sq / bg_n - bg_mean * bg_mean;
+                    double bg_std = (bg_var > 0) ? sqrt(bg_var) : 0.0;
+                    printf("[omega-filter] cluster: μ=%.4f σ=%.4f n=%lld  bg: μ=%.4f σ=%.4f n=%lld\n",
+                           cluster_mean, cluster_std, cluster_n,
+                           bg_mean, bg_std, bg_n);
+                }
 
                 // Numeric dump: ratio per bin for quantitative inspection
                 printf("[phase-hist-num] ");
