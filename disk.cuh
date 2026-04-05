@@ -263,6 +263,13 @@ struct GPUDisk {
     // Jet phase memory: tracks phase through ejection/Aizawa/return cycle
     float jet_phase[MAX_DISK_PTS];
 
+    // Kuramoto phase coupling (math.md Step 8, Step 10, Step 11)
+    // theta advances at rate omega_nat per frame, plus mean-field coupling
+    // from grid phase_sin/phase_cos via the gather kernel. Separate from the
+    // pump state machine so Kuramoto dynamics are not entangled with ejections.
+    float theta[MAX_DISK_PTS];       // phase in [0, 2π), continuous rotation
+    float omega_nat[MAX_DISK_PTS];   // natural frequency, Gaussian spread
+
     // Flags
     bool  ejected[MAX_DISK_PTS];
     bool  active[MAX_DISK_PTS];

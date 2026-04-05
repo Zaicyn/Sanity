@@ -232,8 +232,8 @@ inline void initVRAMConfig() {
     size_t fixed_overhead = grid_overhead + octree_overhead + sparse_overhead + misc_overhead;
 
     // Calculate safe particle cap
-    // Memory per particle: 68 (GPUDisk) + 16 (morton/xor/ids/cell) = 84 bytes
-    size_t bytes_per_particle = 84;
+    // Memory per particle: 76 (GPUDisk + theta + omega_nat) + 16 (morton/xor/ids/cell) = 92 bytes
+    size_t bytes_per_particle = 92;
     int max_particles = (int)((usable_mem - fixed_overhead) / bytes_per_particle);
 
     // Round down to warp-aligned boundary (V8 style: 32 threads)
@@ -1815,9 +1815,12 @@ __global__ void scatterParticlesToCells(
     atomicAdd(&momentum_y[cell], disk->vel_y[i]);
     atomicAdd(&momentum_z[cell], disk->vel_z[i]);
 
-    // Phase state for Kuramoto coupling
-    // Use pump_residual as phase proxy (oscillates 0-1 with pump cycle)
-    float phase = disk->pump_residual[i] * 6.28318f;
+    // Phase state for Kuramoto coupling (math.md Step 8)
+    // Uses the dedicated theta[] field — a continuous rotation, not a pulse.
+    // phase_sin/phase_cos accumulate ∑sin(θ_i) and ∑cos(θ_i) per cell, so
+    // that the gather kernel can read the mean-field ⟨e^{iθ}⟩ as R_local
+    // and apply Kuramoto coupling K·sin(θ_cell − θ_i).
+    float phase = disk->theta[i];
     atomicAdd(&phase_sin[cell], cuda_lut_sin(phase));
     atomicAdd(&phase_cos[cell], cuda_lut_cos(phase));
 }
@@ -1974,7 +1977,9 @@ __global__ void gatherCellForcesToParticles(
     float dt,
     float substrate_k,  // Keplerian substrate coupling (competes with Kuramoto)
     float shear_k,      // Phase-misalignment shear (non-monotonic magnetic friction)
-    float rho_ref       // Reference density for shear normalization (mean × 8)
+    float rho_ref,      // Reference density for shear normalization (mean × 8)
+    float kuramoto_k,   // Kuramoto phase coupling strength (0 = free-running only)
+    int   use_n12       // 1 = apply N12 mixer envelope to coupling, 0 = constant K
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -2094,6 +2099,108 @@ __global__ void gatherCellForcesToParticles(
     disk->vel_x[i] = vx;
     disk->vel_y[i] = vy;
     disk->vel_z[i] = vz;
+
+    // === KURAMOTO PHASE UPDATE (math.md Step 8, Step 10, Step 11) ===
+    // Free-running natural frequency + mean-field coupling to the cell's
+    // averaged phase (read from grid phase_sin/phase_cos fields).
+    //   dθ/dt = ω_i + K_local · sin(θ_cell − θ_i)
+    // K_local is modulated by the N12 envelope (math.md Step 11), which
+    // has natural period LCM(3,4) = 12 derived from the theta mixer.
+    {
+        float theta_i = disk->theta[i];
+        float omega_i = disk->omega_nat[i];
+        float dtheta = omega_i;
+
+        if (kuramoto_k > 0.0f) {
+            float rho_cell = density[cell];
+            if (rho_cell > 0.5f) {
+                float ps = phase_sin[cell];
+                float pc = phase_cos[cell];
+                float inv_rho = 1.0f / rho_cell;
+                float mean_sin = ps * inv_rho;  // ⟨sin θ⟩ over cell
+                float mean_cos = pc * inv_rho;  // ⟨cos θ⟩ over cell
+                // sin(θ_cell − θ_i) = mean_sin · cos(θ_i) − mean_cos · sin(θ_i)
+                float sin_i = cuda_lut_sin(theta_i);
+                float cos_i = cuda_lut_cos(theta_i);
+                float coupling = mean_sin * cos_i - mean_cos * sin_i;
+
+                // R_local = |⟨e^{iθ}⟩|, measures how coherent this cell is
+                float R_local = sqrtf(mean_sin * mean_sin + mean_cos * mean_cos);
+
+                // N12 envelope: 0.5 + 0.5·cos(3θ)·cos(4θ), period LCM(3,4)=12
+                float envelope = 1.0f;
+                if (use_n12) {
+                    float c3 = cuda_lut_cos(3.0f * theta_i);
+                    float c4 = cuda_lut_cos(4.0f * theta_i);
+                    envelope = 0.5f + 0.5f * c3 * c4;
+                }
+
+                dtheta += kuramoto_k * R_local * envelope * coupling;
+            }
+        }
+
+        // Advance and wrap to [0, 2π)
+        theta_i += dtheta * dt;
+        theta_i = fmodf(theta_i, TWO_PI);
+        if (theta_i < 0.0f) theta_i += TWO_PI;
+        disk->theta[i] = theta_i;
+    }
+}
+
+// ============================================================================
+// KURAMOTO ORDER PARAMETER REDUCTION
+// ============================================================================
+// Computes R = |⟨e^{iθ}⟩| over all active particles as the global Kuramoto
+// order parameter. R ≈ 0 means incoherent; R ≈ 1 means fully synchronized.
+// Classical Kuramoto predicts a sharp transition at K_c ≈ 2σ/π for Gaussian
+// natural frequency distribution.
+//
+// Two-stage reduction: each block computes block-level partial sums, then
+// a final host-side combine (block count is small).
+
+__global__ void reduceKuramotoR(
+    const GPUDisk* __restrict__ disk,
+    uint32_t N,
+    float* __restrict__ block_sin_sum,
+    float* __restrict__ block_cos_sum,
+    int* __restrict__ block_count
+) {
+    __shared__ float s_sin[256];
+    __shared__ float s_cos[256];
+    __shared__ int s_cnt[256];
+
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + tid;
+
+    float my_sin = 0.0f, my_cos = 0.0f;
+    int my_cnt = 0;
+    if (i < (int)N && disk->active[i] && !disk->ejected[i]) {
+        float theta = disk->theta[i];
+        my_sin = cuda_lut_sin(theta);
+        my_cos = cuda_lut_cos(theta);
+        my_cnt = 1;
+    }
+
+    s_sin[tid] = my_sin;
+    s_cos[tid] = my_cos;
+    s_cnt[tid] = my_cnt;
+    __syncthreads();
+
+    // Tree reduction within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sin[tid] += s_sin[tid + stride];
+            s_cos[tid] += s_cos[tid + stride];
+            s_cnt[tid] += s_cnt[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        block_sin_sum[blockIdx.x] = s_sin[0];
+        block_cos_sum[blockIdx.x] = s_cos[0];
+        block_count[blockIdx.x] = s_cnt[0];
+    }
 }
 
 // ============================================================================
@@ -2214,7 +2321,7 @@ __global__ void scatterStaticParticles(
     atomicAdd(&momentum_y[cell], disk->vel_y[i]);
     atomicAdd(&momentum_z[cell], disk->vel_z[i]);
 
-    float phase = disk->pump_residual[i] * 6.28318f;
+    float phase = disk->theta[i];
     atomicAdd(&phase_sin[cell], cuda_lut_sin(phase));
     atomicAdd(&phase_cos[cell], cuda_lut_cos(phase));
 }
@@ -2237,7 +2344,9 @@ __global__ void gatherToActiveParticles(
     float dt,
     float substrate_k,
     float shear_k,
-    float rho_ref
+    float rho_ref,
+    float kuramoto_k,
+    int   use_n12
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= active_count) return;
@@ -2319,6 +2428,40 @@ __global__ void gatherToActiveParticles(
     disk->vel_x[i] = vx;
     disk->vel_y[i] = vy;
     disk->vel_z[i] = vz;
+
+    // === KURAMOTO PHASE UPDATE (see gatherCellForcesToParticles) ===
+    {
+        float theta_i = disk->theta[i];
+        float omega_i = disk->omega_nat[i];
+        float dtheta = omega_i;
+
+        if (kuramoto_k > 0.0f) {
+            float rho_cell = density[cell];
+            if (rho_cell > 0.5f) {
+                float ps = phase_sin[cell];
+                float pc = phase_cos[cell];
+                float inv_rho = 1.0f / rho_cell;
+                float mean_sin = ps * inv_rho;
+                float mean_cos = pc * inv_rho;
+                float sin_i = cuda_lut_sin(theta_i);
+                float cos_i = cuda_lut_cos(theta_i);
+                float coupling = mean_sin * cos_i - mean_cos * sin_i;
+                float R_local = sqrtf(mean_sin * mean_sin + mean_cos * mean_cos);
+                float envelope = 1.0f;
+                if (use_n12) {
+                    float c3 = cuda_lut_cos(3.0f * theta_i);
+                    float c4 = cuda_lut_cos(4.0f * theta_i);
+                    envelope = 0.5f + 0.5f * c3 * c4;
+                }
+                dtheta += kuramoto_k * R_local * envelope * coupling;
+            }
+        }
+
+        theta_i += dtheta * dt;
+        theta_i = fmodf(theta_i, TWO_PI);
+        if (theta_i < 0.0f) theta_i += TWO_PI;
+        disk->theta[i] = theta_i;
+    }
 }
 
 // Copy previous cell indices for next frame's activity detection
@@ -3192,6 +3335,15 @@ bool g_use_arm_topology = true;     // true = discrete, false = smooth
 // Drives collapse in turbulent/frustrated regions, leaves locked shells alone.
 float g_shear_k = 0.0f;
 
+// Kuramoto phase coupling — math.md Step 8, Step 10, Step 11
+// θ_i advances at rate ω_i + K·sin(θ_cell − θ_i) via mean-field coupling
+// through the grid phase_sin/phase_cos fields. Tests synchronization
+// threshold, traveling coherence packets, chimera states, breathing clusters.
+float g_kuramoto_k = 0.0f;        // Coupling strength K (0 = no coupling)
+float g_omega_base = 1.0f;        // Mean natural frequency ω₀
+float g_omega_spread = 0.05f;     // Gaussian std-dev σ for ω distribution
+bool  g_n12_envelope = true;      // Apply N12 mixer envelope to coupling (math.md Step 11)
+
 #define NUM_ARMS 3                  // m = 3 (3-armed spiral)
 #define ARM_WIDTH_DEG 45.0f         // Width of each arm in degrees
 #define ARM_TRAP_STRENGTH 0.15f     // Angular momentum barrier strength
@@ -3424,6 +3576,26 @@ int main(int argc, char** argv) {
             g_shear_k = (float)atof(argv[++i]);
             printf("[shear] Phase-misalignment shear coefficient: %.4f\n", g_shear_k);
         }
+        else if (strcmp(argv[i], "--kuramoto-k") == 0 && i+1 < argc) {
+            extern float g_kuramoto_k;
+            g_kuramoto_k = (float)atof(argv[++i]);
+            printf("[kuramoto] Coupling strength K: %.4f\n", g_kuramoto_k);
+        }
+        else if (strcmp(argv[i], "--omega-base") == 0 && i+1 < argc) {
+            extern float g_omega_base;
+            g_omega_base = (float)atof(argv[++i]);
+            printf("[kuramoto] Natural frequency ω₀: %.4f\n", g_omega_base);
+        }
+        else if (strcmp(argv[i], "--omega-spread") == 0 && i+1 < argc) {
+            extern float g_omega_spread;
+            g_omega_spread = (float)atof(argv[++i]);
+            printf("[kuramoto] Frequency spread σ: %.4f\n", g_omega_spread);
+        }
+        else if (strcmp(argv[i], "--no-n12") == 0) {
+            extern bool g_n12_envelope;
+            g_n12_envelope = false;
+            printf("[kuramoto] N12 envelope DISABLED (constant K)\n");
+        }
         else if (strcmp(argv[i], "--headless") == 0) {
             extern bool g_headless;
             g_headless = true;
@@ -3530,6 +3702,10 @@ int main(int argc, char** argv) {
             printf("  --no-arm-topology  Alias for --smooth-arms\n");
             printf("  --no-arms          Disable spiral arm structure entirely\n");
             printf("  --shear-k <k>      Frictional shear: density × sin(2φ) hybrid (default 0, try 2-10; scale-invariant)\n");
+            printf("  --kuramoto-k <K>   Kuramoto phase coupling strength (default 0, sweep 0-2 to find K_c)\n");
+            printf("  --omega-base <ω₀>  Mean natural frequency (default 1.0)\n");
+            printf("  --omega-spread <σ> Gaussian σ for ω distribution (default 0.05; K_c ≈ 2σ/π)\n");
+            printf("  --no-n12           Disable N12 mixer envelope on Kuramoto coupling\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -3943,6 +4119,8 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> h_seam(N);
     std::vector<float> h_residual(N), h_work(N);
     std::vector<float> h_history(N);  // pump_history for emergence
+    std::vector<float> h_theta(N);      // Kuramoto phase, uniform random [0, 2π)
+    std::vector<float> h_omega_nat(N);  // Kuramoto natural freq, Gaussian(ω₀, σ)
     std::vector<uint8_t> h_ejected(N), h_active(N);
 
     std::mt19937 rng(42);
@@ -4008,6 +4186,10 @@ int main(int argc, char** argv) {
         h_work[i] = 0.0f;
         h_history[i] = 1.0f;
 
+        // Kuramoto init: uniform random phase, Gaussian natural frequency
+        h_theta[i] = rphase(rng);
+        h_omega_nat[i] = g_omega_base + g_omega_spread * rnorm(rng);
+
         h_ejected[i] = 0;
         h_active[i] = 1;
     }
@@ -4046,12 +4228,31 @@ int main(int argc, char** argv) {
     UPLOAD(pump_residual, h_residual);
     UPLOAD(pump_work, h_work);
     UPLOAD(pump_history, h_history);
+    UPLOAD(theta, h_theta);
+    UPLOAD(omega_nat, h_omega_nat);
     UPLOAD(ejected, h_ejected);
     UPLOAD(active, h_active);
     #undef UPLOAD
 
     StressCounters* d_stress;
     cudaMalloc(&d_stress, sizeof(StressCounters));
+
+    // === KURAMOTO ORDER PARAMETER BUFFERS ===
+    // Pre-allocate for the largest expected particle count so we don't
+    // reallocate if N_current grows via spawning.
+    const int KR_THREADS = 256;
+    int kr_max_blocks = (RUNTIME_PARTICLE_CAP + KR_THREADS - 1) / KR_THREADS;
+    float* d_kr_sin_sum;
+    float* d_kr_cos_sum;
+    int* d_kr_count;
+    cudaMalloc(&d_kr_sin_sum, kr_max_blocks * sizeof(float));
+    cudaMalloc(&d_kr_cos_sum, kr_max_blocks * sizeof(float));
+    cudaMalloc(&d_kr_count, kr_max_blocks * sizeof(int));
+    // Host buffers for the block partial sums (small — one float per block)
+    std::vector<float> h_kr_sin_sum(kr_max_blocks);
+    std::vector<float> h_kr_cos_sum(kr_max_blocks);
+    std::vector<int> h_kr_count(kr_max_blocks);
+    float R_global_cached = 0.0f;  // Last computed order parameter
 
     // === NATURAL GROWTH: Spawn counter for atomic allocation ===
     // V8-style: separate counter for attempted slots vs successful spawns
@@ -5032,7 +5233,8 @@ int main(int argc, char** argv) {
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
                             d_grid_phase_sin, d_grid_phase_cos,
                             d_particle_cell, g_active_particles.d_active_list,
-                            g_active_particles.h_active_count, dt_sim, substrate_k, g_shear_k, shear_rho_ref
+                            g_active_particles.h_active_count, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
+                            g_kuramoto_k, g_n12_envelope ? 1 : 0
                         );
                     } else {
                         // Full gather to all particles
@@ -5040,7 +5242,8 @@ int main(int argc, char** argv) {
                             d_disk, d_grid_density, d_grid_pressure_x, d_grid_pressure_y, d_grid_pressure_z,
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
                             d_grid_phase_sin, d_grid_phase_cos,
-                            d_particle_cell, N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref
+                            d_particle_cell, N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
+                            g_kuramoto_k, g_n12_envelope ? 1 : 0
                         );
                     }
                     cudaEventRecord(e_gather_end);
@@ -5138,7 +5341,9 @@ int main(int argc, char** argv) {
                         dt_sim,
                         substrate_k,
                         g_shear_k,
-                        shear_rho_ref_cadence
+                        shear_rho_ref_cadence,
+                        g_kuramoto_k,
+                        g_n12_envelope ? 1 : 0
                     );
 
                     // Debug stats every 900 frames
@@ -5539,12 +5744,35 @@ int main(int argc, char** argv) {
 
         // Print stats every 90 frames using sample metrics (no stall)
         if (frame % 90 == 0) {
+            // === Compute Kuramoto order parameter R = |⟨e^{iθ}⟩| ===
+            int kr_blocks = (N_current + KR_THREADS - 1) / KR_THREADS;
+            if (kr_blocks > kr_max_blocks) kr_blocks = kr_max_blocks;
+            reduceKuramotoR<<<kr_blocks, KR_THREADS>>>(
+                d_disk, N_current, d_kr_sin_sum, d_kr_cos_sum, d_kr_count);
+            cudaMemcpy(h_kr_sin_sum.data(), d_kr_sin_sum, kr_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_kr_cos_sum.data(), d_kr_cos_sum, kr_blocks * sizeof(float), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_kr_count.data(), d_kr_count, kr_blocks * sizeof(int), cudaMemcpyDeviceToHost);
+            double sum_sin = 0.0, sum_cos = 0.0;
+            long long total_count = 0;
+            for (int b = 0; b < kr_blocks; b++) {
+                sum_sin += h_kr_sin_sum[b];
+                sum_cos += h_kr_cos_sum[b];
+                total_count += h_kr_count[b];
+            }
+            if (total_count > 0) {
+                double inv_n = 1.0 / (double)total_count;
+                double mean_sin = sum_sin * inv_n;
+                double mean_cos = sum_cos * inv_n;
+                R_global_cached = (float)sqrt(mean_sin * mean_sin + mean_cos * mean_cos);
+            }
+
             printf("[frame %5d] fps=%.0f | particles=%d "
-            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f",
+            "avg_scale=%.2f (sample=%.2f) | bridge: s=%.2f r=%.3f hb=%.2f | R=%.4f",
                    frame, fps_acc > 0 ? fps_frames / fps_acc : 0.0,
                    N_current,
                    h_sample_metrics->avg_scale, h_sample_metrics->avg_scale,
-                   pump_bridge.avg_scale, pump_bridge.avg_residual, pump_bridge.heartbeat);
+                   pump_bridge.avg_scale, pump_bridge.avg_residual, pump_bridge.heartbeat,
+                   R_global_cached);
 
 #ifdef VULKAN_INTEROP
             // Show hybrid LOD stats (visible particle count and culling percentage)
