@@ -173,6 +173,14 @@ static int g_octree_particle_cap = 500000;    // Safe default, recalculated from
 #define RUNTIME_PARTICLE_CAP  g_runtime_particle_cap  // Use runtime value
 #endif
 
+// Tree Architecture Step 2: compile-time guard for passive advection dispatch.
+// Default off in commit 2c; flipped on in commit 2d with the all-encompassing
+// ActiveRegion bootstrap (still zero-behavior-change because the bootstrap
+// mask is all-1s and the passive kernel early-returns on every particle).
+#ifndef ENABLE_PASSIVE_ADVECTION
+#define ENABLE_PASSIVE_ADVECTION 0
+#endif
+
 // NOTE: Physics constants (BH_MASS, ISCO_R, PUMP_*, ION_KICK_*, etc.)
 // are now defined in disk.cuh and the modular physics headers.
 // This avoids duplication and ensures single source of truth.
@@ -4667,6 +4675,14 @@ int main(int argc, char** argv) {
     float* d_grid_R_cell = nullptr;      // per-cell Kuramoto order parameter
     uint32_t* d_particle_cell = nullptr;
 
+    // Tree Architecture Step 2: passive/active region membership flag.
+    // 1 = particle is inside an active region (handled by siphonDiskKernel).
+    // 0 = particle is passive (handled by advectPassiveParticles).
+    // Initialized to all-1s below so Step 2 is zero-behavior-change: the
+    // passive kernel early-returns on every particle. Sized to
+    // g_runtime_particle_cap (not N_current) because spawning can grow N.
+    uint8_t* d_in_active_region = nullptr;
+
     // Radial profile of R_cell — 16 bins from center to box edge
     const int RC_RADIAL_BINS = 16;
     float* d_rc_bin_R = nullptr;
@@ -4796,6 +4812,19 @@ int main(int argc, char** argv) {
                6 * cell_array_size / (1024.0 * 1024.0));
     }
 
+    // === TREE ARCHITECTURE STEP 2: in_active_region buffer ===
+    // Unconditional allocation — the passive kernel is orthogonal to grid
+    // physics and active-compaction. Initialized to all-1s so every particle
+    // is "in the all-encompassing bootstrap region"; the passive kernel
+    // early-returns on every particle in Step 2 (zero behavior change).
+    {
+        size_t in_active_region_size = (size_t)g_runtime_particle_cap * sizeof(uint8_t);
+        cudaMalloc(&d_in_active_region, in_active_region_size);
+        cudaMemset(d_in_active_region, 0xFF, in_active_region_size);  // all-1s = all in region
+        printf("[passive] d_in_active_region allocated: %zu bytes, init=all-in-region\n",
+               in_active_region_size);
+    }
+
     // Timing
     float sim_time = 0.0f;
     int frame = 0;
@@ -4895,6 +4924,19 @@ int main(int argc, char** argv) {
             // Use dynamic particle count (N_current grows via spawning)
             int spawn_blocks = (N_current + threads - 1) / threads;
             siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
+
+#if ENABLE_PASSIVE_ADVECTION
+            // Tree Architecture Step 2: passive advection for particles
+            // outside any active region. ORDERING: must complete before the
+            // scatter/activity-mask pipeline reads disk->pos_*. Default-stream
+            // serialization guarantees this. In Step 2 the in_active_region
+            // buffer is all-1s, so this kernel early-returns on every
+            // particle and does no writes — the launch exists only to prove
+            // the dispatch plumbing compiles.
+            advectPassiveParticles<<<spawn_blocks, threads>>>(
+                d_disk, d_in_active_region, N_current,
+                dt_sim * 2.0f, PASSIVE_RESIDUAL_TAU);
+#endif
 
             // === NATURAL GROWTH: Spawn new particles in coherent regions ===
             if (SPAWN_ENABLE && N_current < MAX_DISK_PTS) {
