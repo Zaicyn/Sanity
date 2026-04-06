@@ -3528,6 +3528,12 @@ float g_corner_threshold = 0.15f;
 // Default 5.0f matches PASSIVE_RESIDUAL_TAU from Step 3. Tunable via --passive-tau.
 float g_passive_residual_tau = 5.0f;
 
+// Tree Architecture Step 6: shell-aware initialization.
+// When true, particles are initialized ON the 8 resonance shells instead of
+// uniformly in a box. This skips the settling transient and starts with most
+// particles passive. Use --shell-init to enable.
+bool g_shell_init = false;
+
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
 
@@ -3820,6 +3826,11 @@ int main(int argc, char** argv) {
             g_passive_residual_tau = (float)atof(argv[++i]);
             printf("[passive] Residual decay tau: %.2f\n", g_passive_residual_tau);
         }
+        else if (strcmp(argv[i], "--shell-init") == 0) {
+            extern bool g_shell_init;
+            g_shell_init = true;
+            printf("[init] Shell-aware initialization: particles ON resonance shells\n");
+        }
         else if (strcmp(argv[i], "--no-spawn") == 0) {
             extern bool g_spawn_enabled;
             g_spawn_enabled = false;
@@ -3964,6 +3975,7 @@ int main(int argc, char** argv) {
             printf("  --r-log-interval <N>     Print dense R(t) samples every N frames for time-series analysis (0=off)\n");
             printf("  --corner-threshold <f>   Passive/active pump_residual threshold (default 0.15)\n");
             printf("  --passive-tau <f>        Passive residual decay tau in sim-time units (default 5.0)\n");
+            printf("  --shell-init             Initialize particles ON resonance shells (skip settling transient)\n");
             printf("  --no-spawn               Disable natural growth — particle count locked for clean measurements\n");
             printf("  --qr-corr                Dump [QR-corr] CSV rows each stats frame: R, Rrec, peaks, mass_frac, Q, shells, ..., active_frac\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
@@ -4388,49 +4400,76 @@ int main(int argc, char** argv) {
     std::uniform_real_distribution<float> rphase(0, TWO_PI);
     std::normal_distribution<float> rnorm(0.0f, 1.0f);
 
-    // === UNIFIED INITIALIZATION: LARGE SQUARE ===
-    // All particles initialized in a large rectangular volume.
-    // No artificial disk/halo split - structure emerges from dynamics.
-    // Particles start with small random velocities and slight rotation bias.
+    // === INITIALIZATION ===
+    // Two modes:
+    //   Default (uniform box): All particles in a large rectangular volume.
+    //     Structure emerges from dynamics over ~5000 frames of settling.
+    //   --shell-init: Particles placed ON the 8 resonance shells from
+    //     d_shell_radii[] with small radial jitter and full Keplerian velocity.
+    //     Skips the settling transient — most particles start passive.
+
+    // Host-side copy of d_shell_radii (device __constant__) for init.
+    static const float h_shell_radii[8] = {
+        6.0f, 9.7f, 15.7f, 25.4f, 41.1f, 66.5f, 107.5f, 174.0f
+    };
 
     float box_half = DISK_OUTER_R;        // ±120 in X and Z
     float box_height = box_half * 0.3f;   // ±36 in Y (thinner to encourage disk formation)
 
     for (int i = 0; i < N; i++) {
-        // Uniform distribution in rectangular volume
-        float x = (runif(rng) * 2.0f - 1.0f) * box_half;
-        float y = (runif(rng) * 2.0f - 1.0f) * box_height;
-        float z = (runif(rng) * 2.0f - 1.0f) * box_half;
+        float x, y, z;
 
-        // Avoid spawning too close to black hole (inside 2× Schwarzschild radius)
-        float r = sqrtf(x*x + y*y + z*z);
-        if (r < SCHW_R * 3.0f) {
-            // Push outward
-            float scale = (SCHW_R * 3.0f) / r;
-            x *= scale;
-            y *= scale;
-            z *= scale;
-            r = SCHW_R * 3.0f;
+        if (g_shell_init) {
+            // Step 6: shell-aware initialization.
+            // Distribute particles across 8 shells weighted by 1/r (inner shells denser).
+            // Small radial jitter (σ = 0.5 units) + random azimuthal phase.
+            float weight_sum = 0.0f;
+            for (int s = 0; s < 8; s++) weight_sum += 1.0f / h_shell_radii[s];
+            float pick = runif(rng) * weight_sum;
+            float accum = 0.0f;
+            int shell = 7;  // fallback to outermost
+            for (int s = 0; s < 8; s++) {
+                accum += 1.0f / h_shell_radii[s];
+                if (pick <= accum) { shell = s; break; }
+            }
+            float r_shell = h_shell_radii[shell];
+            float r_jitter = r_shell + rnorm(rng) * 0.5f;
+            if (r_jitter < ISCO_R * 0.8f) r_jitter = ISCO_R * 0.8f;
+
+            float phi = rphase(rng);
+            x = r_jitter * cosf(phi);
+            z = r_jitter * sinf(phi);
+            y = rnorm(rng) * DISK_THICKNESS * 0.5f;  // thin vertical spread
+        } else {
+            // Legacy uniform box initialization.
+            x = (runif(rng) * 2.0f - 1.0f) * box_half;
+            y = (runif(rng) * 2.0f - 1.0f) * box_height;
+            z = (runif(rng) * 2.0f - 1.0f) * box_half;
+
+            // Avoid spawning too close to black hole
+            float r = sqrtf(x*x + y*y + z*z);
+            if (r < SCHW_R * 3.0f) {
+                float scale = (SCHW_R * 3.0f) / r;
+                x *= scale; y *= scale; z *= scale;
+            }
         }
 
         h_px[i] = x;
         h_py[i] = y;
         h_pz[i] = z;
 
-        // Initial velocity: slight prograde rotation + random thermal motion
-        // This gives net angular momentum so a disk can form
+        // Initial velocity: Keplerian tangential + thermal noise.
+        // --shell-init uses full Keplerian (1.0×); legacy uses 0.3×.
         float r_xz = sqrtf(x*x + z*z);
         if (r_xz > 0.1f) {
-            // Prograde rotation (counterclockwise when viewed from +Y)
-            // v_tangent ~ 0.3 × v_keplerian
-            // Sign flip via --retrograde for chirality test (Q-drift symmetry)
             float rot_sign = g_retrograde_init ? -1.0f : 1.0f;
-            float v_rot = rot_sign * 0.3f * sqrtf(BH_MASS / fmaxf(r, ISCO_R));
-            h_vx[i] = -v_rot * (z / r_xz) + rnorm(rng) * 0.05f;
-            h_vy[i] = rnorm(rng) * 0.03f;
-            h_vz[i] = v_rot * (x / r_xz) + rnorm(rng) * 0.05f;
+            float v_frac = g_shell_init ? 1.0f : 0.3f;
+            float v_rot = rot_sign * v_frac * sqrtf(BH_MASS / fmaxf(r_xz, ISCO_R));
+            float thermal = g_shell_init ? 0.01f : 0.05f;
+            h_vx[i] = -v_rot * (z / r_xz) + rnorm(rng) * thermal;
+            h_vy[i] = rnorm(rng) * (g_shell_init ? 0.005f : 0.03f);
+            h_vz[i] = v_rot * (x / r_xz) + rnorm(rng) * thermal;
         } else {
-            // Near the Y axis - just random thermal motion
             h_vx[i] = rnorm(rng) * 0.05f;
             h_vy[i] = rnorm(rng) * 0.05f;
             h_vz[i] = rnorm(rng) * 0.05f;
