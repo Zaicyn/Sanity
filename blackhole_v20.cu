@@ -4433,13 +4433,16 @@ int main(int argc, char** argv) {
                 if (pick <= accum) { shell = s; break; }
             }
             float r_shell = h_shell_radii[shell];
-            float r_jitter = r_shell + rnorm(rng) * 0.5f;
+            float r_jitter = r_shell + rnorm(rng) * 2.0f;
             if (r_jitter < ISCO_R * 0.8f) r_jitter = ISCO_R * 0.8f;
 
             float phi = rphase(rng);
             x = r_jitter * cosf(phi);
             z = r_jitter * sinf(phi);
-            y = rnorm(rng) * DISK_THICKNESS * 0.5f;  // thin vertical spread
+            // Vertical spread proportional to shell radius — flared disk.
+            // Inner shells (r=6): σ_y ≈ 1.2, outer shells (r=174): σ_y ≈ 35.
+            // Gives a volumetric cloud/nebula appearance, not a paper-thin ring.
+            y = rnorm(rng) * r_shell * 0.2f;
         } else {
             // Legacy uniform box initialization.
             x = (runif(rng) * 2.0f - 1.0f) * box_half;
