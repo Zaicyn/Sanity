@@ -976,41 +976,39 @@ __global__ void fillVulkanParticleBufferLOD(
     float coherence = (disk->pump_state[i] == 1) ? 1.0f : 0.0f;
 
     // === SHELL LENSING (gravitational-lens-like distortion) ===
-    // Toggle via --shell-lensing flag. Displaces apparent positions based
-    // on shells between particle and camera. Each shell acts as a thin
-    // spherical lens with n ≈ 1.091.
+    // Toggle via --shell-lensing flag. Each shell between the particle
+    // and camera adds a small fixed radial displacement to the particle's
+    // apparent position — like looking through concentric glass shells.
+    // The displacement is proportional to shell radius (outer shells bend
+    // more because light crosses them at a shallower angle).
     if (shellLensing) {
         float r_cam_cyl = sqrtf(camX * camX + camZ * camZ);
-        float r_part = r_cyl;  // already computed above
+        float r_part = r_cyl;
 
-        // Accumulate deflection from each shell between particle and camera.
-        // Convention: if camera is outside shell and particle is inside,
-        // the shell bends the apparent position outward (away from center).
+        // Count shells between particle and camera, accumulate displacement.
+        // Each shell crossing adds a small outward (or inward) nudge scaled
+        // by the shell's radius relative to the outermost shell.
         float deflection = 0.0f;
-        const float n_minus_1 = 0.091f;   // refractive index excess (from diagnostics)
-        const float shell_width = 2.0f;   // effective thickness of each shell
+        const float lens_strength = 0.3f;  // total max displacement in world units
 
         for (int s = 0; s < 8; s++) {
             float r_s = d_shell_radii[s];
-            // Shell is "between" particle and camera if one is inside, other outside.
             bool cam_outside = (r_cam_cyl > r_s);
             bool part_inside = (r_part < r_s);
             if (cam_outside && part_inside) {
-                // Camera outside, particle inside: light bends outward.
-                float impact = fmaxf(fabsf(r_part - r_s), 1.0f);
-                deflection += n_minus_1 * shell_width / impact;
+                deflection += lens_strength * (r_s / 174.0f);  // stronger for outer shells
             } else if (!cam_outside && !part_inside) {
-                // Camera inside, particle outside: light bends inward.
-                float impact = fmaxf(fabsf(r_part - r_s), 1.0f);
-                deflection -= n_minus_1 * shell_width / impact;
+                deflection -= lens_strength * (r_s / 174.0f);
             }
         }
 
         // Apply radial displacement in the XZ plane.
         if (fabsf(deflection) > 0.001f) {
-            float inv_r = rsqrtf(px * px + pz * pz + 1e-8f);
-            px += deflection * px * inv_r;
-            pz += deflection * pz * inv_r;
+            float r_xz = sqrtf(px * px + pz * pz);
+            if (r_xz > 0.1f) {
+                px += deflection * (px / r_xz);
+                pz += deflection * (pz / r_xz);
+            }
         }
     }
 
