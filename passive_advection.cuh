@@ -69,6 +69,15 @@
 #define RESIDUAL_INJECT_RATE  0.1f
 #endif
 
+// Step 6: radial drift rate toward nearest resonance shell. Passive
+// particles gently settle onto the nearest shell in d_shell_radii[8].
+// At rate 0.005 and dt ≈ 0.033, a particle 1 unit off-shell moves
+// ~0.017% per frame → settling timescale ~200 frames. Slow enough
+// not to override siphon physics when a particle re-enters active.
+#ifndef PASSIVE_DRIFT_RATE
+#define PASSIVE_DRIFT_RATE  0.005f
+#endif
+
 // Safety clamp — the passive kernel only handles particles inside the
 // eigenspectrum cascade range. Outside of this the siphon path owns
 // them (including apply_boundary_recycle at r > ION_KICK_OUTER_R).
@@ -118,14 +127,21 @@ __global__ void advectPassiveParticles(
     // particle (boundary recycle path in forces.cuh handles escapees).
     if (r_cyl < PASSIVE_R_MIN || r_cyl > PASSIVE_R_MAX) return;
 
-    // Note: Step 2 intentionally does NOT snap r_cyl to the nearest
-    // shell in d_shell_radii[]. Particles are initialized uniformly
-    // in a box (blackhole_v20.cu:4338), not on shells, so snapping on
-    // first call would teleport every particle. Step 3 will introduce
-    // a warmup phase where particles settle before snap-to-shell
-    // becomes safe.
+    // Step 6: gentle radial drift toward nearest resonance shell.
+    // d_shell_radii[8] from sun_trace.cuh — same table the mask kernel
+    // uses for deviation-based residual injection (Step 5). Particles
+    // exponentially approach their nearest shell at PASSIVE_DRIFT_RATE.
+    {
+        float r_target = d_shell_radii[0];
+        float best_dev = fabsf(r_cyl - r_target);
+        for (int s = 1; s < 8; s++) {
+            float dev = fabsf(r_cyl - d_shell_radii[s]);
+            if (dev < best_dev) { best_dev = dev; r_target = d_shell_radii[s]; }
+        }
+        r_cyl += (r_target - r_cyl) * PASSIVE_DRIFT_RATE * dt;
+    }
 
-    // Keplerian angular velocity at current radius.
+    // Keplerian angular velocity at current (drifted) radius.
     float r3 = r_cyl * r_cyl * r_cyl;
     float omega_kep = sqrtf(BH_MASS / r3);
 
@@ -133,7 +149,7 @@ __global__ void advectPassiveParticles(
     float phi = cuda_fast_atan2(pz, px);
     float phi_new = phi + omega_kep * dt;
 
-    // Reconstruct position at same radius, new phase.
+    // Reconstruct position at drifted radius, new phase.
     float px_new = r_cyl * cuda_lut_cos(phi_new);
     float pz_new = r_cyl * cuda_lut_sin(phi_new);
 
