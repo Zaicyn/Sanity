@@ -100,7 +100,8 @@ __global__ void fillVulkanParticleBufferLOD(
     float nearThreshold,         // Distance below which = full points
     float farThreshold,          // Distance above which = volume only
     float volumeScale,           // World-space extent of density grid
-    unsigned int* nearCount      // Atomic counter for near particles
+    unsigned int* nearCount,     // Atomic counter for near particles
+    bool shellLensing = false    // Step 6: enable shell lensing distortion
 );
 
 // Clear density grid before LOD fill

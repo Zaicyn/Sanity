@@ -924,7 +924,8 @@ __global__ void fillVulkanParticleBufferLOD(
     float nearThreshold,         // Distance below which = full points (default: 150)
     float farThreshold,          // Distance above which = volume only (default: 600)
     float volumeScale,           // World-space extent of density grid (default: 300)
-    unsigned int* nearCount      // Atomic counter for near particles
+    unsigned int* nearCount,     // Atomic counter for near particles
+    bool shellLensing            // Step 6: enable shell lensing distortion
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -973,6 +974,45 @@ __global__ void fillVulkanParticleBufferLOD(
     // Coherence factor: LOCKED particles (pump_state == 1) are coherent
     // This could be used to render coherent particles volumetrically earlier
     float coherence = (disk->pump_state[i] == 1) ? 1.0f : 0.0f;
+
+    // === SHELL LENSING (gravitational-lens-like distortion) ===
+    // Toggle via --shell-lensing flag. Displaces apparent positions based
+    // on shells between particle and camera. Each shell acts as a thin
+    // spherical lens with n ≈ 1.091.
+    if (shellLensing) {
+        float r_cam_cyl = sqrtf(camX * camX + camZ * camZ);
+        float r_part = r_cyl;  // already computed above
+
+        // Accumulate deflection from each shell between particle and camera.
+        // Convention: if camera is outside shell and particle is inside,
+        // the shell bends the apparent position outward (away from center).
+        float deflection = 0.0f;
+        const float n_minus_1 = 0.091f;   // refractive index excess (from diagnostics)
+        const float shell_width = 2.0f;   // effective thickness of each shell
+
+        for (int s = 0; s < 8; s++) {
+            float r_s = d_shell_radii[s];
+            // Shell is "between" particle and camera if one is inside, other outside.
+            bool cam_outside = (r_cam_cyl > r_s);
+            bool part_inside = (r_part < r_s);
+            if (cam_outside && part_inside) {
+                // Camera outside, particle inside: light bends outward.
+                float impact = fmaxf(fabsf(r_part - r_s), 1.0f);
+                deflection += n_minus_1 * shell_width / impact;
+            } else if (!cam_outside && !part_inside) {
+                // Camera inside, particle outside: light bends inward.
+                float impact = fmaxf(fabsf(r_part - r_s), 1.0f);
+                deflection -= n_minus_1 * shell_width / impact;
+            }
+        }
+
+        // Apply radial displacement in the XZ plane.
+        if (fabsf(deflection) > 0.001f) {
+            float inv_r = rsqrtf(px * px + pz * pz + 1e-8f);
+            px += deflection * px * inv_r;
+            pz += deflection * pz * inv_r;
+        }
+    }
 
     // === POINT RENDERING (NEAR/MID zones) ===
     // Only fill particle buffer if pointWeight > 0
@@ -3534,6 +3574,11 @@ float g_passive_residual_tau = 5.0f;
 // particles passive. Use --shell-init to enable.
 bool g_shell_init = false;
 
+// Shell lensing: displace particle apparent positions based on shell
+// refractive indices, creating a gravitational-lensing-like distortion.
+// Toggle via --shell-lensing or L key at runtime.
+bool g_shell_lensing = false;
+
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
 
@@ -3831,6 +3876,11 @@ int main(int argc, char** argv) {
             g_shell_init = true;
             printf("[init] Shell-aware initialization: particles ON resonance shells\n");
         }
+        else if (strcmp(argv[i], "--shell-lensing") == 0) {
+            extern bool g_shell_lensing;
+            g_shell_lensing = true;
+            printf("[render] Shell lensing ENABLED\n");
+        }
         else if (strcmp(argv[i], "--no-spawn") == 0) {
             extern bool g_spawn_enabled;
             g_spawn_enabled = false;
@@ -3976,6 +4026,7 @@ int main(int argc, char** argv) {
             printf("  --corner-threshold <f>   Passive/active pump_residual threshold (default 0.15)\n");
             printf("  --passive-tau <f>        Passive residual decay tau in sim-time units (default 5.0)\n");
             printf("  --shell-init             Initialize particles ON resonance shells (skip settling transient)\n");
+            printf("  --shell-lensing          Enable gravitational lensing distortion at shell boundaries\n");
             printf("  --no-spawn               Disable natural growth — particle count locked for clean measurements\n");
             printf("  --qr-corr                Dump [QR-corr] CSV rows each stats frame: R, Rrec, peaks, mass_frac, Q, shells, ..., active_frac\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
@@ -5966,7 +6017,8 @@ int main(int argc, char** argv) {
                 nearThreshold,
                 farThreshold,
                 volumeScale,
-                d_nearCount
+                d_nearCount,
+                g_shell_lensing
             );
 
             // Near count readback removed — caused stutter from GPU sync
