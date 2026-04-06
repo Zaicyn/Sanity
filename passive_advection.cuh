@@ -157,23 +157,18 @@ __global__ void advectPassiveParticles(
     disk->vel_y[i] = vy;
     float py_new = py + vy * dt;
 
-    // Step 6: damp radial velocity component. Passive particles should
-    // have nearly pure tangential (Keplerian) velocity. Any radial
-    // component is residual oscillation from the last siphon pass —
-    // damping it helps particles settle onto shells faster.
+    // Step 6: write Keplerian-correct tangential velocity.
+    // The passive kernel advances position via (r_cyl, phi_new) but the
+    // stored vel_x/vel_z must reflect the actual orbital motion so that:
+    //  (a) rendering elongation and visual effects work correctly,
+    //  (b) the E_kin diagnostic reports nonzero kinetic energy,
+    //  (c) on passive→active promotion, siphon gets a consistent state.
+    // Prograde tangent: (-sin(phi), 0, cos(phi)) = (-pz/r, 0, px/r).
     {
-        float vx = disk->vel_x[i];
-        float vz = disk->vel_z[i];
-        float inv_r = rsqrtf(r_cyl * r_cyl + 1e-8f);
-        // Radial unit vector: (px/r, pz/r) using the NEW position.
-        float rx = px_new * inv_r;
-        float rz = pz_new * inv_r;
-        // Project velocity onto radial direction.
-        float v_radial = vx * rx + vz * rz;
-        // Damp the radial component by 2% per frame.
-        float damp = 0.02f;
-        disk->vel_x[i] = vx - v_radial * damp * rx;
-        disk->vel_z[i] = vz - v_radial * damp * rz;
+        float inv_r = rsqrtf(px_new * px_new + pz_new * pz_new + 1e-8f);
+        float v_kep = omega_kep * r_cyl;  // tangential speed = ω × r
+        disk->vel_x[i] = -pz_new * inv_r * v_kep;
+        disk->vel_z[i] =  px_new * inv_r * v_kep;
     }
 
     // Write back position.
