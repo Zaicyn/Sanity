@@ -3518,6 +3518,16 @@ float g_envelope_scale = 1.0f;    // Multiplier on envelope harmonic indices: co
                                   // s=1 → period 2π (default N12). s=2 → period π (N6). s=0.5 → period 4π (N24).
                                   // Tests GPT's prediction: optimal ω should scale as 1/envelope_period.
 
+// Tree Architecture Step 4: runtime corner threshold for passive/active classification.
+// Particles with |pump_residual| > g_corner_threshold → active (siphon kernel).
+// Default 0.15f matches the compile-time constant from Step 3. Tunable via --corner-threshold.
+float g_corner_threshold = 0.15f;
+
+// Tree Architecture Step 4: runtime passive residual tau.
+// Controls how fast pump_residual decays in passive particles. Units: simulation time.
+// Default 5.0f matches PASSIVE_RESIDUAL_TAU from Step 3. Tunable via --passive-tau.
+float g_passive_residual_tau = 5.0f;
+
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
 
@@ -3800,6 +3810,16 @@ int main(int argc, char** argv) {
             printf("[kuramoto] Envelope harmonic scale: %.3f (period = 2π/%.3f)\n",
                    g_envelope_scale, g_envelope_scale);
         }
+        else if (strcmp(argv[i], "--corner-threshold") == 0 && i+1 < argc) {
+            extern float g_corner_threshold;
+            g_corner_threshold = (float)atof(argv[++i]);
+            printf("[passive] Corner threshold: %.4f\n", g_corner_threshold);
+        }
+        else if (strcmp(argv[i], "--passive-tau") == 0 && i+1 < argc) {
+            extern float g_passive_residual_tau;
+            g_passive_residual_tau = (float)atof(argv[++i]);
+            printf("[passive] Residual decay tau: %.2f\n", g_passive_residual_tau);
+        }
         else if (strcmp(argv[i], "--no-spawn") == 0) {
             extern bool g_spawn_enabled;
             g_spawn_enabled = false;
@@ -3942,8 +3962,10 @@ int main(int argc, char** argv) {
             printf("  --no-n12           Disable N12 mixer envelope on Kuramoto coupling\n");
             printf("  --r-export-interval <N>  Dump per-cell R grid to r_export/frame_NNNNN.bin every N frames (0=off)\n");
             printf("  --r-log-interval <N>     Print dense R(t) samples every N frames for time-series analysis (0=off)\n");
+            printf("  --corner-threshold <f>   Passive/active pump_residual threshold (default 0.15)\n");
+            printf("  --passive-tau <f>        Passive residual decay tau in sim-time units (default 5.0)\n");
             printf("  --no-spawn               Disable natural growth — particle count locked for clean measurements\n");
-            printf("  --qr-corr                Dump [QR-corr] CSV rows each stats frame: R, Rrec, peaks, mass_frac, Q, shells, ...\n");
+            printf("  --qr-corr                Dump [QR-corr] CSV rows each stats frame: R, Rrec, peaks, mass_frac, Q, shells, ..., active_frac\n");
             printf("  --headless         Disable rendering (physics + logging only, 10-20x speedup)\n");
             printf("  --hybrid           Enable hybrid LOD rendering (experimental)\n");
             printf("  --octree-render    Use octree traversal for render compaction\n");
@@ -4989,7 +5011,7 @@ int main(int argc, char** argv) {
             // early-return conditions are mutually exclusive on in_active_region.
             computeInActiveRegionMask<<<spawn_blocks, threads>>>(
                 d_disk, d_active_regions, h_num_active_regions,
-                d_in_active_region, N_current);
+                d_in_active_region, N_current, g_corner_threshold);
 #endif
 
             siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, d_in_active_region, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
@@ -4997,7 +5019,7 @@ int main(int argc, char** argv) {
 #if ENABLE_PASSIVE_ADVECTION
             advectPassiveParticles<<<spawn_blocks, threads>>>(
                 d_disk, d_in_active_region, N_current,
-                dt_sim * 2.0f, PASSIVE_RESIDUAL_TAU);
+                dt_sim * 2.0f, g_passive_residual_tau);
 #endif
 
             // === NATURAL GROWTH: Spawn new particles in coherent regions ===
@@ -6370,9 +6392,24 @@ int main(int argc, char** argv) {
             // One CSV-friendly row per stats frame with all scalars needed to
             // correlate phase-cluster structure with Hopfion invariant Q.
             // Columns: frame, R_global, R_recon, n_peaks, peak_mass_frac,
-            //          Q, num_shells, active_count, R_inner, R_mid
+            //          Q, num_shells, N, R_inner, R_mid, active_frac
+            // Step 4: active_frac = fraction of alive particles classified as active (siphon).
             if (g_qr_corr_log) {
-                printf("[QR-corr] %d %.6f %.6f %d %.6f %.4f %d %d %.4f %.4f\n",
+                // Step 4: count active-region particles via host readback.
+                // 1MB every 90 frames = negligible bandwidth.
+                float active_frac = 1.0f;
+#if ENABLE_PASSIVE_ADVECTION
+                {
+                    uint32_t h_active_region_count = 0;
+                    std::vector<uint8_t> h_region_mask(N_current);
+                    cudaMemcpy(h_region_mask.data(), d_in_active_region,
+                               N_current * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+                    for (int j = 0; j < N_current; j++)
+                        if (h_region_mask[j]) h_active_region_count++;
+                    active_frac = (float)h_active_region_count / (float)N_current;
+                }
+#endif
+                printf("[QR-corr] %d %.6f %.6f %d %.6f %.4f %d %d %.4f %.4f %.4f\n",
                        frame,
                        R_global_cached,
                        R_recon,
@@ -6382,7 +6419,8 @@ int main(int argc, char** argv) {
                        h_sample_metrics->num_shells,
                        N_current,
                        r_inner,
-                       r_mid);
+                       r_mid,
+                       active_frac);
             }
 
             // === RING STABILITY DIAGNOSTIC ===
