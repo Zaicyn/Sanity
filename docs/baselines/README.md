@@ -16,8 +16,48 @@ Columns produced by `[blackhole_v20.cu:6264](../../blackhole_v20.cu#L6264)`
 are:
 
 ```
-[QR-corr] frame R_global R_recon n_peaks peak_frac Q num_shells N r_inner r_mid
+[QR-corr] frame R_global R_recon n_peaks peak_frac Q num_shells N r_inner r_mid active_frac
 ```
+
+Step 4 added the `active_frac` column (11th, 0-indexed: 10): fraction of
+alive particles classified as active (siphon path) by
+`computeInActiveRegionMask`. Values range from 0.0 (all passive) to 1.0
+(all active). At the default threshold of 0.15 with standard initialization,
+`active_frac ≈ 0.0005` from frame 0 onwards (only boundary particles).
+
+## Step 4 threshold sweep results
+
+Sweep run via `sweep_threshold.sh --fast` (500 frames, 1M particles,
+seed=42, `--no-spawn`):
+
+| threshold | fps  | active_frac | num_shells | R_global |
+|-----------|------|-------------|------------|----------|
+| 0.01      | 1424 | 0.0005      | 8          | 0.001337 |
+| 0.05      | 1390 | 0.0005      | 8          | 0.001337 |
+| 0.10      | 1425 | 0.0005      | 8          | 0.001337 |
+| 0.15      | 1390 | 0.0005      | 8          | 0.001337 |
+| 0.20      | 1390 | 0.0005      | 8          | 0.001337 |
+| 0.30      | 1382 | 0.0005      | 8          | 0.001337 |
+| 0.50      | 1465 | 0.0005      | 8          | 0.001337 |
+| 1.00      | 1445 | 0.0005      | 8          | 0.001337 |
+
+**Finding: the threshold is currently irrelevant.** All values produce
+identical active fraction (0.05%) and physics (8 shells, same R_global).
+This is because:
+
+1. `pump_history` is initialized to 1.0 (above the 0.7 forced-active
+   threshold), so the warmup catch doesn't fire.
+2. `pump_residual` is initialized to 0.0, below any threshold.
+3. Passive particles never go through siphon, so their residual never
+   increases — the feedback loop is in a stable "all passive" state.
+4. Only the boundary conditions (`r_cyl < 3.0 || r_cyl > 200.0`) force
+   particles active, producing the constant ~500 active particles.
+
+The threshold will become relevant in Step 5 when dynamic region spawning
+injects perturbations into settled regions (spawn events, external entropy
+injection via E key, tidal perturbations, etc.). For now, the system is
+robust across the entire threshold range, and the passive kernel provides
+correct Keplerian physics (8 stable shells, monotonic R_global growth).
 
 Run-to-run behavior across 26 sample frames (frames 0, 90, 180, ..., 2250):
 
