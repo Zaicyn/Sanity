@@ -112,18 +112,27 @@ __global__ void computeInActiveRegionMask(
     float r_cyl_sq = px * px + pz * pz;
     float r_cyl = sqrtf(r_cyl_sq);
 
+    // Step 5: inject residual proportional to deviation from nearest
+    // resonance shell. Particles off-shell accumulate instability;
+    // on-shell particles stay passive. This breaks the "all passive
+    // forever" feedback loop and makes CORNER_THRESHOLD meaningful.
+    // The injection is computed HERE (in the mask kernel, same frame
+    // as the threshold comparison) to avoid the one-frame-lag issue
+    // that would occur if it were in the passive kernel.
+    // d_shell_radii[8] is __constant__ from sun_trace.cuh.
+    float min_dev = fabsf(r_cyl - d_shell_radii[0]);
+    for (int s = 1; s < 8; s++) {
+        float dev = fabsf(r_cyl - d_shell_radii[s]);
+        if (dev < min_dev) min_dev = dev;
+    }
+    float effective_residual = fmaxf(fabsf(residual), min_dev * RESIDUAL_INJECT_RATE);
+
     // Force active (siphon owns) if ANY of these hold:
-    //   - |pump_residual| > corner_threshold: dynamic, needs full physics
+    //   - effective_residual > corner_threshold: off-shell or dynamically active
     //   - r_cyl near ISCO or at boundary: violent physics / recycle territory
     //   - ejected: in Aizawa jet, siphon owns entirely
     //   - pump_history < 0.7: newborn (cf. SPAWN_COHERENCE_THRESH in disk.cuh:114)
-    //
-    // Note: pump_history is initialized to 1.0 and pump_residual to 0.0, so
-    // most particles start passive from frame 0. This is correct — initialized
-    // particles at equilibrium don't need siphon physics. The passive kernel
-    // provides accurate Keplerian advection until siphon dynamics build up
-    // enough residual to cross the threshold.
-    bool force_active = (fabsf(residual) > corner_threshold)
+    bool force_active = (effective_residual > corner_threshold)
                      || (r_cyl < PASSIVE_R_MIN)
                      || (r_cyl > PASSIVE_R_MAX)
                      || particle_ejected(disk, i)
@@ -132,11 +141,10 @@ __global__ void computeInActiveRegionMask(
     uint8_t new_val = force_active ? 1 : 0;
     uint8_t old_val = in_active_region[i];  // previous frame's classification
 
-    // Hysteresis: once active, stay active until residual drops well below
-    // threshold. Prevents frame-to-frame oscillation for particles hovering
-    // near corner_threshold. The "stay active" band is [0.5 * threshold, threshold].
+    // Hysteresis: once active, stay active until effective residual drops
+    // well below threshold. Prevents frame-to-frame oscillation.
     if (old_val != 0 && !force_active) {
-        if (fabsf(residual) > corner_threshold * 0.5f)
+        if (effective_residual > corner_threshold * 0.5f)
             new_val = 1;
     }
 

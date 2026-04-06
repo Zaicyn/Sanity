@@ -60,6 +60,15 @@
 #define PASSIVE_RESIDUAL_TAU  5.0f
 #endif
 
+// Step 5: residual injection rate from shell deviation. Particles
+// off-shell accumulate pump_residual proportional to their distance
+// from the nearest resonance shell. This breaks the "all passive forever"
+// feedback loop and makes CORNER_THRESHOLD meaningful. Step 6 runtime
+// candidate — tune empirically via sweep.
+#ifndef RESIDUAL_INJECT_RATE
+#define RESIDUAL_INJECT_RATE  0.1f
+#endif
+
 // Safety clamp — the passive kernel only handles particles inside the
 // eigenspectrum cascade range. Outside of this the siphon path owns
 // them (including apply_boundary_recycle at r > ION_KICK_OUTER_R).
