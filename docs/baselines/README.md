@@ -53,11 +53,33 @@ This is because:
 4. Only the boundary conditions (`r_cyl < 3.0 || r_cyl > 200.0`) force
    particles active, producing the constant ~500 active particles.
 
-The threshold will become relevant in Step 5 when dynamic region spawning
-injects perturbations into settled regions (spawn events, external entropy
-injection via E key, tidal perturbations, etc.). For now, the system is
-robust across the entire threshold range, and the passive kernel provides
-correct Keplerian physics (8 stable shells, monotonic R_global growth).
+## Step 5 sweep results (with shell-deviation injection)
+
+Step 5a added shell-deviation residual injection: particles off-shell
+accumulate `effective_residual = max(|pump_residual|, deviation * 0.1)`
+in the mask kernel. The threshold is now meaningful.
+
+Sweep via `sweep_threshold.sh --fast` (500 frames, 1M particles):
+
+| threshold | fps  | active_frac | num_shells | R_global |
+|-----------|------|-------------|------------|----------|
+| 0.01      | 1024 | 0.8267      | 8          | 0.001304 |
+| 0.05      | 1014 | 0.8138      | 8          | 0.001044 |
+| 0.10      | 1009 | 0.7975      | 8          | 0.000960 |
+| 0.15      | 1021 | 0.7813      | 8          | 0.000669 |
+| 0.20      | 1013 | 0.7652      | 8          | 0.000586 |
+| 0.30      | 978  | 0.7338      | 8          | 0.000673 |
+| 0.50      | 1003 | 0.6734      | 8          | 0.001441 |
+| 1.00      | 1030 | 0.5374      | 8          | 0.000511 |
+
+**Key findings:**
+- Active fraction ranges from 53.7% to 82.7% — the threshold IS relevant
+- All 8 shells remain stable across the entire threshold range
+- Active fraction decreases over time as siphon pulls particles onto
+  shells (at 500 frames, settling is still in progress)
+- FPS is ~1000 across the board (most particles still active due to
+  off-shell initialization; longer runs will see more passivation and
+  higher FPS as the system settles)
 
 Run-to-run behavior across 26 sample frames (frames 0, 90, 180, ..., 2250):
 

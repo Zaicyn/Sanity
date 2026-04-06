@@ -7,7 +7,7 @@
 ║       12↔16 Dimensional Circulation Visualizer               ║
 ╚══════════════════════════════════════════════════════════════╝
 
-[VRAM] Total: 5982.2 MB, Free: 4191.0 MB, Usable (82%): 3436.6 MB
+[VRAM] Total: 5982.2 MB, Free: 4167.5 MB, Usable (82%): 3417.3 MB
 [VRAM] Grid size: 96³ = 884736 cells (42.5 MB)
 [VRAM] Safe particle cap: 20000000 (1320.0 MB for particles, octree disabled)
 [VRAM] Octree subsystem DISABLED — no morton/node/leaf buffers allocated
@@ -31,8 +31,8 @@
 [V20] Volume descriptor sets created
 [vulkan] Creating CUDA-Vulkan shared buffer for 20000000 particles (capacity for growth)...
 [interop] Created shared buffer: 762.939 MB for 20000000 particles, fd=109
-[interop] Imported to CUDA: ptr=0x7fd8a2000000
-[vulkan] Initialization complete! Shared buffer at CUDA ptr=0x7fd8a2000000
+[interop] Imported to CUDA: ptr=0x7fe29a000000
+[vulkan] Initialization complete! Shared buffer at CUDA ptr=0x7fe29a000000
 [attractor] Initializing density rendering pipeline...
 [attractor] Density buffer: 808x1394 R32_UINT
 [attractor] Position-primary pipeline created
@@ -56,121 +56,121 @@
 [run] Seam: 1=closed 2=up 3=down 4=full | Bias: [/] or T=turbo
 [run] PURE PHYSICS MODE - no template forcing
 [flags+tiles] Initialized with hierarchical tiled compaction
-[flags+tiles] frame=0 rebuild=1 | Active: 30656 cells in 72 tiles (3.46% of grid)
-[grid timing] scatter=0.46ms compact=0.05ms pressure=0.05ms gather=0.45ms total=1.01ms
+[flags+tiles] frame=0 rebuild=1 | Active: 31545 cells in 72 tiles (3.57% of grid)
+[grid timing] scatter=0.45ms compact=0.04ms pressure=0.05ms gather=0.68ms total=1.22ms
 [frame     0] fps=0 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.33 | R=0.0004/Rrec=0.0004 [0.024/0.024/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 0.99 1.00 1.00 1.01 1.00 1.00 1.01 0.99 1.01 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.01 1.01 1.00 0.99 0.99 1.00 1.01 1.00 1.00 0.99 1.00 1.00 
+[phase-hist-num] 1.00 0.99 1.00 1.01 1.00 1.00 1.00 1.01 0.98 1.01 1.01 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.01 1.00 1.00 1.00 1.00 1.01 1.00 0.99 0.99 1.00 1.00 
 [hopfion shells] num=0 Q=0.00 | 
-[QR-corr] 0 0.000367 0.000367 0 0.000000 0.0000 0 1000000 0.0235 0.0239 0.0005
-[frame    90] fps=2802 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.19 | R=0.0004/Rrec=0.0002 [0.014/0.013/0.000]
-[phase-hist] -------------------------------- max/avg=1.01
+[QR-corr] 0 0.000370 0.000372 0 0.000000 0.0000 0 1000000 0.0237 0.0241 0.9704
+[frame    90] fps=1503 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.19 | R=0.0006/Rrec=0.0004 [0.050/0.050/0.000]
+[phase-hist] -------------------------------- max/avg=1.02
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.00 1.00 1.00 1.01 1.00 0.99 0.99 1.01 1.01 0.99 1.00 1.00 1.00 1.00 1.01 0.99 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.01 1.01 1.00 1.00 
-[hopfion shells] num=8 Q=0.00 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.4 n=1.091 | 
-[QR-corr] 90 0.000382 0.000235 0 0.000000 0.0000 8 1000000 0.0138 0.0134 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.228 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 0.99 1.00 1.02 0.99 0.99 1.00 1.00 1.00 1.00 1.00 1.00 1.01 1.01 1.00 1.00 1.01 0.99 1.01 1.00 0.99 1.00 1.01 1.00 1.00 1.00 1.00 0.99 1.00 1.01 1.00 1.00 0.99 
+[hopfion shells] num=8 Q=0.00 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
+[QR-corr] 90 0.000565 0.000398 0 0.000000 0.0000 8 1000000 0.0497 0.0496 0.9622
+[lensing] stability=0.0% (target ~10%) | M_eff=36.162 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
 [topo] Recording started at frame 100
-[frame   180] fps=1687 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.05 | R=0.0005/Rrec=0.0000 [0.005/0.005/0.000]
+[frame   180] fps=965 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.05 | R=0.0004/Rrec=0.0003 [0.030/0.032/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.01 1.00 0.99 1.01 1.01 1.00 1.01 0.99 0.99 1.01 1.00 1.00 1.00 1.00 1.00 1.01 0.99 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.00 1.00 1.00 0.99 1.01 1.00 
-[hopfion shells] num=8 Q=78.26 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 180 0.000450 0.000013 0 0.000000 78.2569 8 1000000 0.0048 0.0050 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.227 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 1.00 1.00 1.01 1.00 1.00 0.99 0.99 1.01 1.01 0.98 1.00 1.00 1.00 1.00 1.01 0.99 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 0.99 1.01 1.00 1.00 1.00 
+[hopfion shells] num=8 Q=-0.21 | r=15.5 n=1.091 | r=28.0 n=1.091 | r=42.2 n=1.091 | r=57.1 n=1.091 | 
+[QR-corr] 180 0.000412 0.000256 0 0.000000 -0.2130 8 1000000 0.0297 0.0316 0.9483
+[lensing] stability=0.0% (target ~10%) | M_eff=35.988 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   270] fps=1472 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.09 | R=0.0006/Rrec=0.0001 [0.004/0.004/0.000]
+[frame   270] fps=882 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.09 | R=0.0003/Rrec=0.0002 [0.009/0.015/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.00 1.01 0.99 1.00 1.00 1.00 1.00 
-[hopfion shells] num=8 Q=-81.60 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 270 0.000600 0.000115 0 0.000000 -81.6005 8 1000000 0.0036 0.0037 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.227 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 0.99 1.00 1.01 0.99 1.01 0.99 1.00 1.00 0.99 1.00 1.00 1.01 1.00 1.00 1.00 1.01 1.00 0.99 0.99 1.00 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.01 1.00 1.01 
+[hopfion shells] num=8 Q=0.30 | r=15.4 n=1.091 | r=27.8 n=1.091 | r=42.1 n=1.091 | r=57.0 n=1.091 | 
+[QR-corr] 270 0.000273 0.000165 0 0.000000 0.2985 8 1000000 0.0087 0.0153 0.9330
+[lensing] stability=0.0% (target ~10%) | M_eff=35.791 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   360] fps=1469 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.23 | R=0.0008/Rrec=0.0001 [0.003/0.003/0.000]
+[frame   360] fps=860 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.23 | R=0.0007/Rrec=0.0001 [0.003/0.010/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.00 1.00 1.00 1.01 1.00 1.01 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 0.99 1.00 1.00 1.00 0.99 1.00 1.01 1.01 1.00 0.99 1.00 1.00 1.00 1.00 
-[hopfion shells] num=8 Q=-64.54 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 360 0.000798 0.000050 0 0.000000 -64.5416 8 1000000 0.0026 0.0027 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.227 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.00 0.99 0.99 1.01 1.00 0.99 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.01 0.99 1.00 0.99 1.01 0.99 1.00 1.00 0.99 1.01 1.00 
+[hopfion shells] num=8 Q=1.81 | r=15.2 n=1.091 | r=27.7 n=1.091 | r=42.1 n=1.091 | r=56.8 n=1.091 | 
+[QR-corr] 360 0.000700 0.000087 0 0.000000 1.8109 8 1000000 0.0028 0.0098 0.9174
+[lensing] stability=0.0% (target ~10%) | M_eff=35.594 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[lock] LOCKED: 8 shells, Q=1.81, stability=0.0% — skipping mip-tree rebuild
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   450] fps=1399 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.37 | R=0.0009/Rrec=0.0001 [0.002/0.002/0.000]
+[frame   450] fps=959 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.37 | R=0.0007/Rrec=0.0000 [0.004/0.008/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 0.99 1.01 1.00 1.00 1.00 0.99 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.01 0.99 1.00 1.00 1.00 1.00 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.00 0.99 1.00 
-[hopfion shells] num=8 Q=59.53 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 450 0.000942 0.000084 0 0.000000 59.5264 8 1000000 0.0022 0.0022 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.226 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 0.99 1.01 0.99 1.00 0.99 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.00 1.01 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 
+[hopfion shells] num=8 Q=2.80 | r=15.1 n=1.091 | r=27.6 n=1.091 | r=42.0 n=1.091 | r=56.6 n=1.091 | 
+[QR-corr] 450 0.000662 0.000049 0 0.000000 2.7968 8 1000000 0.0040 0.0084 0.9013
+[lensing] stability=0.0% (target ~10%) | M_eff=35.402 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[topo] frame=500 | buf=128/128 | Q≈-64.06 | avg_vel=0.032 | stability=0.000 | streak=0 | stride=1 (rec=401 skip=0)
-[frame   540] fps=1433 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.49 | R=0.0010/Rrec=0.0001 [0.002/0.002/0.000]
+[frame   540] fps=1053 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.49 | R=0.0005/Rrec=0.0001 [0.004/0.007/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.00 0.99 1.00 1.00 0.99 1.00 1.00 1.00 0.99 1.00 1.01 1.00 0.99 1.00 1.01 1.00 1.00 1.00 1.00 
-[hopfion shells] num=8 Q=19.60 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 540 0.001003 0.000053 0 0.000000 19.6025 8 1000000 0.0018 0.0018 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.226 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.01 1.00 1.00 1.01 1.00 0.99 1.00 1.00 1.01 1.00 0.99 0.99 1.01 1.00 1.00 1.00 1.00 0.99 
+[hopfion shells] num=8 Q=3.93 | r=15.0 n=1.091 | r=27.5 n=1.091 | r=41.9 n=1.091 | r=56.5 n=1.091 | 
+[QR-corr] 540 0.000482 0.000079 0 0.000000 3.9270 8 1000000 0.0044 0.0073 0.8848
+[lensing] stability=0.0% (target ~10%) | M_eff=35.212 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   630] fps=1401 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.61 | R=0.0011/Rrec=0.0001 [0.002/0.002/0.000]
+[frame   630] fps=1041 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.61 | R=0.0007/Rrec=0.0001 [0.003/0.006/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 0.99 1.00 1.01 0.99 1.00 1.01 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.01 1.01 1.00 1.00 1.00 1.01 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 0.99 
-[hopfion shells] num=8 Q=-80.72 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 630 0.001072 0.000060 0 0.000000 -80.7165 8 1000000 0.0016 0.0016 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.225 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 0.99 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.00 1.01 0.99 1.01 0.99 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.01 1.01 1.00 1.00 1.00 1.01 1.00 1.00 
+[hopfion shells] num=8 Q=11.49 | r=14.8 n=1.091 | r=27.3 n=1.091 | r=41.8 n=1.091 | r=56.3 n=1.091 | 
+[QR-corr] 630 0.000653 0.000093 0 0.000000 11.4946 8 1000000 0.0028 0.0061 0.8681
+[lensing] stability=0.0% (target ~10%) | M_eff=35.026 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   720] fps=1456 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.72 | R=0.0012/Rrec=0.0001 [0.001/0.001/0.000]
+[frame   720] fps=1004 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.72 | R=0.0005/Rrec=0.0001 [0.002/0.005/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.01 1.01 1.01 1.00 0.99 1.01 1.00 1.00 1.01 0.99 1.00 1.01 0.99 0.99 1.00 0.98 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.01 1.00 1.00 1.00 
-[hopfion shells] num=8 Q=-70.11 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 720 0.001195 0.000051 0 0.000000 -70.1058 8 1000000 0.0014 0.0014 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.225 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.01 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.01 
+[hopfion shells] num=8 Q=5.70 | r=14.7 n=1.091 | r=27.2 n=1.091 | r=41.8 n=1.091 | r=56.2 n=1.091 | 
+[QR-corr] 720 0.000542 0.000058 0 0.000000 5.6987 8 1000000 0.0019 0.0053 0.8509
+[lensing] stability=0.0% (target ~10%) | M_eff=34.841 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[frame   810] fps=1423 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.81 | R=0.0013/Rrec=0.0001 [0.001/0.001/0.000]
+[frame   810] fps=1018 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.81 | R=0.0004/Rrec=0.0000 [0.002/0.005/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.00 0.99 1.01 0.99 1.01 1.00 1.00 1.01 1.00 1.01 1.00 1.00 1.00 1.00 0.99 1.00 1.01 0.99 1.01 1.00 1.00 0.99 0.99 0.99 
-[hopfion shells] num=8 Q=-295.49 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 810 0.001282 0.000051 0 0.000000 -295.4884 8 1000000 0.0013 0.0013 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.224 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 1.00 1.00 0.99 1.01 1.01 1.00 1.00 0.99 1.01 
+[hopfion shells] num=8 Q=5.47 | r=14.6 n=1.091 | r=27.1 n=1.091 | r=41.7 n=1.091 | r=56.0 n=1.091 | 
+[QR-corr] 810 0.000396 0.000028 0 0.000000 5.4654 8 1000000 0.0017 0.0048 0.8335
+[lensing] stability=0.0% (target ~10%) | M_eff=34.662 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[flags+tiles] frame=870 rebuild=30 | Active: 19193 cells in 73 tiles (2.17% of grid)
-[grid timing] scatter=0.33ms compact=0.04ms pressure=0.03ms gather=0.44ms total=0.83ms
-[frame   900] fps=1452 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.88 | R=0.0013/Rrec=0.0000 [0.001/0.001/0.000]
+[flags+tiles] frame=870 rebuild=30 | Active: 25441 cells in 73 tiles (2.88% of grid)
+[grid timing] scatter=0.34ms compact=0.06ms pressure=0.02ms gather=0.23ms total=0.65ms
+[frame   900] fps=985 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=-0.88 | R=0.0010/Rrec=0.0000 [0.002/0.004/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.01 1.00 1.01 1.00 0.99 0.99 1.00 1.01 1.00 0.99 1.00 1.00 1.00 0.99 0.99 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 0.99 1.01 1.00 1.00 1.01 1.01 1.00 1.00 
-[hopfion shells] num=8 Q=-64.69 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 900 0.001295 0.000044 0 0.000000 -64.6950 8 1000000 0.0012 0.0012 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.224 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 0.99 0.99 1.01 1.01 1.00 1.00 0.99 1.01 1.00 1.00 1.00 1.00 1.00 1.00 1.00 1.01 1.01 0.99 1.01 1.00 1.00 1.00 1.01 1.00 0.99 0.99 1.00 1.00 1.00 1.00 1.00 1.00 
+[hopfion shells] num=8 Q=6.05 | r=14.4 n=1.091 | r=26.9 n=1.091 | r=41.6 n=1.091 | r=55.8 n=1.091 | 
+[QR-corr] 900 0.000993 0.000045 0 0.000000 6.0546 8 1000000 0.0016 0.0044 0.8159
+[lensing] stability=0.0% (target ~10%) | M_eff=34.487 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[profile] siphon=0.29ms physics=0.85ms render=6.33ms total=7.46ms
-[frame   990] fps=1395 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.94 | R=0.0013/Rrec=0.0000 [0.001/0.001/0.000]
+[profile] siphon=0.61ms physics=0.62ms render=6.10ms total=7.33ms
+[frame   990] fps=999 | particles=1000000 avg_scale=1.00 (sample=1.00) | bridge: s=1.00 r=0.000 hb=0.94 | R=0.0010/Rrec=0.0001 [0.001/0.004/0.000]
 [phase-hist] -------------------------------- max/avg=1.01
 [phase-hist] peaks=0  peak_mass_frac=0.000000  total_hist=1000000
-[phase-hist-num] 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.01 1.00 1.00 1.00 1.01 1.00 1.00 1.01 0.99 1.01 1.00 1.00 1.00 1.00 0.99 1.01 1.00 0.99 1.00 1.00 
-[hopfion shells] num=8 Q=191.38 | r=15.7 n=1.091 | r=28.1 n=1.091 | r=42.3 n=1.091 | r=57.3 n=1.091 | 
-[QR-corr] 990 0.001337 0.000043 0 0.000000 191.3753 8 1000000 0.0011 0.0011 0.0005
-[lensing] stability=0.0% (target ~10%) | M_eff=36.223 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
+[phase-hist-num] 1.00 1.00 0.99 1.00 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.01 1.00 1.00 1.00 1.00 0.99 1.00 1.00 1.01 1.00 1.00 1.01 1.01 1.00 1.00 0.99 1.00 1.00 1.00 1.01 1.00 
+[hopfion shells] num=8 Q=-11.30 | r=14.3 n=1.091 | r=26.8 n=1.091 | r=41.5 n=1.091 | r=55.7 n=1.091 | 
+[QR-corr] 990 0.000960 0.000071 0 0.000000 -11.2996 8 1000000 0.0014 0.0041 0.7975
+[lensing] stability=0.0% (target ~10%) | M_eff=34.315 (7 active shells, r<100) | n_avg=1.0910 Δn=0.0000
 [coherence] E_kin=0.00e+00 E/N=0.000 | λ=0.100 γ=0.020 (bounded)
-[photon ring] R=113.85 | ΔR/R=0.01% (EHT target <2%) | [113.84 ... 113.86] | 🔥 TOPOLOGY TEST: Shell swallowing photon ring!
+[photon ring] R=110.19 | ΔR/R=5.00% (EHT target <2%) | [108.05 ... 113.56] | 🔥 TOPOLOGY TEST: Shell swallowing photon ring!
 
 ╔════════════════════════════════════════════════════════════════╗
 ║  CONTROLLED EXPERIMENT COMPLETE (Equal Time)                   ║
 ╚════════════════════════════════════════════════════════════════╝
 [TERMINATION] Target frames reached:
   ✓ Frames = 990 (target: 500)
-  ✓ M_eff = 36.223 (compare mass retention)
+  ✓ M_eff = 34.315 (compare mass retention)
 
 Final Results:
   Radial Topology: Hopfion shells
   Arm Mode: DISABLED
-  Photon Ring R: 113.85
-  Ring Stability ΔR/R: 0.01% (EHT target <2%)
+  Photon Ring R: 110.19
+  Ring Stability ΔR/R: 5.00% (EHT target <2%)
   Lensing Stability: 0.0% (target ~10%)
   Active Particles: 0
   Ejected Particles: 0
