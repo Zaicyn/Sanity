@@ -3,81 +3,100 @@
 //
 // Realtime Hopfion Lattice Black Hole + Siphon Pump State Machine
 //
-// This version integrates:
-//   - squaragon.h: O(1) cuboctahedral primitive
-//   - siphon_pump.h: 12↔16 dimensional siphon state machine
-//   - Original V8 Aizawa/Viviani physics
-//
-// The disk particles now operate as individual siphon pumps:
-//   - Each particle has its own 12→16→12 cycle
-//   - Seam phase bits controlled by local stress
-//   - Scale cascades propagate through the disk
-//   - Ejection = pump overload (residual exceeds threshold)
-//
-// Physics mapping:
-//   - ISCO region: pump running at full coupling (SEAM_FULL)
-//   - Outer disk: pump in reduced coupling (SEAM_UP_ONLY or SEAM_DOWN_ONLY)
-//   - Ejected jets: pump overflow, scale cascade triggered
-//   - Accretion: pump intake, 16→12 downstroke dominates
-//
 // Compile:
-//   nvcc -O3 -arch=sm_75 -std=c++17 blackhole_v20.cu -lglfw -lGLEW -lGL -o blackhole_v20
+//   make  (uses Makefile — Vulkan interop build)
 //
 // Controls:
-//   Left drag  — orbit camera
-//   Scroll     — zoom
-//   R          — reset simulation
-//   Space      — pause/resume
-//   C          — toggle color scheme (topology vs intensity)
-//   1/2/3/4    — set seam bits (0=closed, 1=up, 2=down, 3=full)
-//   ESC        — quit
+//   Left drag  — orbit camera     Space — pause/resume
+//   Scroll     — zoom             C     — cycle color modes
+//   R          — reset camera     H     — toggle topology
+//   A          — toggle arms      L     — toggle shell lensing
+//   E          — inject entropy   ESC   — quit
 
-#include "squaragon.h"
-#include "siphon_pump.h"
+// ============================================================================
+// Standard Library
+// ============================================================================
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <random>
+#include <chrono>
 
-// CUDA LUT for fast trigonometry (quarter-sector sine table in constant memory)
-// Define CUDA_LUT_IMPLEMENTATION before including to get the init function
+// ============================================================================
+// Core Primitives
+// ============================================================================
+#include "squaragon.h"                // O(1) cuboctahedral primitive
+#include "siphon_pump.h"              // 12↔16 dimensional siphon state machine
+
+// ============================================================================
+// CUDA LUT (fast trigonometry — quarter-sector sine table in constant memory)
+// ============================================================================
 #define CUDA_LUT_IMPLEMENTATION
 #include "cuda_lut.cuh"
 
 // ============================================================================
 // Modular Physics Headers (Math.md compliant)
 // ============================================================================
-// These headers factor the physics into auditable components:
-//   - disk.cuh:        GPUDisk struct, constants, inline compute
-//   - harmonic.cuh:    heartbeat (cos θ cos 3θ), coherence filter
-//   - forces.cuh:      Viviani field, angular momentum, ion kick
-//   - siphon_pump.cuh: 8-state pump machine, ejection
-//   - aizawa.cuh:      phase-breathing attractor for jets
-//   - topology.cuh:    spiral arm structure
-//
-// The monolithic siphonDiskKernel below can be replaced with physics.cu
-// by defining USE_MODULAR_PHYSICS before compilation.
-#include "disk.cuh"
-#include "harmonic.cuh"
-#include "forces.cuh"
-#include "siphon_pump.cuh"
-#include "aizawa.cuh"
-// topology.cuh moved after device constant definitions (needs d_NUM_ARMS etc.)
-#include "sun_trace.cuh"
-#include "passive_advection.cuh"  // Tree Architecture Step 2: passive Keplerian advection kernel
-#include "active_region.cuh"      // Tree Architecture Step 2: ActiveRegion struct + in-region mask kernel
-#include "cuda_primitives.cuh"
-#include "octree.cuh"
-#include "cell_grid.cuh"
-// render_fill.cuh moved after Vulkan includes (needs ParticleVertex definition)
-#include "validator/frame_export.cuh"
-#include "topology_recorder.cuh"
-#include "mip_tree.cuh"
+#include "disk.cuh"                   // GPUDisk struct, constants, inline compute
+#include "harmonic.cuh"               // Heartbeat cos(θ)cos(3θ), coherence filter
+#include "forces.cuh"                 // Viviani field, angular momentum, ion kick
+#include "siphon_pump.cuh"            // 8-state pump machine, ejection
+#include "aizawa.cuh"                 // Phase-breathing attractor for jets
+#include "sun_trace.cuh"              // VulkanSunTrace, d_shell_radii[8]
+#include "passive_advection.cuh"      // Passive Keplerian advection kernel
+#include "active_region.cuh"          // ActiveRegion struct + in-region mask kernel
 
-// Global instance of topology ring buffer (defined in topology_recorder.cuh as extern)
+// ============================================================================
+// Spatial Data Structures
+// ============================================================================
+#include "cuda_primitives.cuh"        // GPU scan/sort/count utilities
+#include "octree.cuh"                 // OctreeNode, Morton encode/decode, XOR corner
+#include "cell_grid.cuh"              // CellGrid struct, grid constants
+
+// ============================================================================
+// Validation & Topology
+// ============================================================================
+#include "validator/frame_export.cuh" // Frame export for offline validation
+#include "topology_recorder.cuh"      // Ring buffer for crystal detection
+#include "mip_tree.cuh"              // Hierarchical coherence mip-tree
+
+// ============================================================================
+// Vulkan + CUDA Interop
+// ============================================================================
+#include <vulkan/vulkan.h>
+#include <GLFW/glfw3.h>
+#include <cuda_runtime.h>
+#include "vulkan/vk_types.h"          // ParticleVertex, VulkanContext
+#include "vulkan/vk_cuda_interop.h"   // Shared CUDA-Vulkan buffer management
+#include "vulkan/vk_attractor.h"      // Attractor pipeline
+
+// ============================================================================
+// Runtime Configuration & VRAM Management
+// ============================================================================
+#include "vram_config.cuh"            // initVRAMConfig(), canOctreeFit(), grid constants
+#include "math_types.cuh"             // Vec3, Mat4 (minimal, no GLM)
+
+// ============================================================================
+// Rendering
+// ============================================================================
+#include "render_color.cuh"           // blackbody(), mix(), device color helpers
+#include "render_fill.cuh"            // Vulkan fill/compact kernels (LOD, compaction)
+
+// ============================================================================
+// Simulation Globals & CLI
+// ============================================================================
+#include "sim_globals.h"              // Camera, physics flags, test suite globals
+#include "cli_args.cuh"               // parseCLI() — command line argument handling
+#include "diagnostics.cuh"            // StressCounters, PumpMetrics, sampling kernel
+
+// ============================================================================
+// Global Instances
+// ============================================================================
 TopologyRecorder g_topo_recorder = {};
+AttractorPipeline g_attractor;
 
-// ============================================================================
-// VALIDATION CONTEXT — Global state for key handler access
-// ============================================================================
-// The key callback can't access main()'s local variables, so we maintain
-// a global context that gets updated each frame in the main loop.
 struct ValidationContext {
     GPUDisk* d_disk = nullptr;
     int N_current = 0;
@@ -89,18 +108,9 @@ struct ValidationContext {
 };
 static ValidationContext g_validation_ctx;
 
-// Vulkan + CUDA interop mode (single app, zero-copy)
-#include <vulkan/vulkan.h>
-#include <GLFW/glfw3.h>
-#include <cuda_runtime.h>
-#include "vulkan/vk_types.h"
-#include "vulkan/vk_cuda_interop.h"
-#include "vulkan/vk_attractor.h"
-#include "render_fill.cuh"  // Vulkan fill/compact kernels (needs ParticleVertex from vk_types.h)
-
-// Global attractor pipeline (used by vk_buffer.cpp via extern)
-AttractorPipeline g_attractor;
-
+// ============================================================================
+// Vulkan Forward Declarations
+// ============================================================================
 namespace vk {
     void initWindow(VulkanContext& ctx);
     void initVulkan(VulkanContext& ctx);
@@ -128,92 +138,27 @@ namespace vk {
     void recordCommandBuffer(VulkanContext& ctx, VkCommandBuffer commandBuffer, uint32_t imageIndex);
 }
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cmath>
-#include <vector>
-#include <random>
-#include <chrono>
-
-// Native GPU primitives — no external dependencies (V8 philosophy)
-// CUB/thrust removed: "everything correct stays untouched forever"
-
 // ============================================================================
-// Configuration — Rendering-Specific (physics constants in disk.cuh)
+// Rendering Configuration
 // ============================================================================
+#define WIDTH   1280
+#define HEIGHT  720
 
-#define WIDTH         1280
-#define HEIGHT        720
-
-// VRAM configuration, device-side grid constants, runtime particle caps
-#include "vram_config.cuh"
-
-// Tree Architecture Step 2: compile-time guard for passive advection dispatch.
 #ifndef ENABLE_PASSIVE_ADVECTION
 #define ENABLE_PASSIVE_ADVECTION 1
 #endif
 
-// Vec3 / Mat4 (minimal, no GLM) — extracted to math_types.cuh
-#include "math_types.cuh"
-
-// ============================================================================
-// GPU Disk with Siphon Pump State
-// ============================================================================
-
-// NOTE: GPUDisk struct now defined in disk.cuh (modular physics headers)
-// The struct definition has been moved to avoid duplication.
-
-// ============================================================================
-// Octree Node Structure - Hybrid Analytic/Stochastic Spatial Tree
-// ============================================================================
-// Morton encoding for memory layout, XOR corner for O(1) neighbor lookup.
-// Levels 0-5: ANALYTIC (frozen at init, field-derived energy)
-// Levels 6-13: STOCHASTIC (rebuilt from particle positions)
-// BOUNDARY nodes at level 5-6 interface for smoothstep blending
-// OctreeNode struct and defines now in octree.cuh
-
-// CellGrid struct and grid constants now in cell_grid.cuh
-
-// Runtime values — HOST code uses g_grid_*, DEVICE code uses d_grid_*
-// The macros below provide host-side compatibility with existing code
+// Host-side grid macros (device code must use d_grid_* directly)
 #define GRID_DIM        g_grid_dim
 #define GRID_CELLS      g_grid_cells
 #define GRID_CELL_SIZE  g_grid_cell_size
-#define GRID_STRIDE_Y   g_grid_dim                        // Y stride = dim
-#define GRID_STRIDE_Z   (g_grid_dim * g_grid_dim)         // Z stride = dim²
-
-// IMPORTANT: In __device__ and __global__ code, use d_grid_* directly!
-// The macros above expand to host variables which won't work in kernels.
-
-// Convert cell index to tile index
-// Uses device constants for runtime-scaled grids
-__device__ __forceinline__ uint32_t cellToTile(uint32_t cell) {
-    int tiles_per_dim = d_grid_dim / TILE_DIM;
-    uint32_t cx = cell % d_grid_dim;
-    uint32_t cy = (cell / d_grid_stride_y) % d_grid_dim;
-    uint32_t cz = cell / d_grid_stride_z;
-    uint32_t tx = cx / TILE_DIM;
-    uint32_t ty = cy / TILE_DIM;
-    uint32_t tz = cz / TILE_DIM;
-    return tx + ty * tiles_per_dim + tz * tiles_per_dim * tiles_per_dim;
-}
-
-// Convert tile index to first cell in tile
-// Uses device constants for runtime-scaled grids
-__device__ __forceinline__ uint32_t tileToFirstCell(uint32_t tile) {
-    int tiles_per_dim = d_grid_dim / TILE_DIM;
-    uint32_t tx = tile % tiles_per_dim;
-    uint32_t ty = (tile / tiles_per_dim) % tiles_per_dim;
-    uint32_t tz = tile / (tiles_per_dim * tiles_per_dim);
-    return (tx * TILE_DIM) + (ty * TILE_DIM) * d_grid_stride_y + (tz * TILE_DIM) * d_grid_stride_z;
-}
+#define GRID_STRIDE_Y   g_grid_dim
+#define GRID_STRIDE_Z   (g_grid_dim * g_grid_dim)
 
 // ============================================================================
-// Device constants
+// Device Constants
 // ============================================================================
-// Define guard so physics.cu doesn't redefine these when included
-#define PHYSICS_CONSTANTS_DEFINED
+#define PHYSICS_CONSTANTS_DEFINED  // Guard: physics.cu won't redefine these
 
 __device__ __constant__ float d_PI = 3.14159265358979f;
 __device__ __constant__ float d_TWO_PI = 6.28318530717959f;
@@ -226,135 +171,68 @@ __device__ __constant__ float d_SCALE_RATIO = 1.6875f;
 __device__ __constant__ float d_BIAS = 0.75f;
 __device__ __constant__ float d_PHI_EXCESS = 0.09017f;
 
-// Spiral arm topology parameters (Deepseek's experiment)
 __device__ __constant__ int d_NUM_ARMS = 3;
 __device__ __constant__ float d_ARM_WIDTH_DEG = 45.0f;
 __device__ __constant__ float d_ARM_TRAP_STRENGTH = 0.15f;
 __device__ __constant__ bool d_USE_ARM_TOPOLOGY = true;
-__device__ __constant__ float d_ARM_BOOST_OVERRIDE = 0.0f;  // Test C: Override discrete boost
+__device__ __constant__ float d_ARM_BOOST_OVERRIDE = 0.0f;
 
-// Include topology.cuh here AFTER arm constants are defined
-#include "topology.cuh"
+#include "topology.cuh"  // Must follow d_NUM_ARMS etc.
 
-// Natural growth: dynamic particle count tracking
-// System can grow from seed population via spawning in coherent regions
-__device__ unsigned int d_current_particle_count = 0;  // Current active particle count
-__device__ unsigned int d_spawn_count = 0;             // Particles spawned this frame
+__device__ unsigned int d_current_particle_count = 0;
+__device__ unsigned int d_spawn_count = 0;
 
 // ============================================================================
-// Derived Particle Properties — Now in disk.cuh
+// Cell Grid Device Functions (depend on d_grid_* constants from vram_config.cuh)
 // ============================================================================
-// compute_disk_r, compute_disk_phi, compute_temp, compute_in_disk
-// are defined in disk.cuh (modular physics headers).
-// Saves 13 bytes/particle × 10M = 130 MB VRAM and ~37 GB/s bandwidth.
 
-// Morton Key / Octree Device Functions now in octree.cuh:
-// expandBits21, morton64, xorCorner, fieldEnergy
+__device__ __forceinline__ uint32_t cellToTile(uint32_t cell) {
+    int tiles_per_dim = d_grid_dim / TILE_DIM;
+    uint32_t cx = cell % d_grid_dim;
+    uint32_t cy = (cell / d_grid_stride_y) % d_grid_dim;
+    uint32_t cz = cell / d_grid_stride_z;
+    return (cx / TILE_DIM) + (cy / TILE_DIM) * tiles_per_dim + (cz / TILE_DIM) * tiles_per_dim * tiles_per_dim;
+}
 
-// ============================================================================
-// Cell Grid Device Functions — O(1) position-to-cell mapping (DNA layer)
-// ============================================================================
-// These replace Morton sorting + binary search with direct arithmetic.
-// Forward-only: no sorting, no tree traversal, no binary search.
+__device__ __forceinline__ uint32_t tileToFirstCell(uint32_t tile) {
+    int tiles_per_dim = d_grid_dim / TILE_DIM;
+    uint32_t tx = tile % tiles_per_dim;
+    uint32_t ty = (tile / tiles_per_dim) % tiles_per_dim;
+    uint32_t tz = tile / (tiles_per_dim * tiles_per_dim);
+    return (tx * TILE_DIM) + (ty * TILE_DIM) * d_grid_stride_y + (tz * TILE_DIM) * d_grid_stride_z;
+}
 
-// O(1) position → cell index (replaces morton64 + sort + binary search)
-// Uses d_grid_* device constants for runtime-scaled grids
 __device__ __forceinline__ uint32_t cellIndexFromPos(float px, float py, float pz) {
-    // Map [-250, 250] to [0, dim-1] integer coordinates
     uint32_t cx = (uint32_t)fminf(fmaxf((px + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     uint32_t cy = (uint32_t)fminf(fmaxf((py + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     uint32_t cz = (uint32_t)fminf(fmaxf((pz + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     return cx + cy * d_grid_stride_y + cz * d_grid_stride_z;
 }
 
-// Extract cell coordinates from linear index
 __device__ __forceinline__ void cellCoords(uint32_t cell, uint32_t* cx, uint32_t* cy, uint32_t* cz) {
     *cx = cell % d_grid_dim;
     *cy = (cell / d_grid_stride_y) % d_grid_dim;
     *cz = cell / d_grid_stride_z;
 }
 
-// O(1) neighbor cell index — direct arithmetic (replaces binary search neighbor lookup)
-// Returns cell index or UINT32_MAX if out of bounds
 __device__ __forceinline__ uint32_t neighborCellIndex(uint32_t cell, int dx, int dy, int dz) {
     uint32_t cx, cy, cz;
     cellCoords(cell, &cx, &cy, &cz);
-
-    // Check bounds
-    int nx = (int)cx + dx;
-    int ny = (int)cy + dy;
-    int nz = (int)cz + dz;
-
-    if (nx < 0 || nx >= d_grid_dim || ny < 0 || ny >= d_grid_dim || nz < 0 || nz >= d_grid_dim) {
-        return UINT32_MAX;  // Out of bounds
-    }
-
+    int nx = (int)cx + dx, ny = (int)cy + dy, nz = (int)cz + dz;
+    if (nx < 0 || nx >= d_grid_dim || ny < 0 || ny >= d_grid_dim || nz < 0 || nz >= d_grid_dim)
+        return UINT32_MAX;
     return (uint32_t)nx + (uint32_t)ny * d_grid_stride_y + (uint32_t)nz * d_grid_stride_z;
 }
 
-// XOR Neighbor Lookup functions now in octree.cuh:
-// mortonNeighbor, getNeighborKeys, findLeafByHash, findLeafByMorton
-
 // ============================================================================
-// Siphon Pump Kernel - Modular Physics Implementation
+// Kernel Includes (order matters — each may depend on constants above)
 // ============================================================================
-// Uses modular functions from .cuh headers via physics.cu
-// ============================================================================
-#include "physics.cu"
-
-// Spawn and entropy injection kernels — extracted to header
-#include "spawn.cuh"
-
-
-// Device-side color helpers (vec3, mix, blackbody) — extracted to render_color.cuh
-#include "render_color.cuh"
-
-// Vulkan fill/compact kernel implementations now in render_fill.cuh
-
-// Octree kernels (Morton, tree build, leaf phase) — extracted to header
-#include "octree_kernels.cuh"
-
-// Cell grid kernels (scatter/field/gather) — extracted to header
-#include "cell_grid_kernels.cuh"
-
-// REMOVED: clearCellGrid, scatterParticlesToCells, computeCellFields,
-// gatherCellForcesToParticles — now in cell_grid_kernels.cuh
-
-// [cell grid kernel bodies removed — now in cell_grid_kernels.cuh]
-
-// Kuramoto reduction kernels — extracted to header
-#include "kuramoto.cuh"
-
-
-// ============================================================================
-// ACTIVE PARTICLE COMPACTION KERNELS
-// ============================================================================
-// Active compaction + sparse tile flags — extracted to header
-#include "active_compact.cuh"
-
-
-// ============================================================================
-// PRESSURE + VORTICITY FORCE KERNEL
-// ============================================================================
-// Applies three forces:
-//   1. Pressure: F_p = -k_p ∇ρ  (pushes toward lower density)
-//   2. Vorticity: F_ω = k_ω (ω × v)  (induces rotation/spiral structure)
-//   3. Phase coherence: modulates pressure by neighbor phase alignment
-//
-// Together these create a self-organizing medium with radial balance,
-// rotational structure (spiral arms), and temporal coherence (standing waves).
-// applyPressureVorticityKernel now in octree_kernels.cuh
-
-
-// Diagnostics (StressCounters, sampling) — extracted to header
-#include "diagnostics.cuh"
-
-
-// Global state (camera, physics toggles, test flags) — extracted to header
-#include "sim_globals.h"
-#include "cli_args.cuh"
-
-// [globals removed — now in sim_globals.h]
+#include "physics.cu"                 // siphonDiskKernel (main per-particle physics)
+#include "spawn.cuh"                  // spawnParticlesKernel, injectEntropyCluster
+#include "octree_kernels.cuh"         // Morton, tree build, leaf phase, pressure+vorticity
+#include "cell_grid_kernels.cuh"      // scatter/field/gather 3-pass grid physics
+#include "kuramoto.cuh"               // R_cell, global R reduction, phase histogram
+#include "active_compact.cuh"         // Active compaction + sparse tile flags
 
 // ============================================================================
 // Main
