@@ -172,24 +172,22 @@ __device__ __forceinline__ void apply_anisotropic_damping(
 __device__ __forceinline__ void compute_coherence_direction(
     float px, float py, float pz,
     float heartbeat,
-    float inv_r_cyl,  // Pre-computed: 1/(r_cyl + epsilon), avoids redundant sqrtf
-    float& nx, float& ny, float& nz)
+    float inv_r_cyl,
+    float& nx, float& ny, float& nz,
+    // Local orbital frame from compute_local_frame()
+    float frx = 0, float fry = 0, float frz = 1,   // radial
+    float ftx = -1, float fty = 0, float ftz = 0,   // tangential
+    float flx = 0, float fly = 1, float flz = 0)    // orbital normal
 {
     if (heartbeat > 0.5f) {
-        // Radial direction (in disk plane)
-        nx = px * inv_r_cyl;
-        ny = 0.0f;
-        nz = pz * inv_r_cyl;
+        // Radial direction — in the particle's actual orbital plane
+        nx = frx; ny = fry; nz = frz;
     } else if (heartbeat > -0.5f) {
-        // Tangential direction
-        nx = -pz * inv_r_cyl;
-        ny = 0.0f;
-        nz = px * inv_r_cyl;
+        // Tangential direction — prograde in the orbital plane
+        nx = ftx; ny = fty; nz = ftz;
     } else {
-        // Orthogonal phase: align toward vertical (DMRG freeze)
-        nx = 0.0f;
-        ny = 1.0f;
-        nz = 0.0f;
+        // Orbital normal — perpendicular to the orbit (DMRG freeze)
+        nx = flx; ny = fly; nz = flz;
     }
 }
 

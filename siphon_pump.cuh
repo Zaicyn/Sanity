@@ -27,19 +27,23 @@
 // ============================================================================
 // Math.md: K factor determines synchronization threshold
 //
-// Coupling depends on:
-//   1. Proximity to ISCO (high coupling near event horizon)
-//   2. Disk alignment (high coupling for orbiting particles)
-//   3. Height (low coupling far from disk plane)
+// Coupling depends on proximity to center only — no axis-aligned penalties.
+// The old L_disk_align and height_penalty terms hardcoded Y as "up" and
+// suppressed coupling for particles not in the XZ plane. Removed so that
+// particles in any orbital plane can participate in the coherent pump.
 
 __device__ __forceinline__ float compute_coupling_strength(
     float r3d, float L_disk_align, float py)
 {
+    // Proximity to ISCO: high coupling near center, decays with 3D radius
     float proximity_factor = fmaxf(0.0f, 1.0f - r3d / (ISCO_R * 3.0f));
-    float align_factor = fmaxf(0.0f, L_disk_align);
-    float height_penalty = expf(-fabsf(py) / (DISK_THICKNESS * 10.0f));
 
-    return proximity_factor * 0.5f + align_factor * 0.3f + height_penalty * 0.2f;
+    // Velocity coherence: use |L_disk_align| (absolute alignment strength,
+    // not direction) as a measure of how organized the orbit is.
+    // Particles with high |L| relative to |L_max| are well-organized.
+    float coherence_factor = fabsf(L_disk_align);  // 0 = radial, 1 = circular
+
+    return proximity_factor * 0.6f + coherence_factor * 0.4f;
 }
 
 // ============================================================================

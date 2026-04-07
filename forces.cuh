@@ -127,11 +127,73 @@ __device__ __forceinline__ float compute_disk_alignment(float Lz, float inv_L_ma
 }
 
 // ============================================================================
-// Disk Plane Damping
+// Local Orbital Frame — 3D generalization of the XZ-plane tangent/radial
 // ============================================================================
-// Particles crossing the disk plane lose vertical momentum (collisional).
-// This naturally flattens trajectories into the disk over time.
+// Computes an orthonormal frame from each particle's actual angular momentum:
+//   r_hat = r / |r|             — 3D radial (away from center)
+//   L_hat = L / |L|             — orbital plane normal
+//   t_hat = L_hat × r_hat       — in-plane tangential (prograde direction)
+//
+// This replaces hardcoded (-pz, 0, px)/r_cyl tangent vectors. Particles can
+// orbit in ANY plane — the frame adapts to each particle's actual trajectory.
+// Cost: ~12 FMA + 1 rsqrtf on top of the already-computed L and r3d.
 
+__device__ __forceinline__ void compute_local_frame(
+    float px, float py, float pz,
+    float Lx, float Ly, float Lz, float inv_L_mag,
+    float inv_r3d,
+    float& rx, float& ry, float& rz,    // radial unit vector (outward)
+    float& tx, float& ty, float& tz,    // tangential unit vector (prograde)
+    float& lx, float& ly, float& lz)    // orbital normal unit vector
+{
+    // Radial: r_hat = r / |r|
+    rx = px * inv_r3d;
+    ry = py * inv_r3d;
+    rz = pz * inv_r3d;
+
+    // Orbital normal: L_hat = L / |L|
+    lx = Lx * inv_L_mag;
+    ly = Ly * inv_L_mag;
+    lz = Lz * inv_L_mag;
+
+    // Tangential: t_hat = L_hat × r_hat (right-hand rule: prograde direction)
+    tx = ly * rz - lz * ry;
+    ty = lz * rx - lx * rz;
+    tz = lx * ry - ly * rx;
+
+    // Normalize t_hat (should already be ~unit length since L_hat ⊥ r_hat,
+    // but numerical drift in L can make them non-orthogonal)
+    float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f);
+    tx *= inv_t;
+    ty *= inv_t;
+    tz *= inv_t;
+}
+
+// ============================================================================
+// Orbital-Plane Damping (was: Disk Plane Damping)
+// ============================================================================
+// Damps velocity perpendicular to the particle's orbital plane (defined by L).
+// This is the 3D generalization of the old vy-only damping that forced
+// particles toward Y=0. Now particles settle into their OWN orbital plane,
+// not a hardcoded XZ plane.
+
+__device__ __forceinline__ void apply_orbital_damping(
+    float vx_in, float vy_in, float vz_in,
+    float lx, float ly, float lz,  // orbital normal (L_hat from local frame)
+    float r3d,
+    float& vx, float& vy, float& vz)
+{
+    if (r3d > SCHW_R * 2.0f && r3d < 80.0f) {
+        // Component of velocity perpendicular to orbital plane
+        float v_normal = vx * lx + vy * ly + vz * lz;
+        float damping = 0.02f;
+        vx -= damping * v_normal * lx;
+        vy -= damping * v_normal * ly;
+        vz -= damping * v_normal * lz;
+    }
+}
+
+// Legacy wrapper for callers that haven't been updated yet
 __device__ __forceinline__ void apply_disk_damping(
     float py, float r_cyl,
     float& vy)
@@ -139,7 +201,6 @@ __device__ __forceinline__ void apply_disk_damping(
     if (fabsf(py) < DISK_THICKNESS * 3.0f &&
         r_cyl > SCHW_R * 2.0f &&
         r_cyl < 80.0f) {
-        // Inside disk region: damp vertical velocity
         float disk_damping = 0.02f * cuda_lut_repulsion_var(fabsf(py), DISK_THICKNESS);
         vy *= (1.0f - disk_damping);
     }
@@ -193,23 +254,27 @@ __device__ __forceinline__ void apply_angular_momentum_sink(
 __device__ __forceinline__ void apply_ion_kick(
     float px, float pz, float r_xz,
     float global_heartbeat,
-    float& vx, float& vz)
+    float& vx, float& vz,
+    // 3D mode: pass full position and vy for 3D energy injection
+    float py = 0.0f, float* vy_ptr = nullptr, float r3d_override = 0.0f)
 {
     // Period-4 modulation: on on on off (1110 pattern)
     float hb_mod = (global_heartbeat > -0.5f) ? 1.0f : 0.0f;
 
-    if (r_xz > ION_KICK_INNER_R && r_xz < ION_KICK_OUTER_R) {
-        // Ion kick region
-        float ion_coupling = (r_xz - ION_KICK_INNER_R) / (ION_KICK_OUTER_R - ION_KICK_INNER_R);
+    // Use 3D radius if provided, otherwise fall back to XZ
+    float r = (r3d_override > 0.0f) ? r3d_override : r_xz;
 
-        // Radial inward normal
-        float nx = -px / r_xz;
-        float nz = -pz / r_xz;
-
-        // Langevin noise: σ × heartbeat × coupling × direction
+    if (r > ION_KICK_INNER_R && r < ION_KICK_OUTER_R) {
+        float ion_coupling = (r - ION_KICK_INNER_R) / (ION_KICK_OUTER_R - ION_KICK_INNER_R);
         float sigma_eff = LANGEVIN_SIGMA * hb_mod;
-        vx += sigma_eff * ion_coupling * nx;
-        vz += sigma_eff * ion_coupling * nz;
+
+        // 3D radial inward direction
+        float inv_r = 1.0f / (r + 1e-8f);
+        vx += sigma_eff * ion_coupling * (-px * inv_r);
+        vz += sigma_eff * ion_coupling * (-pz * inv_r);
+        if (vy_ptr) {
+            *vy_ptr += sigma_eff * ion_coupling * (-py * inv_r);
+        }
     }
 }
 
@@ -253,21 +318,22 @@ __device__ __forceinline__ bool apply_boundary_recycle(
 
 __device__ __forceinline__ void apply_core_anchor(
     float px, float pz, float r_xz,
-    float& vx, float& vz)
+    float& vx, float& vz,
+    // 3D mode: pass full position and vy
+    float py = 0.0f, float* vy_ptr = nullptr, float r3d_override = 0.0f)
 {
-    // Only apply outside the shell region. Inside the shells, Keplerian orbits
-    // provide the structure — the core anchor's persistent inward pull has no
-    // counterpart and causes secular inward drift that collapses shells into
-    // pillars over thousands of frames.
-    if (r_xz > CORE_ANCHOR_INNER_R) {
-        float r_scaled = r_xz / CORE_PULL_SCALE;
+    float r = (r3d_override > 0.0f) ? r3d_override : r_xz;
+    if (r > CORE_ANCHOR_INNER_R) {
+        float r_scaled = r / CORE_PULL_SCALE;
         float core_pull = CORE_PULL_STRENGTH / (1.0f + r_scaled * r_scaled);
-        // Smooth onset: fade in over 20 units outside the boundary
-        float onset = fminf((r_xz - CORE_ANCHOR_INNER_R) / 20.0f, 1.0f);
-        float nx = -px / r_xz;
-        float nz = -pz / r_xz;
-        vx += core_pull * onset * nx;
-        vz += core_pull * onset * nz;
+        float onset = fminf((r - CORE_ANCHOR_INNER_R) / 20.0f, 1.0f);
+        // 3D radial inward
+        float inv_r = 1.0f / (r + 1e-8f);
+        vx += core_pull * onset * (-px * inv_r);
+        vz += core_pull * onset * (-pz * inv_r);
+        if (vy_ptr) {
+            *vy_ptr += core_pull * onset * (-py * inv_r);
+        }
     }
 }
 

@@ -148,6 +148,13 @@ __global__ void siphonDiskKernel(
     compute_angular_momentum(px, py, pz, vx, vy, vz, Lx, Ly, Lz, inv_L_mag);
     float L_disk_align = compute_disk_alignment(Lz, inv_L_mag);
 
+    // Local orbital frame: 3D radial, tangential, and orbital normal
+    float frx, fry, frz;  // radial (outward from center)
+    float ftx, fty, ftz;  // tangential (prograde in orbital plane)
+    float flx, fly, flz;  // orbital normal (L_hat)
+    compute_local_frame(px, py, pz, Lx, Ly, Lz, inv_L_mag, inv_r3d,
+                        frx, fry, frz, ftx, fty, ftz, flx, fly, flz);
+
     // ========================================================================
     // STEP 3: APPLY VIVIANI FIELD FORCE
     // ========================================================================
@@ -157,10 +164,12 @@ __global__ void siphonDiskKernel(
     apply_viviani_field_force(px, py, pz, vx, vy, vz, r3d, inv_r3d, ax, ay, az);
 
     // ========================================================================
-    // STEP 4: DISK PLANE DAMPING
+    // STEP 4: ORBITAL-PLANE DAMPING (was: disk plane damping)
     // ========================================================================
+    // Damps velocity perpendicular to the particle's own orbital plane,
+    // not the hardcoded Y axis. Particles settle into their own orbits.
 
-    apply_disk_damping(py, r_cyl, vy);
+    apply_orbital_damping(vx, vy, vz, flx, fly, flz, r3d, vx, vy, vz);
 
     // ========================================================================
     // STEP 5: UPDATE VELOCITY AND POSITION (First Integration)
@@ -238,7 +247,8 @@ __global__ void siphonDiskKernel(
         // Math.md Step 8: Coherence filter -λm_⊥
         // Removes orthogonal components (entropy)
         float nx, ny, nz;
-        compute_coherence_direction(px, py, pz, heartbeat, inv_r_cyl, nx, ny, nz);
+        compute_coherence_direction(px, py, pz, heartbeat, inv_r_cyl, nx, ny, nz,
+                                    frx, fry, frz, ftx, fty, ftz, flx, fly, flz);
 
         float lambda = COHERENCE_LAMBDA * rate_mod;
         apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
@@ -248,10 +258,10 @@ __global__ void siphonDiskKernel(
         state = PUMP_EXPAND;
     }
     else if (state == PUMP_UPSTROKE_HOP) {
-        // Stronger filter for φ-hop (reuse inv_r_cyl, no sqrt needed)
-        float nx = px * inv_r_cyl;
-        float ny = 0.0f;
-        float nz = pz * inv_r_cyl;
+        // Stronger filter for φ-hop — use 3D radial from local frame
+        float nx = frx;
+        float ny = fry;
+        float nz = frz;
 
         float lambda = COHERENCE_LAMBDA * d_PHI * rate_mod;
         apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
@@ -314,11 +324,11 @@ __global__ void siphonDiskKernel(
         inv_r_cyl = 1.0f / ION_KICK_RESPAWN_R;
     }
 
-    // Ion kick (Langevin noise - energy source)
-    apply_ion_kick(px, pz, r_cyl, global_hb, vx, vz);
+    // Ion kick (Langevin noise - energy source) — 3D radial injection
+    apply_ion_kick(px, pz, r_cyl, global_hb, vx, vz, py, &vy, r3d);
 
-    // Core anchor (K factor gradient)
-    apply_core_anchor(px, pz, r_cyl, vx, vz);
+    // Core anchor (K factor gradient) — 3D radial pull
+    apply_core_anchor(px, pz, r_cyl, vx, vz, py, &vy, r3d);
 
     // ========================================================================
     // STEP 13b: KEPLERIAN ORBIT MAINTENANCE
@@ -334,25 +344,23 @@ __global__ void siphonDiskKernel(
     // Perturbations from the pump, ejection, and coupling still act freely —
     // this just prevents the slow secular drift that has no physical source.
     {
-        float rx = px * inv_r_cyl;    // radial unit vector in XZ
-        float rz = pz * inv_r_cyl;
-        float tx = -rz;               // tangent unit vector in XZ
-        float tz =  rx;
-
-        float v_rad = vx * rx + vz * rz;  // radial speed (positive = outward)
-        float v_tan = vx * tx + vz * tz;  // tangential speed
-        float v_kep = sqrtf(d_BH_MASS * inv_r_cyl);  // Keplerian target
+        // Use local orbital frame (3D, not XZ projection)
+        float v_rad = vx * frx + vy * fry + vz * frz;  // 3D radial speed
+        float v_tan = vx * ftx + vy * fty + vz * ftz;  // 3D tangential speed
+        float v_kep = sqrtf(d_BH_MASS * inv_r3d);       // Keplerian at 3D radius
 
         // Tangential restore: exponential approach to v_kep
         float t_restore = KEPLER_RESTORE_RATE * dt;
         float dv_tan = (v_kep - v_tan) * t_restore;
-        vx += dv_tan * tx;
-        vz += dv_tan * tz;
+        vx += dv_tan * ftx;
+        vy += dv_tan * fty;
+        vz += dv_tan * ftz;
 
         // Radial damping: bleed radial velocity toward zero (circular orbit)
-        float r_damp = KEPLER_RESTORE_RATE * 0.5f * dt;  // half-rate for radial
-        vx -= v_rad * r_damp * rx;
-        vz -= v_rad * r_damp * rz;
+        float r_damp = KEPLER_RESTORE_RATE * 0.5f * dt;
+        vx -= v_rad * r_damp * frx;
+        vy -= v_rad * r_damp * fry;
+        vz -= v_rad * r_damp * frz;
     }
 
     // ========================================================================
@@ -362,11 +370,8 @@ __global__ void siphonDiskKernel(
     // NOTE: reuse inv_r_cyl (no redundant sqrt)
 
     {
-        float nx = px * inv_r_cyl;
-        float ny = 0.0f;
-        float nz = pz * inv_r_cyl;
-
-        apply_anisotropic_damping(vx, vy, vz, nx, ny, nz, COHERENCE_GAMMA);
+        // Use 3D radial from local frame (not XZ projection)
+        apply_anisotropic_damping(vx, vy, vz, frx, fry, frz, COHERENCE_GAMMA);
     }
 
     // ========================================================================
