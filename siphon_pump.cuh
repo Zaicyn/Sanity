@@ -210,10 +210,38 @@ __device__ __forceinline__ bool check_ejection(
 }
 
 // ============================================================================
-// Initial Ejection Kick
+// Initial Ejection Kick — Hopf Fiber Geometry
 // ============================================================================
-// Particles near the rotation axis get collimated into coherent jets.
-// Particles further out get more lateral kick.
+// Jets follow the Hopf fiber direction at the particle's position rather than
+// firing straight up/down along Y. This produces curved, spiraling jets that
+// express the hopfion field topology instead of vertical column artifacts.
+//
+// The fiber direction is a blend of two orthogonal components:
+//
+//   Toroidal (t): tangent to the orbital circle in the XZ plane
+//     t = (-pz/r_cyl, 0, px/r_cyl)
+//     → pure orbital rotation, no vertical component
+//
+//   Poloidal (p): up the meridional circle in the r-Y plane
+//     p = (-px/r3d, py/r3d, -pz/r3d)  [inward-and-up along field line]
+//     → escape direction along the field
+//
+//   fiber = cos(pitch)*t + sin(pitch)*p * jet_sign
+//
+// Pitch angle = PI/2 * (1 - collimation):
+//   collimation=1 (near center):  pitch→0    → pure toroidal → tight spiral
+//   collimation=0.5 (mid):        pitch=PI/4  → 45° helix
+//   collimation=0 (outer edge):   pitch=PI/2  → pure poloidal → field escape
+//
+// This inverts the old logic: near the center jets spiral tightly (bound by
+// the hopfion field), far out they open and escape along field lines.
+//
+// JET_SPEED replaces the old 15x vertical hack. Tune this constant to match
+// the desired jet velocity scale.
+
+#ifndef JET_SPEED
+#define JET_SPEED 4.0f
+#endif
 
 __device__ __forceinline__ void apply_ejection_kick(
     float px, float py, float pz,
@@ -223,32 +251,62 @@ __device__ __forceinline__ void apply_ejection_kick(
     float Ly, float orb_phi,
     float dt)
 {
-    // Determine jet direction
-    float jet_sign = (py >= 0.0f) ? 1.0f : -1.0f;
-    if (fabsf(py) < 0.5f) {
-        // Near disk plane - use angular momentum
-        jet_sign = (Ly >= 0.0f) ? 1.0f : -1.0f;
-    }
-
-    // Collimation factor: tighter near center
-    float collimation = fmaxf(0.1f, 1.0f - (r_cyl - SCHW_R) / (ISCO_R * 2.0f));
-
-    // Muzzle velocity from pump history
-    float muzzle_velocity = residual * (1.0f + history * 0.5f);
-
-    // Vertical kick
-    float vertical_kick = muzzle_velocity * collimation * jet_sign;
-    vy += vertical_kick * 15.0f;
-
-    // Lateral drift for non-collimated particles
-    float lateral_drift = muzzle_velocity * (1.0f - collimation) * 0.3f;
-
-    // Forward declarations for LUT - defined elsewhere
+    // Forward declarations for LUT
     extern __device__ float cuda_lut_sin(float x);
     extern __device__ float cuda_lut_cos(float x);
 
-    vx += lateral_drift * cuda_lut_cos(orb_phi);
-    vz += lateral_drift * cuda_lut_sin(orb_phi);
+    // Jet sign: which hemisphere the particle escapes toward
+    float jet_sign = (py >= 0.0f) ? 1.0f : -1.0f;
+    if (fabsf(py) < 0.5f) {
+        // Near disk plane — use angular momentum direction
+        jet_sign = (Ly >= 0.0f) ? 1.0f : -1.0f;
+    }
+
+    // 3D radius (safe floor to avoid div by zero)
+    float r3d = sqrtf(px*px + py*py + pz*pz);
+    float r3d_safe  = fmaxf(r3d,  0.01f);
+    float r_cyl_safe = fmaxf(r_cyl, 0.01f);
+
+    // Toroidal unit vector: tangent to orbit in XZ plane
+    // t = (-pz, 0, px) / r_cyl
+    float inv_rcyl = 1.0f / r_cyl_safe;
+    float tx = -pz * inv_rcyl;
+    float ty =  0.0f;
+    float tz =  px * inv_rcyl;
+
+    // Poloidal unit vector: inward-and-up along the meridional field line
+    // p = (-px, py, -pz) / r3d  (points toward axis and up)
+    float inv_r3d = 1.0f / r3d_safe;
+    float polx = -px * inv_r3d;
+    float poly =  py * inv_r3d;
+    float polz = -pz * inv_r3d;
+
+    // Collimation: 1.0 near center, 0.0 at outer edge
+    float collimation = fmaxf(0.0f, fminf(1.0f,
+        1.0f - (r_cyl - SCHW_R) / (ISCO_R * 2.0f)));
+
+    // Pitch angle: near center→tight spiral, far out→field escape
+    float pitch = (PI * 0.5f) * (1.0f - collimation);
+    float cos_pitch = cuda_lut_cos(pitch);
+    float sin_pitch = cuda_lut_sin(pitch);
+
+    // Hopf fiber direction = blend of toroidal and poloidal
+    float kx = cos_pitch * tx + sin_pitch * polx * jet_sign;
+    float ky = cos_pitch * ty + sin_pitch * poly * jet_sign;
+    float kz = cos_pitch * tz + sin_pitch * polz * jet_sign;
+
+    // Normalize (rsqrtf pattern)
+    float inv_k = rsqrtf(kx*kx + ky*ky + kz*kz + 1e-8f);
+    kx *= inv_k;
+    ky *= inv_k;
+    kz *= inv_k;
+
+    // Muzzle velocity: residual × history boost × jet speed constant
+    float muzzle = residual * (1.0f + history * 0.5f) * JET_SPEED;
+
+    vx += muzzle * kx;
+    vy += muzzle * ky;
+    vz += muzzle * kz;
 }
 
 // ============================================================================
