@@ -321,6 +321,41 @@ __global__ void siphonDiskKernel(
     apply_core_anchor(px, pz, r_cyl, vx, vz);
 
     // ========================================================================
+    // STEP 13b: KEPLERIAN ORBIT MAINTENANCE
+    // ========================================================================
+    // The angular momentum sink (Step 5), core anchor, and anisotropic damping
+    // create a net inward force budget that collapses shells into pillars over
+    // thousands of frames. Two corrections restore circular orbit equilibrium:
+    //
+    //   1. Tangential restore: nudge v_tangential toward v_kep = sqrt(M/r)
+    //   2. Radial damping: bleed radial velocity toward zero (circular orbit)
+    //
+    // Together these define the equilibrium as Keplerian circular orbits.
+    // Perturbations from the pump, ejection, and coupling still act freely —
+    // this just prevents the slow secular drift that has no physical source.
+    {
+        float rx = px * inv_r_cyl;    // radial unit vector in XZ
+        float rz = pz * inv_r_cyl;
+        float tx = -rz;               // tangent unit vector in XZ
+        float tz =  rx;
+
+        float v_rad = vx * rx + vz * rz;  // radial speed (positive = outward)
+        float v_tan = vx * tx + vz * tz;  // tangential speed
+        float v_kep = sqrtf(d_BH_MASS * inv_r_cyl);  // Keplerian target
+
+        // Tangential restore: exponential approach to v_kep
+        float t_restore = KEPLER_RESTORE_RATE * dt;
+        float dv_tan = (v_kep - v_tan) * t_restore;
+        vx += dv_tan * tx;
+        vz += dv_tan * tz;
+
+        // Radial damping: bleed radial velocity toward zero (circular orbit)
+        float r_damp = KEPLER_RESTORE_RATE * 0.5f * dt;  // half-rate for radial
+        vx -= v_rad * r_damp * rx;
+        vz -= v_rad * r_damp * rz;
+    }
+
+    // ========================================================================
     // STEP 14: ANISOTROPIC DISSIPATION (Energy Sink)
     // ========================================================================
     // Math.md Step 8: -γ(m·n)n removes parallel component

@@ -95,12 +95,17 @@ __device__ float cuda_fast_atan2(float y, float x);
 #define ION_KICK_RESPAWN_R    150.0f  // Respawn recycled particles here
 #endif
 
-// Core anchor: 1/(1+r²) attractor preventing shell detachment
+// Core anchor: 1/(1+r²) attractor — only active outside shells to return escapees.
+// Inside the shell region, Keplerian orbits provide structure; the anchor's
+// persistent inward pull has no counterpart and collapses shells into pillars.
 #ifndef CORE_PULL_STRENGTH
 #define CORE_PULL_STRENGTH    0.002f
 #endif
 #ifndef CORE_PULL_SCALE
 #define CORE_PULL_SCALE       30.0f
+#endif
+#ifndef CORE_ANCHOR_INNER_R
+#define CORE_ANCHOR_INNER_R   DISK_OUTER_R  // Only pull back particles that escape the disk
 #endif
 
 // ============================================================================
@@ -162,6 +167,9 @@ __device__ float cuda_fast_atan2(float y, float x);
 #ifndef COHERENCE_GAMMA
 #define COHERENCE_GAMMA   0.02f   // Parallel decay (energy removal)
 #endif
+#ifndef KEPLER_RESTORE_RATE
+#define KEPLER_RESTORE_RATE 6.0f  // Tangential velocity restore toward v_kep (per sim-time unit)
+#endif                            // At dt=1/60: ~10% nudge per frame. Balances L_sink at outer shells.
 #ifndef LANGEVIN_SIGMA
 #define LANGEVIN_SIGMA    0.02f   // Ion kick strength
 #endif

@@ -255,14 +255,19 @@ __device__ __forceinline__ void apply_core_anchor(
     float px, float pz, float r_xz,
     float& vx, float& vz)
 {
-    if (r_xz > 1.0f) {
-        // 1/(1 + (r/scale)²) — strongest at origin, weak but persistent at large r
+    // Only apply outside the shell region. Inside the shells, Keplerian orbits
+    // provide the structure — the core anchor's persistent inward pull has no
+    // counterpart and causes secular inward drift that collapses shells into
+    // pillars over thousands of frames.
+    if (r_xz > CORE_ANCHOR_INNER_R) {
         float r_scaled = r_xz / CORE_PULL_SCALE;
         float core_pull = CORE_PULL_STRENGTH / (1.0f + r_scaled * r_scaled);
+        // Smooth onset: fade in over 20 units outside the boundary
+        float onset = fminf((r_xz - CORE_ANCHOR_INNER_R) / 20.0f, 1.0f);
         float nx = -px / r_xz;
         float nz = -pz / r_xz;
-        vx += core_pull * nx;
-        vz += core_pull * nz;
+        vx += core_pull * onset * nx;
+        vz += core_pull * onset * nz;
     }
 }
 
