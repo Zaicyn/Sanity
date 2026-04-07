@@ -253,53 +253,43 @@ __device__ __forceinline__ void apply_ejection_kick(
     float r_cyl,
     float residual, float history,
     float Ly, float orb_phi,
-    float dt)
+    float dt,
+    // Local orbital frame (3D mode)
+    float ftx = 0, float fty = 0, float ftz = 0,   // tangential (toroidal)
+    float flx = 0, float fly = 1, float flz = 0)    // orbital normal (poloidal escape)
 {
-    // Forward declarations for LUT
     extern __device__ float cuda_lut_sin(float x);
     extern __device__ float cuda_lut_cos(float x);
 
-    // Jet sign: which hemisphere the particle escapes toward
-    float jet_sign = (py >= 0.0f) ? 1.0f : -1.0f;
-    if (fabsf(py) < 0.5f) {
-        // Near disk plane — use angular momentum direction
+    // Jet sign: which side of the orbital plane to escape toward.
+    // Use the sign of the position's projection onto L_hat.
+    float pos_along_L = px * flx + py * fly + pz * flz;
+    float jet_sign = (pos_along_L >= 0.0f) ? 1.0f : -1.0f;
+    if (fabsf(pos_along_L) < 0.5f) {
+        // Near orbital plane — use angular momentum direction
         jet_sign = (Ly >= 0.0f) ? 1.0f : -1.0f;
     }
 
-    // 3D radius (safe floor to avoid div by zero)
     float r3d = sqrtf(px*px + py*py + pz*pz);
-    float r3d_safe  = fmaxf(r3d,  0.01f);
-    float r_cyl_safe = fmaxf(r_cyl, 0.01f);
-
-    // Toroidal unit vector: tangent to orbit in XZ plane
-    // t = (-pz, 0, px) / r_cyl
-    float inv_rcyl = 1.0f / r_cyl_safe;
-    float tx = -pz * inv_rcyl;
-    float ty =  0.0f;
-    float tz =  px * inv_rcyl;
-
-    // Poloidal unit vector: inward-and-up along the meridional field line
-    // p = (-px, py, -pz) / r3d  (points toward axis and up)
-    float inv_r3d = 1.0f / r3d_safe;
-    float polx = -px * inv_r3d;
-    float poly =  py * inv_r3d;
-    float polz = -pz * inv_r3d;
+    float r3d_safe = fmaxf(r3d, 0.01f);
 
     // Collimation: 1.0 near center, 0.0 at outer edge
     float collimation = fmaxf(0.0f, fminf(1.0f,
-        1.0f - (r_cyl - SCHW_R) / (ISCO_R * 2.0f)));
+        1.0f - (r3d_safe - SCHW_R) / (ISCO_R * 2.0f)));
 
     // Pitch angle: near center→tight spiral, far out→field escape
     float pitch = (PI * 0.5f) * (1.0f - collimation);
     float cos_pitch = cuda_lut_cos(pitch);
     float sin_pitch = cuda_lut_sin(pitch);
 
-    // Hopf fiber direction = blend of toroidal and poloidal
-    float kx = cos_pitch * tx + sin_pitch * polx * jet_sign;
-    float ky = cos_pitch * ty + sin_pitch * poly * jet_sign;
-    float kz = cos_pitch * tz + sin_pitch * polz * jet_sign;
+    // Hopf fiber direction = blend of toroidal (t_hat) and poloidal (L_hat)
+    // Toroidal = in-plane tangential (spiral component)
+    // Poloidal = orbital normal (escape component)
+    float kx = cos_pitch * ftx + sin_pitch * flx * jet_sign;
+    float ky = cos_pitch * fty + sin_pitch * fly * jet_sign;
+    float kz = cos_pitch * ftz + sin_pitch * flz * jet_sign;
 
-    // Normalize (rsqrtf pattern)
+    // Normalize
     float inv_k = rsqrtf(kx*kx + ky*ky + kz*kz + 1e-8f);
     kx *= inv_k;
     ky *= inv_k;

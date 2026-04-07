@@ -102,6 +102,7 @@ __global__ void computeInActiveRegionMask(
     }
 
     float px = disk->pos_x[i];
+    float py = disk->pos_y[i];
     float pz = disk->pos_z[i];
 
     // ================================================================
@@ -149,18 +150,34 @@ __global__ void computeInActiveRegionMask(
     }
 
     // Velocity fix-up on passive→active promotion.
-    // The passive kernel doesn't update vel_x/vel_z (it advances position
-    // azimuthally at fixed radius using Keplerian omega_kep, but leaves
-    // the tangential velocity stale). After K frames of passive advection
-    // the velocity direction is wrong by K*omega_kep*dt radians. Snap to
-    // Keplerian tangential on promotion so siphon gets a consistent state.
+    // Snap to Keplerian tangential using 3D local orbital frame so siphon
+    // gets a consistent state regardless of orbital plane orientation.
     if (new_val == 1 && old_val == 0) {
-        float inv_r = rsqrtf(r_cyl_sq + 1e-8f);
-        float v_kep = sqrtf(BH_MASS * inv_r);  // Keplerian speed at this radius
-        // Prograde tangent direction in the XZ plane: (-z/r, 0, x/r)
-        float tx = -pz * inv_r;
-        float tz =  px * inv_r;
+        float vx_cur = disk->vel_x[i];
+        float vy_cur = disk->vel_y[i];
+        float vz_cur = disk->vel_z[i];
+
+        // Compute local frame from current L
+        float Lx = py * vz_cur - pz * vy_cur;
+        float Ly = pz * vx_cur - px * vz_cur;
+        float Lz = px * vy_cur - py * vx_cur;
+        float inv_L = rsqrtf(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8f);
+        float lx = Lx * inv_L, ly = Ly * inv_L, lz = Lz * inv_L;
+
+        float r3d_sq = px*px + py*py + pz*pz;
+        float inv_r3d = rsqrtf(r3d_sq + 1e-8f);
+        float rx = px * inv_r3d, ry = py * inv_r3d, rz = pz * inv_r3d;
+
+        // t_hat = L_hat × r_hat
+        float tx = ly * rz - lz * ry;
+        float ty = lz * rx - lx * rz;
+        float tz = lx * ry - ly * rx;
+        float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f);
+        tx *= inv_t; ty *= inv_t; tz *= inv_t;
+
+        float v_kep = sqrtf(BH_MASS * inv_r3d);
         disk->vel_x[i] = tx * v_kep;
+        disk->vel_y[i] = ty * v_kep;
         disk->vel_z[i] = tz * v_kep;
     }
 

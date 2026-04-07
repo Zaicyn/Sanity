@@ -112,64 +112,94 @@ __global__ void advectPassiveParticles(
     if ((flags & PFLAG_EJECTED) != 0) return;         // in jet
     if (in_active_region[i] != 0) return;             // siphon owns active regions
 
-    // Load position.
+    // Load position and velocity.
     float px = disk->pos_x[i];
     float py = disk->pos_y[i];
     float pz = disk->pos_z[i];
+    float vx = disk->vel_x[i];
+    float vy = disk->vel_y[i];
+    float vz = disk->vel_z[i];
 
-    // Cylindrical radius.
-    float r_cyl_sq = px * px + pz * pz;
-    float r_cyl = sqrtf(r_cyl_sq);
+    // 3D radius.
+    float r3d_sq = px * px + py * py + pz * pz;
+    float r3d = sqrtf(r3d_sq);
 
-    // Safety clamp — outside the cascade range, let siphon own the
-    // particle (boundary recycle path in forces.cuh handles escapees).
-    if (r_cyl < PASSIVE_R_MIN || r_cyl > PASSIVE_R_MAX) return;
+    // Safety clamp — outside the cascade range, let siphon own the particle.
+    if (r3d < PASSIVE_R_MIN || r3d > PASSIVE_R_MAX) return;
+
+    // Compute local orbital frame from angular momentum.
+    float Lx = py * vz - pz * vy;
+    float Ly = pz * vx - px * vz;
+    float Lz = px * vy - py * vx;
+    float inv_L = rsqrtf(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8f);
+    float lx = Lx * inv_L;  // orbital normal
+    float ly = Ly * inv_L;
+    float lz = Lz * inv_L;
+
+    float inv_r3d = 1.0f / (r3d + 1e-8f);
+    float rx = px * inv_r3d;  // radial
+    float ry = py * inv_r3d;
+    float rz = pz * inv_r3d;
+
+    // Tangential: t = L_hat × r_hat
+    float tx = ly * rz - lz * ry;
+    float ty = lz * rx - lx * rz;
+    float tz = lx * ry - ly * rx;
+    float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f);
+    tx *= inv_t; ty *= inv_t; tz *= inv_t;
 
     // Step 6: gentle radial drift toward nearest resonance shell.
-    // d_shell_radii[8] from sun_trace.cuh — same table the mask kernel
-    // uses for deviation-based residual injection (Step 5). Particles
-    // exponentially approach their nearest shell at PASSIVE_DRIFT_RATE.
+    // Uses 3D radius instead of cylindrical.
     {
         float r_target = d_shell_radii[0];
-        float best_dev = fabsf(r_cyl - r_target);
+        float best_dev = fabsf(r3d - r_target);
         for (int s = 1; s < 8; s++) {
-            float dev = fabsf(r_cyl - d_shell_radii[s]);
+            float dev = fabsf(r3d - d_shell_radii[s]);
             if (dev < best_dev) { best_dev = dev; r_target = d_shell_radii[s]; }
         }
-        r_cyl += (r_target - r_cyl) * PASSIVE_DRIFT_RATE * dt;
+        float dr = (r_target - r3d) * PASSIVE_DRIFT_RATE * dt;
+        px += dr * rx;
+        py += dr * ry;
+        pz += dr * rz;
+        r3d += dr;  // update radius after drift
     }
 
-    // Keplerian angular velocity at current (drifted) radius.
-    float r3 = r_cyl * r_cyl * r_cyl;
+    // Keplerian angular velocity at current 3D radius.
+    float r3 = r3d * r3d * r3d;
     float omega_kep = sqrtf(BH_MASS / r3);
+    float dtheta = omega_kep * dt;
 
-    // Current orbital phase, advance by omega_kep * dt.
-    float phi = cuda_fast_atan2(pz, px);
-    float phi_new = phi + omega_kep * dt;
+    // Rodrigues rotation: advance position around L_hat by dtheta.
+    // r_new = r·cos(dθ) + (L_hat × r)·sin(dθ) + L_hat·(L_hat·r)·(1−cos(dθ))
+    // For small dθ (typical ~0.002), cos≈1 and sin≈dθ, but we use exact
+    // for correctness at large radii where omega is higher.
+    float cos_dt = cuda_lut_cos(dtheta);
+    float sin_dt = cuda_lut_sin(dtheta);
 
-    // Reconstruct position at drifted radius, new phase.
-    float px_new = r_cyl * cuda_lut_cos(phi_new);
-    float pz_new = r_cyl * cuda_lut_sin(phi_new);
+    // L_hat × r
+    float crx = ly * pz - lz * py;
+    float cry = lz * px - lx * pz;
+    float crz = lx * py - ly * px;
 
-    // Vertical damping — reuse the existing helper from forces.cuh.
-    float vy = disk->vel_y[i];
-    apply_disk_damping(py, r_cyl, vy);
-    disk->vel_y[i] = vy;
-    float py_new = py + vy * dt;
+    // L_hat · r (should be ~0 for orbits in the plane, but nonzero for tilted)
+    float ldotr = lx * px + ly * py + lz * pz;
 
-    // Step 6: write Keplerian-correct tangential velocity.
-    // The passive kernel advances position via (r_cyl, phi_new) but the
-    // stored vel_x/vel_z must reflect the actual orbital motion so that:
-    //  (a) rendering elongation and visual effects work correctly,
-    //  (b) the E_kin diagnostic reports nonzero kinetic energy,
-    //  (c) on passive→active promotion, siphon gets a consistent state.
-    // Prograde tangent: (-sin(phi), 0, cos(phi)) = (-pz/r, 0, px/r).
-    {
-        float inv_r = rsqrtf(px_new * px_new + pz_new * pz_new + 1e-8f);
-        float v_kep = omega_kep * r_cyl;  // tangential speed = ω × r
-        disk->vel_x[i] = -pz_new * inv_r * v_kep;
-        disk->vel_z[i] =  px_new * inv_r * v_kep;
-    }
+    float px_new = px * cos_dt + crx * sin_dt + lx * ldotr * (1.0f - cos_dt);
+    float py_new = py * cos_dt + cry * sin_dt + ly * ldotr * (1.0f - cos_dt);
+    float pz_new = pz * cos_dt + crz * sin_dt + lz * ldotr * (1.0f - cos_dt);
+
+    // Orbital-plane damping (damp velocity perpendicular to orbital plane)
+    float v_normal = vx * lx + vy * ly + vz * lz;
+    float damping = 0.02f;
+    vx -= damping * v_normal * lx;
+    vy -= damping * v_normal * ly;
+    vz -= damping * v_normal * lz;
+
+    // Write Keplerian-correct tangential velocity using local frame.
+    float v_kep = omega_kep * r3d;
+    disk->vel_x[i] = v_kep * tx;
+    disk->vel_y[i] = v_kep * ty;
+    disk->vel_z[i] = v_kep * tz;
 
     // Write back position.
     disk->pos_x[i] = px_new;

@@ -290,17 +290,27 @@ __device__ __forceinline__ bool apply_boundary_recycle(
     float r_xz, float global_heartbeat,
     int& state, int& coherent)
 {
-    if (r_xz > ION_KICK_OUTER_R) {
-        float theta = cuda_fast_atan2(pz, px);
-        px = ION_KICK_RESPAWN_R * cuda_lut_cos(theta);
-        pz = ION_KICK_RESPAWN_R * cuda_lut_sin(theta);
-        py *= 0.3f;
+    // Use 3D radius for boundary check
+    float r3d = sqrtf(px*px + py*py + pz*pz);
+    if (r3d > ION_KICK_OUTER_R) {
+        // Respawn along current 3D radial direction (preserves orbital plane)
+        float inv_r = 1.0f / (r3d + 1e-8f);
+        float scale = ION_KICK_RESPAWN_R * inv_r;
+        px *= scale;
+        py *= scale;
+        pz *= scale;
 
+        // Gentle inward velocity along radial direction
         float hb_mod = (global_heartbeat > -0.5f) ? 1.0f : 0.0f;
         float sigma = LANGEVIN_SIGMA * hb_mod;
-        vx = -0.1f * cuda_lut_cos(theta) * (0.5f + sigma);
-        vz = -0.1f * cuda_lut_sin(theta) * (0.5f + sigma);
-        vy *= 0.3f;
+        float v_inward = -0.1f * (0.5f + sigma);
+        float rx = px * inv_r * scale;  // post-scale radial
+        float ry = py * inv_r * scale;
+        float rz = pz * inv_r * scale;
+        float inv_rr = rsqrtf(rx*rx + ry*ry + rz*rz + 1e-8f);
+        vx = v_inward * rx * inv_rr;
+        vy = v_inward * ry * inv_rr;
+        vz = v_inward * rz * inv_rr;
 
         state = 0;  // IDLE
         coherent = 0;
@@ -352,11 +362,12 @@ __device__ __forceinline__ void compute_tidal_forces(
     float shear = 0.0f;
     float tidal_radial = 0.0f;
 
-    // Keplerian shear (disk plane only)
-    if (r_cyl > SCHW_R * 1.5f) {
-        shear = 1.5f * sqrtf(BH_MASS / (r_cyl * r_cyl * r_cyl * r_cyl * r_cyl));
+    // Keplerian shear — use 3D radius, no disk-alignment penalty.
+    // Shear exists for any orbiting particle regardless of orbital plane.
+    if (r3d > SCHW_R * 1.5f) {
+        shear = 1.5f * sqrtf(BH_MASS / (r3d * r3d * r3d * r3d * r3d));
         shear *= sqrtf(scale);
-        shear *= fmaxf(0.0f, L_disk_align);  // Weight by disk alignment
+        shear *= fmaxf(0.0f, fabsf(L_disk_align));  // Orbital coherence, not direction
     }
 
     // Radial tidal (always present)

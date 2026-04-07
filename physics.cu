@@ -288,7 +288,8 @@ __global__ void siphonDiskKernel(
     if (eject && !was_ejected) {
         // Initial ejection kick
         disk->jet_phase[i] = orb_phi;  // Capture phase for jet memory
-        apply_ejection_kick(px, py, pz, vx, vy, vz, r_cyl, residual, history, Ly, orb_phi, dt);
+        apply_ejection_kick(px, py, pz, vx, vy, vz, r_cyl, residual, history, Ly, orb_phi, dt,
+                            ftx, fty, ftz, flx, fly, flz);
     }
 
     // ========================================================================
