@@ -77,6 +77,11 @@ bool g_shell_init = false;
 // Toggle via --shell-lensing or L key at runtime.
 bool g_shell_lensing = false;
 
+// Ghost projection: render transport-channel particles (near center, ejected,
+// high stress) as faint cyan-white ghosts — the "polarized out" dimension.
+// Toggle via --ghost/--no-ghost or G key at runtime.
+bool g_ghost_projection = true;
+
 // Per-cell R export: dumps R_cell grid to disk every N frames (0 = disabled)
 int g_r_export_interval = 0;
 

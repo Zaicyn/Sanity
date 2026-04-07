@@ -93,6 +93,14 @@ inline int parseCLI(int argc, char** argv) {
             g_shell_lensing = true;
             printf("[render] Shell lensing ENABLED\n");
         }
+        else if (strcmp(argv[i], "--ghost") == 0) {
+            g_ghost_projection = true;
+            printf("[render] Ghost projection ENABLED (transport channel visible)\n");
+        }
+        else if (strcmp(argv[i], "--no-ghost") == 0) {
+            g_ghost_projection = false;
+            printf("[render] Ghost projection DISABLED\n");
+        }
         else if (strcmp(argv[i], "--no-spawn") == 0) {
 
             g_spawn_enabled = false;

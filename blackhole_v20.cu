@@ -2182,7 +2182,7 @@ int main(int argc, char** argv) {
                 fillVulkanSunTraceBuffer<<<blocks, threads>>>(
                     (VulkanSunTrace*)d_vkParticles, d_disk, N_current);
             } else {
-                fillVulkanParticleBuffer<<<blocks, threads>>>(d_vkParticles, d_disk, N_current);
+                fillVulkanParticleBuffer<<<blocks, threads>>>(d_vkParticles, d_disk, N_current, g_ghost_projection);
             }
             vkCtx.nearParticleCount = 0;  // Clear count to indicate no culling
         } else if (hybridLODEnabled && d_densityGrid != nullptr) {
@@ -2203,7 +2203,8 @@ int main(int argc, char** argv) {
                 farThreshold,
                 volumeScale,
                 d_nearCount,
-                g_shell_lensing
+                g_shell_lensing,
+                g_ghost_projection
             );
 
             // Near count readback removed — caused stutter from GPU sync
@@ -2215,7 +2216,7 @@ int main(int argc, char** argv) {
                 fillVulkanSunTraceBuffer<<<blocks, threads>>>(
                     (VulkanSunTrace*)d_vkParticles, d_disk, N_current);
             } else {
-                fillVulkanParticleBuffer<<<blocks, threads>>>(d_vkParticles, d_disk, N_current);
+                fillVulkanParticleBuffer<<<blocks, threads>>>(d_vkParticles, d_disk, N_current, g_ghost_projection);
             }
         }
         // Sync CUDA before Vulkan reads the particle buffer

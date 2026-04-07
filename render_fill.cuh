@@ -98,13 +98,12 @@ __device__ inline float lod_smoothstep(float edge0, float edge1, float x) {
 __global__ void fillVulkanParticleBuffer(
     ParticleVertex* output,  // Shared buffer (Vulkan-visible)
     const GPUDisk* disk,
-    int N
+    int N,
+    bool ghostProjection = true
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    // Pack data into Vulkan vertex format
-    // Inactive particles get zeroed (will be culled by alpha=0 in shader)
     if (particle_active(disk, i)) {
         float px = disk->pos_x[i];
         float py = disk->pos_y[i];
@@ -114,17 +113,31 @@ __global__ void fillVulkanParticleBuffer(
         output[i].position[2] = pz;
         output[i].pump_scale = disk->pump_scale[i];
         output[i].pump_residual = disk->pump_residual[i];
-        // Compute temp on-demand (saves 4 bytes/particle storage)
         float r_cyl = compute_disk_r(px, pz);
         output[i].temp = compute_temp(r_cyl);
         output[i].velocity[0] = disk->vel_x[i];
         output[i].velocity[1] = disk->vel_y[i];
         output[i].velocity[2] = disk->vel_z[i];
-        // Elongation from velocity magnitude (proxy for shear)
         float vel_mag = sqrtf(disk->vel_x[i]*disk->vel_x[i] +
                               disk->vel_y[i]*disk->vel_y[i] +
                               disk->vel_z[i]*disk->vel_z[i]);
         output[i].elongation = 1.0f + vel_mag * 0.01f;
+
+        // Ghost projection: particles in the transport channel rendered
+        // as faint cyan-white ghosts — the "polarized out" dimension
+        if (ghostProjection) {
+            float r3d = sqrtf(px*px + py*py + pz*pz);
+            bool in_transport = (r3d < ISCO_R * 2.0f)
+                             || particle_ejected(disk, i)
+                             || (disk->pump_residual[i] > 0.88f)
+                             || (disk->pump_state[i] == 6);
+            if (in_transport) {
+                output[i].temp = 50000.0f;
+                output[i].pump_scale = 0.3f;
+                output[i].elongation *= 0.25f;
+                output[i].pump_residual = 0.0f;
+            }
+        }
     } else {
         // Zero out inactive particles
         output[i].position[0] = 0.0f;
@@ -213,7 +226,8 @@ __global__ void fillVulkanParticleBufferLOD(
     float farThreshold,          // Distance above which = volume only (default: 600)
     float volumeScale,           // World-space extent of density grid (default: 300)
     unsigned int* nearCount,     // Atomic counter for near particles
-    bool shellLensing            // Step 6: enable shell lensing distortion
+    bool shellLensing,           // Step 6: enable shell lensing distortion
+    bool ghostProjection = true  // Ghost projection for transport channel
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
@@ -317,6 +331,21 @@ __global__ void fillVulkanParticleBufferLOD(
         // Encode LOD weight in elongation (shader will use this for alpha blend)
         float vel_mag = sqrtf(vx*vx + vy*vy + vz*vz);
         output[i].elongation = pointWeight * (1.0f + vel_mag * 0.01f);
+
+        // Ghost projection: transport channel particles as faint cyan ghosts
+        if (ghostProjection) {
+            float r3d_ghost = sqrtf(px*px + py*py + pz*pz);
+            bool in_transport = (r3d_ghost < ISCO_R * 2.0f)
+                             || particle_ejected(disk, i)
+                             || (pump_residual > 0.88f)
+                             || (disk->pump_state[i] == 6);
+            if (in_transport) {
+                output[i].temp = 50000.0f;
+                output[i].pump_scale = 0.3f;
+                output[i].elongation *= 0.25f;
+                output[i].pump_residual = 0.0f;
+            }
+        }
 
         // Count near particles for stats
         if (dist < nearThreshold) {
