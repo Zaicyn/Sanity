@@ -191,9 +191,16 @@ __device__ __forceinline__ void apply_orbital_damping(
         // Skip if velocity is too low to define an orbital plane
         if (v_sq > 0.001f) {
             float v_normal = vx * lx + vy * ly + vz * lz;
-            // 10% damping per frame — strong enough to flatten spawned particles
-            // into the disk within ~10 frames despite spawn velocity noise.
-            float damping = 0.10f;
+            // Radius-scaled damping matched to vertical epicyclic frequency:
+            //   ω_z(r) = √(BH_MASS / r³)
+            //   γ(r) = overdamp × ω_z(r)
+            // With overdamp ≥ 1.0, vertical oscillations are critically damped
+            // at all radii simultaneously → cone flattens into disk.
+            // overdamp = 2.0 gives slightly supercritical damping (no ringing).
+            float r3 = r3d * r3d * r3d;
+            float omega_z = sqrtf(BH_MASS / fmaxf(r3, 1.0f));
+            float damping = 2.0f * omega_z;  // critically damped
+            damping = fminf(damping, 0.50f);  // stability cap
             vx -= damping * v_normal * lx;
             vy -= damping * v_normal * ly;
             vz -= damping * v_normal * lz;
