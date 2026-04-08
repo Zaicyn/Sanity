@@ -52,7 +52,7 @@
 __device__ __constant__ float d_PI = 3.14159265358979f;
 __device__ __constant__ float d_TWO_PI = 6.28318530717959f;
 __device__ __constant__ float d_ISCO = 6.0f;
-__device__ __constant__ float d_BH_MASS = 1.0f;
+__device__ __constant__ float d_BH_MASS = BH_MASS;  // Must match BH_MASS (100.0f) from disk.cuh
 __device__ __constant__ float d_SCHW_R = 2.0f;
 __device__ __constant__ float d_DISK_THICKNESS = 0.8f;
 __device__ __constant__ float d_PHI = 1.6180339887498948f;
