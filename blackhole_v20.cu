@@ -1035,6 +1035,14 @@ int main(int argc, char** argv) {
     // g_runtime_particle_cap (not N_current) because spawning can grow N.
     uint8_t* d_in_active_region = nullptr;
 
+    // Hopfion enforcement buffers
+    int* d_Q_sum = nullptr;
+    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes
+    int h_Q_sum = 0;
+    int h_operator_counts[2] = {};
+    int g_Q_target = 0;               // Set at frame 0, checked every frame
+    float g_hopfion_flip_scale = 1.0f; // Recycling equilibrium multiplier
+
     // Radial profile of R_cell — 16 bins from center to box edge
     const int RC_RADIAL_BINS = 16;
     float* d_rc_bin_R = nullptr;
@@ -1176,6 +1184,13 @@ int main(int argc, char** argv) {
         printf("[passive] d_in_active_region allocated: %zu bytes, init=all-in-region\n",
                in_active_region_size);
     }
+
+    // === HOPFION ENFORCEMENT BUFFERS ===
+    cudaMalloc(&d_Q_sum, sizeof(int));
+    cudaMalloc(&d_operator_counts, 2 * sizeof(int));
+    cudaMemset(d_Q_sum, 0, sizeof(int));
+    cudaMemset(d_operator_counts, 0, 2 * sizeof(int));
+    printf("[hopfion] Enforcement buffers allocated (Q_sum + 2 operator counters)\n");
 
     // === TREE ARCHITECTURE STEP 2: bootstrap ActiveRegion ===
     // Allocate a small fixed-size array of ActiveRegion slots and seed
@@ -1326,6 +1341,16 @@ int main(int argc, char** argv) {
                 d_disk, d_in_active_region, N_current,
                 dt_sim * 2.0f, g_passive_residual_tau);
 #endif
+
+            // === HOPFION ENFORCEMENT: topological boundary conditions ===
+            // Runs after all medium physics (siphon + passive), before spawn.
+            // Operators: phason flip (stochastic relaxation), iron freeze.
+            // Global Q accumulated via warp reduction.
+            cudaMemset(d_Q_sum, 0, sizeof(int));
+            cudaMemset(d_operator_counts, 0, 2 * sizeof(int));
+            hopfionEnforceKernel<<<spawn_blocks, threads>>>(
+                d_disk, d_in_active_region, N_current,
+                d_Q_sum, d_operator_counts, sim_time, g_hopfion_flip_scale);
 
             // === NATURAL GROWTH: Spawn new particles in coherent regions ===
             if (SPAWN_ENABLE && N_current < MAX_DISK_PTS) {
@@ -2728,6 +2753,18 @@ int main(int argc, char** argv) {
                        r_inner,
                        r_mid,
                        active_frac);
+
+                // Hopfion Q_discrete readback (one-frame lag is fine)
+                cudaMemcpy(&h_Q_sum, d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_operator_counts, d_operator_counts, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+                if (frame == 0) g_Q_target = h_Q_sum;  // Set conservation target on first read
+                if (h_Q_sum != g_Q_target) {
+                    printf("[TOPO] Q DRIFT: %d → %d (Δ=%d) at frame %d\n",
+                           g_Q_target, h_Q_sum, h_Q_sum - g_Q_target, frame);
+                    g_Q_target = h_Q_sum;  // Update target (statistical conservation)
+                }
+                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d\n",
+                       frame, h_Q_sum, h_operator_counts[0], h_operator_counts[1]);
             }
 
             // === RING STABILITY DIAGNOSTIC ===

@@ -310,3 +310,91 @@ inline bool run_hopfion_tests() {
     return true;
 }
 #endif // TEST_HOPFION
+
+// ============================================================================
+// Enforcement Kernel — topological boundary conditions on the medium
+// ============================================================================
+// Runs AFTER siphonDiskKernel and advectPassiveParticles, BEFORE spawn.
+// Default stream, sequential with medium physics.
+//
+// Per-particle operators applied:
+//   - Phason flip: stochastic, rate ∝ |pump_residual|. Relaxation only
+//     (accept if dim doesn't increase).
+//   - Iron freeze: dim-4 + PUMP_IDLE + low history → locked (0xFF).
+//
+// Fusion and tension explosion are deferred to H5 (need cell-level topo).
+// Venting is deferred to H6 (needs spawn piggybacking).
+//
+// Global Q is accumulated via warp-level reduction + atomicAdd.
+
+__global__ void hopfionEnforceKernel(
+    GPUDisk* disk,
+    const uint8_t* __restrict__ in_active_region,
+    int N,
+    int* __restrict__ d_Q_sum,
+    int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes
+    float sim_time,
+    float flip_rate_scale  // host-side recycling equilibrium multiplier
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    // Skip dead/ejected/passive particles
+    uint8_t flags = disk->flags[i];
+    if (!(flags & PFLAG_ACTIVE)) return;
+    if (flags & PFLAG_EJECTED) return;
+    if (!in_active_region[i]) return;
+
+    uint8_t state = disk->topo_state[i];
+
+    // Skip frozen particles
+    if (state == TOPO_FROZEN) {
+        // Still accumulate Q (frozen = Q contribution locked)
+        // Frozen state has all reserved bits, Q_lut[0xFF] = 0
+        goto reduce;
+    }
+
+    // --- Phason flip: stochastic relaxation ---
+    {
+        float residual = fabsf(disk->pump_residual[i]);
+        float flip_prob = HOPFION_FLIP_BASE_RATE * residual * flip_rate_scale;
+
+        // Simple LCG from thread index + sim_time for stochastic decision
+        unsigned int rng = (unsigned int)(i * 2654435761u + __float_as_uint(sim_time));
+        float r = (float)(rng & 0xFFFF) / 65536.0f;
+
+        if (r < flip_prob) {
+            // Pick random axis
+            int axis = (int)((rng >> 16) & 0x03);
+            int s = topo_get_axis(state, axis);
+            if (s != 0) {
+                uint8_t flipped = hopfion_phason_flip(state, axis);
+                // Accept only if dim doesn't increase (relaxation, not excitation)
+                if (topo_dim(flipped) <= topo_dim(state)) {
+                    state = flipped;
+                    atomicAdd(&d_operator_counts[0], 1);
+                }
+            }
+        }
+    }
+
+    // --- Iron freeze: dim-4 + idle + exhausted history ---
+    if (topo_dim(state) == 4 &&
+        disk->pump_state[i] == 0 &&  // PUMP_IDLE
+        disk->pump_history[i] < HOPFION_FREEZE_HISTORY) {
+        state = TOPO_FROZEN;
+        atomicAdd(&d_operator_counts[1], 1);
+    }
+
+    disk->topo_state[i] = state;
+
+reduce:
+    // Warp-level Q reduction
+    int q = (state == TOPO_FROZEN) ? 0 : topo_Q_fast(state);
+    // Warp shuffle reduction
+    for (int offset = 16; offset > 0; offset >>= 1)
+        q += __shfl_down_sync(0xFFFFFFFF, q, offset);
+    // Lane 0 of each warp does the atomicAdd
+    if ((threadIdx.x & 31) == 0)
+        atomicAdd(d_Q_sum, q);
+}
