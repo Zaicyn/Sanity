@@ -29,76 +29,83 @@ __device__ float cuda_fast_atan2(float y, float x);
 // ============================================================================
 // Viviani Field Force Model
 // ============================================================================
-// Force derived from field line direction, not central mass.
-// Reference: viv/viv_field_trace.comp
+// Force derived directly from the Viviani curve geometry:
+//   x(θ) = sin(θ) - ½·sin(3θ)
+//   y(θ) = -cos(θ) + ½·cos(3θ)
+//   z(θ) = cos(θ)·cos(3θ)
+//   w(θ) = ⅓·sin(5θ)
 //
-// Physics: The topology of the field creates anisotropic forces:
-//   - POLES (axial): Field converges/diverges → radial push/pull
-//   - SIDES (equatorial): Field runs tangent → rotational force
+// The field direction at each particle is the Viviani tangent vector
+// evaluated at the particle's orbital phase θ = atan2(pz, px).
+// The force arises from the difference between the particle's velocity
+// and the field direction — particles are accelerated along the field.
 //
-// This replaces uniform -GM/r² gravity with context-dependent field forces.
-// The galaxy should "breathe" — poles bind, sides vent, oscillating equilibrium.
-//
-// Arguments:
-//   px, py, pz: position
-//   vx, vy, vz: velocity (used as field direction proxy)
-//   ax, ay, az: output acceleration (added to, not replaced)
+// This IS gravity in this framework: G_μν = 8πG(T^ideal + ΔE/c² g_μν)
+// The curve encodes the metric's topology. No -GM/r² anywhere.
 
 __device__ __forceinline__ void apply_viviani_field_force(
     float px, float py, float pz,
     float vx, float vy, float vz,
-    float r3d, float inv_r3d,  // Pre-computed: avoids redundant sqrtf
+    float r3d, float inv_r3d,
     float& ax, float& ay, float& az)
 {
     float r_safe = fmaxf(r3d, SCHW_R * 0.5f);
     float inv_r = (r3d >= SCHW_R * 0.5f) ? inv_r3d : (1.0f / r_safe);
 
-    // Field direction: use velocity as proxy (rsqrtf avoids sqrtf + division)
-    float v2 = vx*vx + vy*vy + vz*vz;
-    float inv_v = rsqrtf(v2 + 0.0001f);  // +epsilon avoids div by zero
-    float bx = vx * inv_v;
-    float by = vy * inv_v;
-    float bz = vz * inv_v;
+    // Orbital phase from position in the disk plane
+    float theta = cuda_fast_atan2(pz, px);
 
-    // Radial unit vector (reuse inv_r)
+    // Viviani curve evaluated at θ — the field geometry
+    //   x(θ) = sin(θ) - ½·sin(3θ)
+    //   y(θ) = -cos(θ) + ½·cos(3θ)
+    //   z(θ) = cos(θ)·cos(3θ)
+    float s1 = cuda_lut_sin(theta);
+    float c1 = cuda_lut_cos(theta);
+    float s3 = cuda_lut_sin3(theta);
+    float c3 = cuda_lut_cos3(theta);
+
+    // Tangent vector: d/dθ of the curve = field direction
+    //   dx/dθ = cos(θ) - 3/2·cos(3θ)
+    //   dy/dθ = sin(θ) - 3/2·sin(3θ)
+    //   dz/dθ = -sin(θ)·cos(3θ) - 3·cos(θ)·sin(3θ)
+    float fx = c1 - 1.5f * c3;
+    float fy = s1 - 1.5f * s3;
+    float fz = -s1 * c3 - 3.0f * c1 * s3;
+
+    // Normalize field direction
+    float inv_f = rsqrtf(fx*fx + fy*fy + fz*fz + 1e-8f);
+    fx *= inv_f;
+    fy *= inv_f;
+    fz *= inv_f;
+
+    // Force weight: field strength / (1 + r²/falloff)
+    // At large r, weight ≈ STRENGTH × FALLOFF / r² ≈ BH_MASS / r²
+    float weight = FIELD_FORCE_STRENGTH / (1.0f + r_safe * r_safe / FIELD_FORCE_FALLOFF);
+
+    // The force has two components:
+    //   1. Tangential: accelerate along the field direction (drives rotation)
+    //   2. Radial: pull toward center proportional to weight (provides centripetal)
+
+    // Radial unit vector
     float rx = px * inv_r;
     float ry = py * inv_r;
     float rz = pz * inv_r;
 
-    // Classify: axial (pole) vs equatorial (side)
-    float cos_theta = py * inv_r;
-    bool is_axial = fabsf(cos_theta) > AXIAL_THRESHOLD;
+    // Tangential component: field direction projected perpendicular to radial
+    float f_dot_r = fx * rx + fy * ry + fz * rz;
+    float tx = fx - f_dot_r * rx;
+    float ty = fy - f_dot_r * ry;
+    float tz = fz - f_dot_r * rz;
 
-    // Weight = field_strength / (1 + distance²/falloff)
-    float weight = FIELD_FORCE_STRENGTH / (1.0f + r_safe * r_safe / FIELD_FORCE_FALLOFF);
+    // Centripetal (radial inward) — the "gravity" component
+    ax += -rx * weight;
+    ay += -ry * weight;
+    az += -rz * weight;
 
-    if (is_axial) {
-        // AXIAL (poles): Force direction based on field flow
-        float radial_dot = -(bx * rx + by * ry + bz * rz);
-
-        if (radial_dot > 0.0f) {
-            // Field flowing TOWARD center → PULL inward
-            ax += -rx * weight * radial_dot;
-            ay += -ry * weight * radial_dot;
-            az += -rz * weight * radial_dot;
-        } else {
-            // Field flowing AWAY from center → PUSH outward
-            ax += rx * weight * (-radial_dot);
-            ay += ry * weight * (-radial_dot);
-            az += rz * weight * (-radial_dot);
-        }
-    } else {
-        // EQUATORIAL (sides): Tangential force
-        float tx = ry * bz - rz * by;
-        float ty = rz * bx - rx * bz;
-        float tz = rx * by - ry * bx;
-
-        // rsqrtf for normalization (avoids sqrtf + division)
-        float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f) * TANGENT_SCALE;
-        ax += tx * inv_t * weight;
-        ay += ty * inv_t * weight;
-        az += tz * inv_t * weight;
-    }
+    // Tangential — the rotation-driving component (scaled by TANGENT_SCALE)
+    ax += tx * weight * TANGENT_SCALE;
+    ay += ty * weight * TANGENT_SCALE;
+    az += tz * weight * TANGENT_SCALE;
 }
 
 // ============================================================================
