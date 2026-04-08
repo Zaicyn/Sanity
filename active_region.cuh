@@ -120,13 +120,10 @@ __global__ void computeInActiveRegionMask(
     // The injection is computed HERE (in the mask kernel, same frame
     // as the threshold comparison) to avoid the one-frame-lag issue
     // that would occur if it were in the passive kernel.
-    // d_shell_radii[8] is __constant__ from sun_trace.cuh.
-    float min_dev = fabsf(r_cyl - d_shell_radii[0]);
-    for (int s = 1; s < 8; s++) {
-        float dev = fabsf(r_cyl - d_shell_radii[s]);
-        if (dev < min_dev) min_dev = dev;
-    }
-    float effective_residual = fmaxf(fabsf(residual), min_dev * RESIDUAL_INJECT_RATE);
+    // Shell-deviation injection — REMOVED. Shells should emerge from
+    // the field, not be used as hardcoded classification boundaries.
+    // Active/passive split based purely on pump residual now.
+    float effective_residual = fabsf(residual);
 
     // Force active (siphon owns) if ANY of these hold:
     //   - effective_residual > corner_threshold: off-shell or dynamically active

@@ -148,21 +148,10 @@ __global__ void advectPassiveParticles(
     float inv_t = rsqrtf(tx*tx + ty*ty + tz*tz + 1e-8f);
     tx *= inv_t; ty *= inv_t; tz *= inv_t;
 
-    // Step 6: gentle radial drift toward nearest resonance shell.
-    // Uses 3D radius instead of cylindrical.
-    {
-        float r_target = d_shell_radii[0];
-        float best_dev = fabsf(r3d - r_target);
-        for (int s = 1; s < 8; s++) {
-            float dev = fabsf(r3d - d_shell_radii[s]);
-            if (dev < best_dev) { best_dev = dev; r_target = d_shell_radii[s]; }
-        }
-        float dr = (r_target - r3d) * PASSIVE_DRIFT_RATE * dt;
-        px += dr * rx;
-        py += dr * ry;
-        pz += dr * rz;
-        r3d += dr;  // update radius after drift
-    }
+    // Step 6: radial drift toward hardcoded shells — REMOVED
+    // Shells should emerge from the Viviani field harmonics, not be forced.
+    // The field topology creates natural density concentrations at resonant
+    // radii — those ARE the shells.
 
     // Keplerian angular velocity at current 3D radius.
     float r3 = r3d * r3d * r3d;

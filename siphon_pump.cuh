@@ -27,38 +27,21 @@
 // ============================================================================
 // Math.md: K factor determines synchronization threshold
 //
-// Coupling depends on proximity to nearest shell and orbital coherence.
-// All 8 shells participate equally in the pump — coupling is NOT biased
-// toward ISCO. Particles near any shell get full proximity coupling.
-//
-// Shell radii (golden ratio cascade from ISCO=6.0):
-//   6.0, 9.7, 15.7, 25.4, 41.1, 66.5, 107.5, 174.0
-
-// Local copy of shell radii for coupling computation (avoids include
-// dependency on sun_trace.cuh which is included later in the TU).
-__constant__ float d_pump_shell_radii[8] = {
-    6.0f, 9.7f, 15.7f, 25.4f, 41.1f, 66.5f, 107.5f, 174.0f
-};
+// Coupling depends on orbital coherence only — no hardcoded shell radii.
+// Shells emerge from the Viviani field harmonics. The pump couples to
+// how organized the orbit is (|L_disk_align|), not where the particle
+// happens to be relative to predefined radii.
 
 __device__ __forceinline__ float compute_coupling_strength(
     float r3d, float L_disk_align, float py)
 {
-    // Proximity to nearest resonance shell: high coupling near any shell,
-    // decays with distance from nearest shell. All 8 shells are equivalent.
-    float r_cyl = sqrtf(fmaxf(r3d * r3d - py * py, 0.0f));
-    float min_dev = 1e6f;
-    for (int s = 0; s < 8; s++) {
-        float dev = fabsf(r_cyl - d_pump_shell_radii[s]);
-        if (dev < min_dev) min_dev = dev;
-    }
-    // Normalize: full coupling within 5 units of a shell, decays to 0 at 20 units
-    float proximity_factor = fmaxf(0.0f, 1.0f - min_dev / 20.0f);
+    // Velocity coherence: |L_disk_align| measures how circular the orbit is.
+    // 1.0 = perfectly circular (strong coupling), 0.0 = radial (no coupling).
+    // This is the only physically meaningful coupling criterion — the pump
+    // should couple to coherent orbits regardless of radius.
+    float coherence_factor = fabsf(L_disk_align);
 
-    // Velocity coherence: use |L_disk_align| (absolute alignment strength,
-    // not direction) as a measure of how organized the orbit is.
-    float coherence_factor = fabsf(L_disk_align);  // 0 = radial, 1 = circular
-
-    return proximity_factor * 0.6f + coherence_factor * 0.4f;
+    return coherence_factor;
 }
 
 // ============================================================================
