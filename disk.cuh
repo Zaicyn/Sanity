@@ -137,10 +137,10 @@ __device__ float cuda_fast_atan2(float y, float x);
 // Force derived from field line direction, not central mass
 
 #ifndef FIELD_FORCE_STRENGTH
-#define FIELD_FORCE_STRENGTH    0.02f
+#define FIELD_FORCE_STRENGTH    1.0f    // STRENGTH × FALLOFF ≈ BH_MASS for orbital support
 #endif
 #ifndef FIELD_FORCE_FALLOFF
-#define FIELD_FORCE_FALLOFF     10.0f
+#define FIELD_FORCE_FALLOFF     100.0f  // Large falloff → weight ∝ 1/r² at outer shells
 #endif
 #ifndef AXIAL_THRESHOLD
 #define AXIAL_THRESHOLD         0.5f
