@@ -123,19 +123,26 @@ __global__ void fillVulkanParticleBuffer(
                               disk->vel_z[i]*disk->vel_z[i]);
         output[i].elongation = 1.0f + vel_mag * 0.01f;
 
-        // Ghost projection: particles in the transport channel rendered
-        // as faint cyan-white ghosts — the "polarized out" dimension
+        // Ghost projection: w-component controls visibility.
+        // High w = particle rotated into 4D transport channel.
+        // 3D projection scales as s = sqrt(1 - w²).
+        // Ghost renders the "anti-now" component as faint blue.
         if (ghostProjection) {
-            float r3d = sqrtf(px*px + py*py + pz*pz);
-            bool in_transport = (r3d < ISCO_R * 2.0f)
-                             || particle_ejected(disk, i)
-                             || (disk->pump_residual[i] > 0.88f)
-                             || (disk->pump_state[i] == 6);
-            if (in_transport) {
-                output[i].temp = 50000.0f;
-                output[i].pump_scale = 0.3f;
-                output[i].elongation *= 0.25f;
-                output[i].pump_residual = 0.0f;
+            float w = disk->w_component[i];
+            if (w > 0.05f) {
+                // Scale 3D projection: s = sqrt(1 - w²)
+                float s = sqrtf(1.0f - w * w);
+
+                // Normal appearance is scaled by s (fades as w grows)
+                output[i].pump_scale *= s;
+                output[i].elongation *= s;
+
+                // Ghost overlay: the w-portion rendered as cool blue
+                // Blend between normal color and ghost blue based on w
+                float ghost_alpha = w * 0.015f;  // faint per-particle
+                output[i].temp = output[i].temp * s + 18.0f * w;  // blend toward blue
+                output[i].elongation = fmaxf(output[i].elongation, ghost_alpha);
+                output[i].pump_residual *= s;  // suppress stress glow in ghost state
             }
         }
     } else {
@@ -340,10 +347,12 @@ __global__ void fillVulkanParticleBufferLOD(
                              || (pump_residual > 0.88f)
                              || (disk->pump_state[i] == 6);
             if (in_transport) {
-                output[i].temp = 50000.0f;
-                output[i].pump_scale = 0.3f;
-                output[i].elongation *= 0.25f;
-                output[i].pump_residual = 0.0f;
+                // Shader maps temp as: tempK = temp * 0.5 + 2.0
+                // temperatureToRGB wants ~2-12 range. temp=18 → tempK=11 → blue-white
+                output[i].temp = 18.0f;              // maps to ~11K range = cool blue
+                output[i].pump_scale = 0.01f;        // near-zero luminosity (0.5 + 0.005 = 0.505)
+                output[i].elongation = 0.008f;       // <1% alpha — additive blending stacks fast
+                output[i].pump_residual = 0.0f;      // no stress glow
             }
         }
 

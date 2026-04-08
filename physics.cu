@@ -400,6 +400,34 @@ __global__ void siphonDiskKernel(
 
     // Update pump history (exponential smoothing)
     disk->pump_history[i] = update_pump_history(history, scale);
+
+    // ========================================================================
+    // STEP 16: w-COMPONENT EVOLUTION (4D Phase / Transport Axis)
+    // ========================================================================
+    // math.md: w(θ) = ⅓ sin 5θ. The w-component accumulates from the pump
+    // bias residual — each pump cycle leaves (1 - BIAS) = 25% unrecovered.
+    // This energy rotates into the 4D phase, thinning the 3D projection:
+    //   s(θ) = sqrt(1 - w²)  →  visible size scales down as w grows.
+    // Jets reset w toward zero (re-entry into 3D from the transport channel).
+    {
+        float w = disk->w_component[i];
+
+        // Accumulation: pump residual leaks into w at rate proportional to
+        // the bias gap. Higher residual = faster w accumulation.
+        float w_rate = (1.0f - d_BIAS) * fabsf(residual) * 0.01f;
+        w += w_rate * dt;
+
+        // Jet reset: ejection dumps w back toward zero (3D re-entry).
+        // The jets are the mechanism for resetting the 4D accumulation.
+        if (eject) {
+            w *= 0.8f;  // 20% reset per frame while ejected
+        }
+
+        // Clamp to [0, 1] — w=1 is fully in the transport channel
+        w = fminf(fmaxf(w, 0.0f), 1.0f);
+
+        disk->w_component[i] = w;
+    }
 }
 
 // ============================================================================

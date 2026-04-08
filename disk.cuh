@@ -281,6 +281,15 @@ struct GPUDisk {
     float theta[MAX_DISK_PTS];       // phase in [0, 2π), continuous rotation
     float omega_nat[MAX_DISK_PTS];   // natural frequency, Gaussian spread
 
+    // 4D phase component — the "anti-now" / transport axis.
+    // math.md: w(θ) = ⅓ sin 5θ. Accumulates via pump bias residual:
+    //   w += (1 - BIAS) * |pump_residual| per cycle
+    // The 3D projection scales as s(θ) = sqrt(1 - w²):
+    //   w≈0: fully present in 3D (normal particle)
+    //   w≈1: rotated into 4D (in the transport channel, ghost state)
+    // Jets reset w toward zero (the 3D re-entry mechanism).
+    float w_component[MAX_DISK_PTS];
+
     // Byte-sized fields packed at the end to avoid alignment padding that
     // would otherwise cost 3 bytes per particle (previous layout had
     // pump_seam as a uint8_t between two floats, forcing 3 bytes of pad).
