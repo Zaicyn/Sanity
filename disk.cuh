@@ -295,6 +295,14 @@ struct GPUDisk {
     // pump_seam as a uint8_t between two floats, forcing 3 bytes of pad).
     uint8_t pump_seam[MAX_DISK_PTS]; // seam phase bits
     uint8_t flags[MAX_DISK_PTS];     // bit0=active, bit1=ejected (see PFLAG_*)
+
+    // Hopfion topological state — 4 axes packed into 1 byte.
+    // Each axis s_i ∈ {-1, 0, +1} encoded in 2 bits:
+    //   00 = 0 (unoccupied), 01 = +1, 10 = -1, 11 = reserved/frozen
+    // Bit layout: [s4:7-6][s3:5-4][s2:3-2][s1:1-0]
+    // Full state space: 3^4 = 81 valid signed states.
+    // Conserved quantity: discrete helicity Q = Σ_{i<j<k} ε_{ijk} s_i s_j s_k
+    uint8_t topo_state[MAX_DISK_PTS];
 };
 
 // Packed-flag accessors for the ejected/active bits previously stored as
@@ -316,6 +324,53 @@ __device__ __forceinline__ void set_particle_active(GPUDisk* disk, int i, bool v
 __device__ __forceinline__ void set_particle_ejected(GPUDisk* disk, int i, bool v) {
     if (v) disk->flags[i] |= PFLAG_EJECTED;
     else   disk->flags[i] &= (uint8_t)~PFLAG_EJECTED;
+}
+
+// ============================================================================
+// Hopfion topological state accessors
+// ============================================================================
+// 2-bit encoding per axis: 00=0, 01=+1, 10=-1, 11=reserved
+#define TOPO_AXIS_ZERO  0
+#define TOPO_AXIS_POS   1
+#define TOPO_AXIS_NEG   2
+#define TOPO_AXIS_RSVD  3
+
+__device__ __host__ __forceinline__ int topo_get_axis(uint8_t state, int axis) {
+    int bits = (state >> (axis * 2)) & 0x03;
+    // 00→0, 01→+1, 10→-1, 11→0 (reserved treated as zero for arithmetic)
+    return (bits == TOPO_AXIS_POS) ? 1 : (bits == TOPO_AXIS_NEG) ? -1 : 0;
+}
+
+__device__ __host__ __forceinline__ uint8_t topo_set_axis(uint8_t state, int axis, int val) {
+    uint8_t bits = (val > 0) ? TOPO_AXIS_POS : (val < 0) ? TOPO_AXIS_NEG : TOPO_AXIS_ZERO;
+    uint8_t mask = ~(uint8_t)(0x03 << (axis * 2));
+    return (state & mask) | (bits << (axis * 2));
+}
+
+__device__ __host__ __forceinline__ int topo_dim(uint8_t state) {
+    int d = 0;
+    for (int a = 0; a < 4; a++)
+        if (topo_get_axis(state, a) != 0) d++;
+    return d;
+}
+
+// Discrete helicity: Q = Σ_{i<j<k} ε_{ijk} s_i s_j s_k
+// For N=4 axes, there are 4 triples: (0,1,2), (0,1,3), (0,2,3), (1,2,3)
+// ε is +1 for even permutations of the triple index ordering
+__device__ __host__ __forceinline__ int topo_compute_Q(uint8_t state) {
+    int s[4];
+    for (int a = 0; a < 4; a++) s[a] = topo_get_axis(state, a);
+    return s[0]*s[1]*s[2] - s[0]*s[1]*s[3] + s[0]*s[2]*s[3] - s[1]*s[2]*s[3];
+}
+
+// Pack a signed 4-axis state into a uint8_t
+__device__ __host__ __forceinline__ uint8_t topo_pack(int s0, int s1, int s2, int s3) {
+    uint8_t st = 0;
+    st = topo_set_axis(st, 0, s0);
+    st = topo_set_axis(st, 1, s1);
+    st = topo_set_axis(st, 2, s2);
+    st = topo_set_axis(st, 3, s3);
+    return st;
 }
 
 // ============================================================================
