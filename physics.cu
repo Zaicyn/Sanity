@@ -414,7 +414,7 @@ __global__ void siphonDiskKernel(
 
         // Accumulation: pump residual leaks into w at rate proportional to
         // the bias gap. Higher residual = faster w accumulation.
-        float w_rate = (1.0f - d_BIAS) * fabsf(residual) * 0.01f;
+        float w_rate = (1.0f - d_BIAS) * fabsf(residual) * 1.0f;
         w += w_rate * dt;
 
         // Jet reset: ejection dumps w back toward zero (3D re-entry).
@@ -543,6 +543,22 @@ __global__ void spawnParticlesKernel(
     disk->pump_history[new_idx] = history * 0.5f;
     disk->jet_phase[new_idx] = disk->jet_phase[i];
     disk->flags[new_idx] = PFLAG_ACTIVE;  // active, not ejected
+
+    // Hopfion: child inherits parent topo_state with one axis flipped
+    uint8_t parent_topo = disk->topo_state[i];
+    uint8_t child_topo = parent_topo;
+    if (topo_dim(parent_topo) > 0) {
+        unsigned int rng2 = seed * (i + 1);
+        int a = (int)(rng2 & 0x03);
+        for (int t = 0; t < 4; t++) {
+            int ax = (a + t) & 0x03;
+            if (topo_get_axis(parent_topo, ax) != 0) {
+                child_topo = hopfion_phason_flip(parent_topo, ax);
+                break;
+            }
+        }
+    }
+    disk->topo_state[new_idx] = child_topo;
 
     atomicAdd(&d_spawn_count, 1);
 }

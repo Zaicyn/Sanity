@@ -172,6 +172,26 @@ __global__ void spawnParticlesKernel(
     // Activate the new particle
     disk->flags[new_idx] = PFLAG_ACTIVE;  // active, not ejected
 
+    // Hopfion topo_state: child inherits parent's state with one axis negated.
+    // Single-axis children (from phason flip of single-axis parent) have Q=0.
+    // Multi-axis parents: try each nonzero axis, pick first that keeps Q valid.
+    uint8_t parent_topo = disk->topo_state[i];
+    uint8_t child_topo = parent_topo;  // fallback: exact copy
+    int parent_dim = topo_dim(parent_topo);
+    if (parent_dim > 0) {
+        // Pick a random nonzero axis to flip on the child
+        rng = rng * 1664525u + 1013904223u;
+        int start_axis = (int)(rng & 0x03);  // random start 0-3
+        for (int tries = 0; tries < 4; tries++) {
+            int a = (start_axis + tries) & 0x03;
+            if (topo_get_axis(parent_topo, a) != 0) {
+                child_topo = hopfion_phason_flip(parent_topo, a);
+                break;
+            }
+        }
+    }
+    disk->topo_state[new_idx] = child_topo;
+
     // V8-style: only count SUCCESSFUL spawns (after all writes complete)
     // This ensures spawn_success == actual initialized particles
     atomicAdd(spawn_success, 1);

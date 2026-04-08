@@ -632,6 +632,7 @@ int main(int argc, char** argv) {
     std::vector<float> h_theta(N);      // Kuramoto phase, uniform random [0, 2π)
     std::vector<float> h_omega_nat(N);  // Kuramoto natural freq, Gaussian(ω₀, σ)
     std::vector<uint8_t> h_flags(N);    // packed PFLAG_ACTIVE | PFLAG_EJECTED
+    std::vector<uint8_t> h_topo(N);     // hopfion topological state (4 axes, 2 bits each)
 
     std::mt19937 rng(g_rng_seed);
     std::uniform_real_distribution<float> runif(0.0f, 1.0f);
@@ -733,6 +734,13 @@ int main(int argc, char** argv) {
         h_omega_nat[i] = g_omega_base + g_omega_spread * rnorm(rng);
 
         h_flags[i] = PFLAG_ACTIVE;  // active, not ejected
+
+        // Hopfion init: random single-axis-active state from 8 options.
+        // All single-axis states have Q=0 (triple product needs 3+ axes).
+        // 8 options: {±1,0,0,0}, {0,±1,0,0}, {0,0,±1,0}, {0,0,0,±1}
+        int topo_axis = (int)(runif(rng) * 4.0f) % 4;   // axis 0-3
+        int topo_sign = (runif(rng) < 0.5f) ? 1 : -1;
+        h_topo[i] = topo_set_axis(0, topo_axis, topo_sign);
     }
 
     // Debug: verify active count
@@ -742,6 +750,22 @@ int main(int argc, char** argv) {
            N, box_half*2, box_height*2, box_half*2, active_count);
     printf("[kuramoto-init] theta uniform[0,2π), omega_nat ~ N(%.2f, %.2f)\n",
            g_omega_base, g_omega_spread);
+
+    // Hopfion init stats: verify 8-way uniform distribution
+    int topo_dist[8] = {};  // 4 axes × 2 signs
+    int topo_Q_sum = 0;
+    for (int i = 0; i < N; i++) {
+        for (int a = 0; a < 4; a++) {
+            int s = topo_get_axis(h_topo[i], a);
+            if (s == 1) topo_dist[a * 2]++;
+            else if (s == -1) topo_dist[a * 2 + 1]++;
+        }
+        topo_Q_sum += topo_compute_Q(h_topo[i]);
+    }
+    printf("[hopfion-init] topo_state distribution (axis+/axis-): "
+           "e1(%d/%d) e2(%d/%d) e3(%d/%d) e4(%d/%d) Q_sum=%d\n",
+           topo_dist[0], topo_dist[1], topo_dist[2], topo_dist[3],
+           topo_dist[4], topo_dist[5], topo_dist[6], topo_dist[7], topo_Q_sum);
 
     // GPU allocation
     GPUDisk* d_disk;
@@ -774,6 +798,7 @@ int main(int argc, char** argv) {
     UPLOAD(theta, h_theta);
     UPLOAD(omega_nat, h_omega_nat);
     UPLOAD(flags, h_flags);
+    UPLOAD(topo_state, h_topo);
     #undef UPLOAD
 
     StressCounters* d_stress;
