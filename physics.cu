@@ -232,11 +232,10 @@ __global__ void siphonDiskKernel(
     compute_tidal_forces(r_cyl, r3d, scale, L_disk_align, shear, tidal_radial);
     float tidal_stress = fmaxf(shear, tidal_radial);
 
-    // ========================================================================
-    // STEP 9: APPLY SPIRAL ARM TOPOLOGY
-    // ========================================================================
-
-    float arm_boost = apply_arm_topology(orb_phi, r_cyl, scale, tidal_stress, px, pz, vx, vz, dt);
+    // STEP 9: SPIRAL ARM TOPOLOGY — REMOVED
+    // Azimuthal confinement with no field derivation. Arms should emerge
+    // from the Viviani field topology, not be forced.
+    float arm_boost = 1.0f;  // neutral (no boost)
     scale *= arm_boost;
 
     // ========================================================================
@@ -298,72 +297,15 @@ __global__ void siphonDiskKernel(
     // ========================================================================
     // Math.md: Aizawa has harmonic structure similar to r⃗(θ) = r⃗_ω + ½r⃗_3ω
 
+    // STEP 12: AIZAWA JET DYNAMICS — REMOVED
+    // Strange attractor blended into jet trajectories had no derivation
+    // from the Viviani field. Ejected particles follow ballistic + field.
     float jet_phase_delta = 0.0f;
 
-    if (was_ejected) {
-        float jet_phase = disk->jet_phase[i];
-        bool exit_jet = evolve_jet_particle(px, py, pz, vx, vy, vz,
-                                            jet_phase, phase_stress, orb_phi,
-                                            state, coherent, residual, scale,
-                                            jet_phase_delta);
-        if (exit_jet) {
-            eject = false;
-        }
-    }
-
-    // ========================================================================
-    // STEP 13: BACKGROUND COUPLING (Ion Kick + Core Anchor)
-    // ========================================================================
-    // Math.md: These are the INTERACTION terms that enable emergence
-    // NOTE: r_cyl is already computed above, reuse it (no redundant sqrt)
-
-    // Global heartbeat for coherent breathing
-    float global_hb = cuda_lut_cos(time * 2.0f) * cuda_lut_cos3(time * 2.0f);
-
-    // Boundary recycling (may update r_cyl)
-    if (apply_boundary_recycle(px, py, pz, vx, vy, vz, r_cyl, global_hb, state, coherent)) {
-        r_cyl = ION_KICK_RESPAWN_R;
-        inv_r_cyl = 1.0f / ION_KICK_RESPAWN_R;
-    }
-
-    // Ion kick (Langevin noise - energy source) — 3D radial injection
-    apply_ion_kick(px, pz, r_cyl, global_hb, vx, vz, py, &vy, r3d);
-
-    // Core anchor (K factor gradient) — 3D radial pull
-    apply_core_anchor(px, pz, r_cyl, vx, vz, py, &vy, r3d);
-
-    // ========================================================================
-    // STEP 13b: KEPLERIAN ORBIT MAINTENANCE
-    // ========================================================================
-    // The angular momentum sink (Step 5), core anchor, and anisotropic damping
-    // create a net inward force budget that collapses shells into pillars over
-    // thousands of frames. Two corrections restore circular orbit equilibrium:
-    //
-    //   1. Tangential restore: nudge v_tangential toward v_kep = sqrt(M/r)
-    //   2. Radial damping: bleed radial velocity toward zero (circular orbit)
-    //
-    // Together these define the equilibrium as Keplerian circular orbits.
-    // Perturbations from the pump, ejection, and coupling still act freely —
-    // this just prevents the slow secular drift that has no physical source.
-    {
-        // Use local orbital frame (3D, not XZ projection)
-        float v_rad = vx * frx + vy * fry + vz * frz;  // 3D radial speed
-        float v_tan = vx * ftx + vy * fty + vz * ftz;  // 3D tangential speed
-        float v_kep = sqrtf(d_BH_MASS * inv_r3d);       // Keplerian at 3D radius
-
-        // Tangential restore: exponential approach to v_kep
-        float t_restore = KEPLER_RESTORE_RATE * dt;
-        float dv_tan = (v_kep - v_tan) * t_restore;
-        vx += dv_tan * ftx;
-        vy += dv_tan * fty;
-        vz += dv_tan * ftz;
-
-        // Radial damping: bleed radial velocity toward zero (circular orbit)
-        float r_damp = KEPLER_RESTORE_RATE * 0.5f * dt;
-        vx -= v_rad * r_damp * frx;
-        vy -= v_rad * r_damp * fry;
-        vz -= v_rad * r_damp * frz;
-    }
+    // STEPS 13, 13b: BOLTED-ON FORCES — ALL REMOVED
+    // Ion kick, core anchor, boundary recycling, Keplerian orbit maintenance
+    // were all independent hacks fighting the Viviani field. Orbits should
+    // emerge from the field's radial force balance, not be forced.
 
     // ========================================================================
     // STEP 14: ANISOTROPIC DISSIPATION (Energy Sink)
