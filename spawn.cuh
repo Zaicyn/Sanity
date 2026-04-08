@@ -141,7 +141,7 @@ __global__ void spawnParticlesKernel(
     rng = rng * 1664525u + 1013904223u;
     float vx_pert = ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.05f;
     rng = rng * 1664525u + 1013904223u;
-    float vy_pert = ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.05f;
+    float vy_pert = ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.01f;  // 5× less vertical noise — preserves disk
     rng = rng * 1664525u + 1013904223u;
     float vz_pert = ((float)(rng & 0xFFFF) / 65536.0f - 0.5f) * 0.05f;
 

@@ -184,9 +184,11 @@ __device__ __forceinline__ void apply_orbital_damping(
     float& vx, float& vy, float& vz)
 {
     if (r3d > SCHW_R * 2.0f && r3d < ION_KICK_OUTER_R) {
-        // Component of velocity perpendicular to orbital plane
+        // Component of velocity perpendicular to orbital plane.
+        // 10% damping per frame — strong enough to flatten spawned particles
+        // into the disk within ~10 frames despite spawn velocity noise.
         float v_normal = vx * lx + vy * ly + vz * lz;
-        float damping = 0.02f;
+        float damping = 0.10f;
         vx -= damping * v_normal * lx;
         vy -= damping * v_normal * ly;
         vz -= damping * v_normal * lz;
@@ -201,7 +203,7 @@ __device__ __forceinline__ void apply_disk_damping(
     if (fabsf(py) < DISK_THICKNESS * 3.0f &&
         r_cyl > SCHW_R * 2.0f &&
         r_cyl < ION_KICK_OUTER_R) {  // All 8 shells (max 174.0) within 200.0
-        float disk_damping = 0.02f * cuda_lut_repulsion_var(fabsf(py), DISK_THICKNESS);
+        float disk_damping = 0.10f * cuda_lut_repulsion_var(fabsf(py), DISK_THICKNESS);
         vy *= (1.0f - disk_damping);
     }
 }
