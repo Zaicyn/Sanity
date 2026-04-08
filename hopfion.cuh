@@ -22,6 +22,20 @@
 #pragma once
 
 #include "disk.cuh"
+#include "vram_config.cuh"  // d_grid_dim, d_grid_cells, d_grid_cell_size, d_grid_stride_y/z
+
+// Grid helper — needs GRID_HALF_SIZE and grid constants from cell_grid.cuh
+#include "cell_grid.cuh"
+
+#ifndef CELL_INDEX_FROM_POS_DEFINED
+#define CELL_INDEX_FROM_POS_DEFINED
+__device__ __forceinline__ uint32_t cellIndexFromPos(float px, float py, float pz) {
+    uint32_t cx = (uint32_t)fminf(fmaxf((px + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    uint32_t cy = (uint32_t)fminf(fmaxf((py + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    uint32_t cz = (uint32_t)fminf(fmaxf((pz + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    return cx + cy * d_grid_stride_y + cz * d_grid_stride_z;
+}
+#endif
 
 // ============================================================================
 // Compile-time constants (tune empirically before adding CLI flags)
@@ -312,6 +326,52 @@ inline bool run_hopfion_tests() {
 #endif // TEST_HOPFION
 
 // ============================================================================
+// Cell-level topo scatter — accumulate per-axis state sums per grid cell
+// ============================================================================
+// Same pattern as scatterParticlesToCells. Each particle atomically adds
+// its axis values to the cell's topo accumulators. The enforcement kernel
+// reads these to compute cell-average state for fusion and weight variance
+// for tension explosion.
+
+__global__ void scatterTopoToCells(
+    const GPUDisk* __restrict__ disk,
+    int N,
+    int* __restrict__ cell_topo_s,   // 4 arrays of GRID_CELLS ints, interleaved: [axis][cell]
+    int* __restrict__ cell_topo_cnt  // particle count per cell
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N || !particle_active(disk, i)) return;
+    if (disk->flags[i] & PFLAG_EJECTED) return;
+
+    uint8_t state = disk->topo_state[i];
+    if (state == TOPO_FROZEN) return;  // frozen particles don't contribute
+
+    uint32_t cell = cellIndexFromPos(disk->pos_x[i], disk->pos_y[i], disk->pos_z[i]);
+    if (cell >= (uint32_t)d_grid_cells) return;
+
+    for (int a = 0; a < 4; a++) {
+        int s = topo_get_axis(state, a);
+        if (s != 0) atomicAdd(&cell_topo_s[a * d_grid_cells + cell], s);
+    }
+    atomicAdd(&cell_topo_cnt[cell], 1);
+}
+
+// Clear cell topo buffers
+__global__ void clearTopoBuffers(
+    int* __restrict__ cell_topo_s,
+    int* __restrict__ cell_topo_cnt,
+    int total_cells
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total_cells) return;
+    cell_topo_s[0 * total_cells + i] = 0;
+    cell_topo_s[1 * total_cells + i] = 0;
+    cell_topo_s[2 * total_cells + i] = 0;
+    cell_topo_s[3 * total_cells + i] = 0;
+    cell_topo_cnt[i] = 0;
+}
+
+// ============================================================================
 // Enforcement Kernel — topological boundary conditions on the medium
 // ============================================================================
 // Runs AFTER siphonDiskKernel and advectPassiveParticles, BEFORE spawn.
@@ -331,8 +391,10 @@ __global__ void hopfionEnforceKernel(
     GPUDisk* disk,
     const uint8_t* __restrict__ in_active_region,
     int N,
+    const int* __restrict__ cell_topo_s,   // 4 × GRID_CELLS axis sums (nullptr before H5)
+    const int* __restrict__ cell_topo_cnt, // particle count per cell (nullptr before H5)
     int* __restrict__ d_Q_sum,
-    int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes
+    int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions
     float sim_time,
     float flip_rate_scale  // host-side recycling equilibrium multiplier
 ) {
@@ -347,11 +409,68 @@ __global__ void hopfionEnforceKernel(
 
     uint8_t state = disk->topo_state[i];
 
+    // Simple LCG RNG seeded from thread index + time
+    unsigned int rng = (unsigned int)(i * 2654435761u + __float_as_uint(sim_time));
+
     // Skip frozen particles
     if (state == TOPO_FROZEN) {
-        // Still accumulate Q (frozen = Q contribution locked)
-        // Frozen state has all reserved bits, Q_lut[0xFF] = 0
         goto reduce;
+    }
+
+    // --- Fusion: saturating add with cell-average topo state ---
+    if (cell_topo_cnt != nullptr) {
+        uint32_t cell = cellIndexFromPos(disk->pos_x[i], disk->pos_y[i], disk->pos_z[i]);
+        if (cell < (uint32_t)d_grid_cells) {
+            int cnt = cell_topo_cnt[cell];
+            if (cnt >= 2) {
+                // Compute cell-average topo state (rounded to nearest {-1,0,+1})
+                uint8_t cell_avg = 0;
+                for (int a = 0; a < 4; a++) {
+                    int sum = cell_topo_s[a * d_grid_cells + cell];
+                    // Round: if |sum/cnt| > 0.5, the axis is active in the cell average
+                    int avg = (2 * abs(sum) > cnt) ? (sum > 0 ? 1 : -1) : 0;
+                    cell_avg = topo_set_axis(cell_avg, a, avg);
+                }
+
+                // Fuse if cell average differs from current state AND result
+                // has at least as many axes (monotonic span growth)
+                uint8_t fused = hopfion_fusion(state, cell_avg);
+                if (fused != state && topo_dim(fused) >= topo_dim(state)) {
+                    // Stochastic: probability ∝ density / FUSION_DENSITY threshold
+                    float density = (float)cnt;
+                    float fuse_prob = fminf(density / (HOPFION_FUSION_DENSITY * 100.0f), 0.1f);
+                    rng = rng * 1664525u + 1013904223u;
+                    float r = (float)(rng & 0xFFFF) / 65536.0f;
+                    if (r < fuse_prob) {
+                        state = fused;
+                        atomicAdd(&d_operator_counts[2], 1);
+                    }
+                }
+
+                // --- Tension explosion: weight variance too high ---
+                // Approximate variance from axis sums: if axes are polarized
+                // (|sum| close to cnt) the cell is coherent; if near 0 despite
+                // high count, the cell has canceling orientations = tension
+                float coherence = 0.0f;
+                for (int a = 0; a < 4; a++) {
+                    int sum = cell_topo_s[a * d_grid_cells + cell];
+                    coherence += (float)(sum * sum) / (float)(cnt * cnt);
+                }
+                coherence *= 0.25f;  // normalize to [0,1]
+
+                float tension = 1.0f - coherence;  // high tension = low coherence
+                if (tension > HOPFION_T_CRIT && topo_dim(state) >= 3) {
+                    // Rate-limit: use cell-level atomic to allow max 1 ejection per cell
+                    // We don't have a per-cell flag array, so use stochastic rate-limiting
+                    rng = rng * 1664525u + 1013904223u;
+                    float r2 = (float)(rng & 0xFFFF) / 65536.0f;
+                    if (r2 < 0.001f) {  // Very low probability per particle → ~1 per cell
+                        disk->flags[i] |= PFLAG_EJECTED;
+                        atomicAdd(&d_operator_counts[3], 1);
+                    }
+                }
+            }
+        }
     }
 
     // --- Phason flip: stochastic relaxation ---
@@ -359,17 +478,14 @@ __global__ void hopfionEnforceKernel(
         float residual = fabsf(disk->pump_residual[i]);
         float flip_prob = HOPFION_FLIP_BASE_RATE * residual * flip_rate_scale;
 
-        // Simple LCG from thread index + sim_time for stochastic decision
-        unsigned int rng = (unsigned int)(i * 2654435761u + __float_as_uint(sim_time));
+        rng = rng * 1664525u + 1013904223u;
         float r = (float)(rng & 0xFFFF) / 65536.0f;
 
         if (r < flip_prob) {
-            // Pick random axis
             int axis = (int)((rng >> 16) & 0x03);
             int s = topo_get_axis(state, axis);
             if (s != 0) {
                 uint8_t flipped = hopfion_phason_flip(state, axis);
-                // Accept only if dim doesn't increase (relaxation, not excitation)
                 if (topo_dim(flipped) <= topo_dim(state)) {
                     state = flipped;
                     atomicAdd(&d_operator_counts[0], 1);
@@ -391,10 +507,8 @@ __global__ void hopfionEnforceKernel(
 reduce:
     // Warp-level Q reduction
     int q = (state == TOPO_FROZEN) ? 0 : topo_Q_fast(state);
-    // Warp shuffle reduction
     for (int offset = 16; offset > 0; offset >>= 1)
         q += __shfl_down_sync(0xFFFFFFFF, q, offset);
-    // Lane 0 of each warp does the atomicAdd
     if ((threadIdx.x & 31) == 0)
         atomicAdd(d_Q_sum, q);
 }

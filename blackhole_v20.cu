@@ -203,12 +203,15 @@ __device__ __forceinline__ uint32_t tileToFirstCell(uint32_t tile) {
     return (tx * TILE_DIM) + (ty * TILE_DIM) * d_grid_stride_y + (tz * TILE_DIM) * d_grid_stride_z;
 }
 
+#ifndef CELL_INDEX_FROM_POS_DEFINED
+#define CELL_INDEX_FROM_POS_DEFINED
 __device__ __forceinline__ uint32_t cellIndexFromPos(float px, float py, float pz) {
     uint32_t cx = (uint32_t)fminf(fmaxf((px + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     uint32_t cy = (uint32_t)fminf(fmaxf((py + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     uint32_t cz = (uint32_t)fminf(fmaxf((pz + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
     return cx + cy * d_grid_stride_y + cz * d_grid_stride_z;
 }
+#endif
 
 __device__ __forceinline__ void cellCoords(uint32_t cell, uint32_t* cx, uint32_t* cy, uint32_t* cz) {
     *cx = cell % d_grid_dim;
@@ -1037,11 +1040,15 @@ int main(int argc, char** argv) {
 
     // Hopfion enforcement buffers
     int* d_Q_sum = nullptr;
-    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes
+    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions
     int h_Q_sum = 0;
-    int h_operator_counts[2] = {};
+    int h_operator_counts[4] = {};
     int g_Q_target = 0;               // Set at frame 0, checked every frame
     float g_hopfion_flip_scale = 1.0f; // Recycling equilibrium multiplier
+
+    // Cell-level topo statistics for fusion/tension operators
+    int* d_cell_topo_s = nullptr;     // 4 × GRID_CELLS axis sums
+    int* d_cell_topo_cnt = nullptr;   // particle count per cell
 
     // Radial profile of R_cell — 16 bins from center to box edge
     const int RC_RADIAL_BINS = 16;
@@ -1187,10 +1194,14 @@ int main(int argc, char** argv) {
 
     // === HOPFION ENFORCEMENT BUFFERS ===
     cudaMalloc(&d_Q_sum, sizeof(int));
-    cudaMalloc(&d_operator_counts, 2 * sizeof(int));
+    cudaMalloc(&d_operator_counts, 4 * sizeof(int));
     cudaMemset(d_Q_sum, 0, sizeof(int));
-    cudaMemset(d_operator_counts, 0, 2 * sizeof(int));
-    printf("[hopfion] Enforcement buffers allocated (Q_sum + 2 operator counters)\n");
+    cudaMemset(d_operator_counts, 0, 4 * sizeof(int));
+    // Cell-level topo: 4 axis sums + 1 count per cell
+    cudaMalloc(&d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
+    cudaMalloc(&d_cell_topo_cnt, g_grid_cells * sizeof(int));
+    printf("[hopfion] Enforcement buffers allocated: Q_sum + 4 counters + cell topo (%.1f MB)\n",
+           (4 * g_grid_cells * sizeof(int) + g_grid_cells * sizeof(int)) / 1e6);
 
     // === TREE ARCHITECTURE STEP 2: bootstrap ActiveRegion ===
     // Allocate a small fixed-size array of ActiveRegion slots and seed
@@ -1343,14 +1354,22 @@ int main(int argc, char** argv) {
 #endif
 
             // === HOPFION ENFORCEMENT: topological boundary conditions ===
-            // Runs after all medium physics (siphon + passive), before spawn.
-            // Operators: phason flip (stochastic relaxation), iron freeze.
-            // Global Q accumulated via warp reduction.
-            cudaMemset(d_Q_sum, 0, sizeof(int));
-            cudaMemset(d_operator_counts, 0, 2 * sizeof(int));
-            hopfionEnforceKernel<<<spawn_blocks, threads>>>(
-                d_disk, d_in_active_region, N_current,
-                d_Q_sum, d_operator_counts, sim_time, g_hopfion_flip_scale);
+            // 1. Clear cell topo buffers
+            // 2. Scatter per-particle topo state to cell accumulators
+            // 3. Enforce: phason flip, fusion, tension explosion, iron freeze
+            {
+                int clear_blocks = (g_grid_cells + threads - 1) / threads;
+                clearTopoBuffers<<<clear_blocks, threads>>>(
+                    d_cell_topo_s, d_cell_topo_cnt, g_grid_cells);
+                scatterTopoToCells<<<spawn_blocks, threads>>>(
+                    d_disk, N_current, d_cell_topo_s, d_cell_topo_cnt);
+                cudaMemset(d_Q_sum, 0, sizeof(int));
+                cudaMemset(d_operator_counts, 0, 4 * sizeof(int));
+                hopfionEnforceKernel<<<spawn_blocks, threads>>>(
+                    d_disk, d_in_active_region, N_current,
+                    d_cell_topo_s, d_cell_topo_cnt,
+                    d_Q_sum, d_operator_counts, sim_time, g_hopfion_flip_scale);
+            }
 
             // === NATURAL GROWTH: Spawn new particles in coherent regions ===
             if (SPAWN_ENABLE && N_current < MAX_DISK_PTS) {
@@ -2756,15 +2775,16 @@ int main(int argc, char** argv) {
 
                 // Hopfion Q_discrete readback (one-frame lag is fine)
                 cudaMemcpy(&h_Q_sum, d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_operator_counts, d_operator_counts, 2 * sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_operator_counts, d_operator_counts, 4 * sizeof(int), cudaMemcpyDeviceToHost);
                 if (frame == 0) g_Q_target = h_Q_sum;  // Set conservation target on first read
                 if (h_Q_sum != g_Q_target) {
                     printf("[TOPO] Q DRIFT: %d → %d (Δ=%d) at frame %d\n",
                            g_Q_target, h_Q_sum, h_Q_sum - g_Q_target, frame);
                     g_Q_target = h_Q_sum;  // Update target (statistical conservation)
                 }
-                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d\n",
-                       frame, h_Q_sum, h_operator_counts[0], h_operator_counts[1]);
+                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d fusions=%d tensions=%d\n",
+                       frame, h_Q_sum, h_operator_counts[0], h_operator_counts[1],
+                       h_operator_counts[2], h_operator_counts[3]);
             }
 
             // === RING STABILITY DIAGNOSTIC ===
