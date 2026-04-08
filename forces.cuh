@@ -183,7 +183,7 @@ __device__ __forceinline__ void apply_orbital_damping(
     float r3d,
     float& vx, float& vy, float& vz)
 {
-    if (r3d > SCHW_R * 2.0f && r3d < 80.0f) {
+    if (r3d > SCHW_R * 2.0f && r3d < ION_KICK_OUTER_R) {
         // Component of velocity perpendicular to orbital plane
         float v_normal = vx * lx + vy * ly + vz * lz;
         float damping = 0.02f;
