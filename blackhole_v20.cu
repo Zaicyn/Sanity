@@ -1040,9 +1040,9 @@ int main(int argc, char** argv) {
 
     // Hopfion enforcement buffers
     int* d_Q_sum = nullptr;
-    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions
+    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions, [4]=vents
     int h_Q_sum = 0;
-    int h_operator_counts[4] = {};
+    int h_operator_counts[5] = {};
     int g_Q_target = 0;               // Set at frame 0, checked every frame
     float g_hopfion_flip_scale = 1.0f; // Recycling equilibrium multiplier
 
@@ -1194,9 +1194,9 @@ int main(int argc, char** argv) {
 
     // === HOPFION ENFORCEMENT BUFFERS ===
     cudaMalloc(&d_Q_sum, sizeof(int));
-    cudaMalloc(&d_operator_counts, 4 * sizeof(int));
+    cudaMalloc(&d_operator_counts, 5 * sizeof(int));
     cudaMemset(d_Q_sum, 0, sizeof(int));
-    cudaMemset(d_operator_counts, 0, 4 * sizeof(int));
+    cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
     // Cell-level topo: 4 axis sums + 1 count per cell
     cudaMalloc(&d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
     cudaMalloc(&d_cell_topo_cnt, g_grid_cells * sizeof(int));
@@ -1364,7 +1364,7 @@ int main(int argc, char** argv) {
                 scatterTopoToCells<<<spawn_blocks, threads>>>(
                     d_disk, N_current, d_cell_topo_s, d_cell_topo_cnt);
                 cudaMemset(d_Q_sum, 0, sizeof(int));
-                cudaMemset(d_operator_counts, 0, 4 * sizeof(int));
+                cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
                 hopfionEnforceKernel<<<spawn_blocks, threads>>>(
                     d_disk, d_in_active_region, N_current,
                     d_cell_topo_s, d_cell_topo_cnt,
@@ -2775,16 +2775,26 @@ int main(int argc, char** argv) {
 
                 // Hopfion Q_discrete readback (one-frame lag is fine)
                 cudaMemcpy(&h_Q_sum, d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_operator_counts, d_operator_counts, 4 * sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_operator_counts, d_operator_counts, 5 * sizeof(int), cudaMemcpyDeviceToHost);
                 if (frame == 0) g_Q_target = h_Q_sum;  // Set conservation target on first read
                 if (h_Q_sum != g_Q_target) {
                     printf("[TOPO] Q DRIFT: %d → %d (Δ=%d) at frame %d\n",
                            g_Q_target, h_Q_sum, h_Q_sum - g_Q_target, frame);
                     g_Q_target = h_Q_sum;  // Update target (statistical conservation)
                 }
-                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d fusions=%d tensions=%d\n",
+                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d fusions=%d tensions=%d vents=%d\n",
                        frame, h_Q_sum, h_operator_counts[0], h_operator_counts[1],
-                       h_operator_counts[2], h_operator_counts[3]);
+                       h_operator_counts[2], h_operator_counts[3], h_operator_counts[4]);
+
+                // Recycling equilibrium: adjust phason flip rate to balance fusion/vent
+                int fusions = h_operator_counts[2];
+                int vents = h_operator_counts[4];
+                if (fusions > 0 && vents > 0) {
+                    float ratio = (float)fusions / (float)vents;
+                    // If fusion >> vent, increase flips (more relaxation to shed complexity)
+                    // If vent >> fusion, decrease flips (let complexity build)
+                    g_hopfion_flip_scale = fminf(fmaxf(ratio, 0.1f), 10.0f);
+                }
             }
 
             // === RING STABILITY DIAGNOSTIC ===

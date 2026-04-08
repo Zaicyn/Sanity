@@ -394,7 +394,7 @@ __global__ void hopfionEnforceKernel(
     const int* __restrict__ cell_topo_s,   // 4 × GRID_CELLS axis sums (nullptr before H5)
     const int* __restrict__ cell_topo_cnt, // particle count per cell (nullptr before H5)
     int* __restrict__ d_Q_sum,
-    int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions
+    int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions, [4]=vents
     float sim_time,
     float flip_rate_scale  // host-side recycling equilibrium multiplier
 ) {
@@ -492,6 +492,16 @@ __global__ void hopfionEnforceKernel(
                 }
             }
         }
+    }
+
+    // --- Venting: dim-4 + high history → mark for spawn with opposite-helicity child ---
+    // Piggybacked on spawn infrastructure via PFLAG_VENT_PENDING. The spawn kernel
+    // checks this flag and uses hopfion_vent() for the child's topo_state.
+    if (topo_dim(state) == 4 &&
+        disk->pump_history[i] > HOPFION_VENT_HISTORY &&
+        !(disk->flags[i] & PFLAG_VENT_PENDING)) {
+        disk->flags[i] |= PFLAG_VENT_PENDING;
+        atomicAdd(&d_operator_counts[4], 1);
     }
 
     // --- Iron freeze: dim-4 + idle + exhausted history ---

@@ -47,9 +47,13 @@ __global__ void spawnParticlesKernel(
     // vel_y on default stream.
     if (in_active_region && !in_active_region[i]) return;
 
+    // Check for topological vent override (enforcement kernel set PFLAG_VENT_PENDING)
+    bool vent_pending = (disk->flags[i] & PFLAG_VENT_PENDING) != 0;
+
     // Only coherent particles can spawn (sustained pumping = gravitationally bound)
+    // Exception: vent-pending particles MUST spawn regardless of history
     float history = disk->pump_history[i];
-    if (history < SPAWN_COHERENCE_THRESH) return;
+    if (!vent_pending && history < SPAWN_COHERENCE_THRESH) return;
 
     // Spawn probability scales with pump_scale (high D = more accretion = more spawn)
     float scale = disk->pump_scale[i];
@@ -172,21 +176,42 @@ __global__ void spawnParticlesKernel(
     // Activate the new particle
     disk->flags[new_idx] = PFLAG_ACTIVE;  // active, not ejected
 
-    // Hopfion topo_state: child inherits parent's state with one axis negated.
-    // Single-axis children (from phason flip of single-axis parent) have Q=0.
-    // Multi-axis parents: try each nonzero axis, pick first that keeps Q valid.
+    // Hopfion topo_state: depends on whether this is a topological vent or normal spawn
     uint8_t parent_topo = disk->topo_state[i];
     uint8_t child_topo = parent_topo;  // fallback: exact copy
-    int parent_dim = topo_dim(parent_topo);
-    if (parent_dim > 0) {
-        // Pick a random nonzero axis to flip on the child
+
+    if (vent_pending) {
+        // Topological venting: drop one axis from parent, child gets opposite sign.
+        // Pick the axis with largest contribution (random if tied).
         rng = rng * 1664525u + 1013904223u;
-        int start_axis = (int)(rng & 0x03);  // random start 0-3
+        int best_axis = -1;
+        int start = (int)(rng & 0x03);
         for (int tries = 0; tries < 4; tries++) {
-            int a = (start_axis + tries) & 0x03;
+            int a = (start + tries) & 0x03;
             if (topo_get_axis(parent_topo, a) != 0) {
-                child_topo = hopfion_phason_flip(parent_topo, a);
+                best_axis = a;
                 break;
+            }
+        }
+        if (best_axis >= 0) {
+            VentResult vr = hopfion_vent(parent_topo, best_axis);
+            disk->topo_state[i] = vr.parent_new;  // Parent loses axis
+            child_topo = vr.child;                 // Child gets opposite-sign single axis
+        }
+        // Clear vent flag
+        disk->flags[i] &= ~(uint8_t)PFLAG_VENT_PENDING;
+    } else {
+        // Normal spawn: child inherits parent's state with one axis negated (phason flip)
+        int parent_dim = topo_dim(parent_topo);
+        if (parent_dim > 0) {
+            rng = rng * 1664525u + 1013904223u;
+            int start_axis = (int)(rng & 0x03);
+            for (int tries = 0; tries < 4; tries++) {
+                int a = (start_axis + tries) & 0x03;
+                if (topo_get_axis(parent_topo, a) != 0) {
+                    child_topo = hopfion_phason_flip(parent_topo, a);
+                    break;
+                }
             }
         }
     }
