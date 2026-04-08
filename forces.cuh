@@ -184,14 +184,20 @@ __device__ __forceinline__ void apply_orbital_damping(
     float& vx, float& vy, float& vz)
 {
     if (r3d > SCHW_R * 2.0f && r3d < ION_KICK_OUTER_R) {
-        // Component of velocity perpendicular to orbital plane.
-        // 10% damping per frame — strong enough to flatten spawned particles
-        // into the disk within ~10 frames despite spawn velocity noise.
-        float v_normal = vx * lx + vy * ly + vz * lz;
-        float damping = 0.10f;
-        vx -= damping * v_normal * lx;
-        vy -= damping * v_normal * ly;
-        vz -= damping * v_normal * lz;
+        // Only damp if L is well-defined (particle is actually orbiting).
+        // When |L| is small, L_hat is garbage and damping kills all velocity.
+        float L_sq = lx*lx + ly*ly + lz*lz;  // L_hat is already normalized, but check input L
+        float v_sq = vx*vx + vy*vy + vz*vz;
+        // Skip if velocity is too low to define an orbital plane
+        if (v_sq > 0.001f) {
+            float v_normal = vx * lx + vy * ly + vz * lz;
+            // 10% damping per frame — strong enough to flatten spawned particles
+            // into the disk within ~10 frames despite spawn velocity noise.
+            float damping = 0.10f;
+            vx -= damping * v_normal * lx;
+            vy -= damping * v_normal * ly;
+            vz -= damping * v_normal * lz;
+        }
     }
 }
 
