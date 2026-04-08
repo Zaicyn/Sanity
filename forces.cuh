@@ -200,7 +200,7 @@ __device__ __forceinline__ void apply_disk_damping(
 {
     if (fabsf(py) < DISK_THICKNESS * 3.0f &&
         r_cyl > SCHW_R * 2.0f &&
-        r_cyl < 80.0f) {
+        r_cyl < ION_KICK_OUTER_R) {  // All 8 shells (max 174.0) within 200.0
         float disk_damping = 0.02f * cuda_lut_repulsion_var(fabsf(py), DISK_THICKNESS);
         vy *= (1.0f - disk_damping);
     }

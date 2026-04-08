@@ -89,10 +89,10 @@ __device__ float cuda_fast_atan2(float y, float x);
 #define ION_KICK_INNER_R      50.0f   // Start outer ion kick at this radius
 #endif
 #ifndef ION_KICK_OUTER_R
-#define ION_KICK_OUTER_R      200.0f  // Recycle particles beyond this radius
+#define ION_KICK_OUTER_R      250.0f  // Recycle particles beyond this radius (outside shell 7 at 174)
 #endif
 #ifndef ION_KICK_RESPAWN_R
-#define ION_KICK_RESPAWN_R    150.0f  // Respawn recycled particles here
+#define ION_KICK_RESPAWN_R    190.0f  // Respawn recycled particles here (above shell 7 at 174)
 #endif
 
 // Core anchor: 1/(1+r²) attractor — only active outside shells to return escapees.
