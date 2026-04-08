@@ -119,7 +119,7 @@ __device__ float cuda_fast_atan2(float y, float x);
 #define SPAWN_COHERENCE_THRESH 0.7f
 #endif
 #ifndef SPAWN_PROB_BASE
-#define SPAWN_PROB_BASE       0.00001f
+#define SPAWN_PROB_BASE       0.001f    // Legacy: no longer used for spawn gating (deterministic now)
 #endif
 #ifndef SPAWN_SCALE_BOOST
 #define SPAWN_SCALE_BOOST     2.0f

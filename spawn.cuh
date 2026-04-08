@@ -50,21 +50,23 @@ __global__ void spawnParticlesKernel(
     // Check for topological vent override (enforcement kernel set PFLAG_VENT_PENDING)
     bool vent_pending = (disk->flags[i] & PFLAG_VENT_PENDING) != 0;
 
-    // Only coherent particles can spawn (sustained pumping = gravitationally bound)
-    // Exception: vent-pending particles MUST spawn regardless of history
+    // Spawn decision is deterministic from the physics:
+    //   - Pump history > threshold (sustained coherent pumping = gravitationally bound)
+    //   - Pump residual > threshold (energy overflow from completed pump cycle)
+    //   - OR topological vent pending (hopfion dim-4 overflow)
+    // No random probability gate — the siphon pump state machine and
+    // hopfion algebra already determine WHEN spawning should happen.
     float history = disk->pump_history[i];
-    if (!vent_pending && history < SPAWN_COHERENCE_THRESH) return;
-
-    // Spawn probability scales with pump_scale (high D = more accretion = more spawn)
     float scale = disk->pump_scale[i];
-    float spawn_prob = SPAWN_PROB_BASE * (1.0f + scale * SPAWN_SCALE_BOOST);
+    float residual = fabsf(disk->pump_residual[i]);
+    if (!vent_pending) {
+        if (history < SPAWN_COHERENCE_THRESH) return;  // not coherent enough
+        if (residual < 0.01f) return;  // no energy overflow — pump hasn't completed a cycle
+    }
 
-    // Simple LCG random for spawn decision (per-particle, per-frame)
+    // RNG for position/velocity perturbation only
     unsigned int rng = seed ^ (i * 1664525u + 1013904223u);
     rng = rng * 1664525u + 1013904223u;
-    float rand_val = (float)(rng & 0xFFFFFF) / 16777216.0f;
-
-    if (rand_val > spawn_prob) return;
 
     // === ENERGY BUDGET CHECK ===
     // Compute parent's current energy
