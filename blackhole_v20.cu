@@ -47,6 +47,7 @@
 #include "sun_trace.cuh"              // VulkanSunTrace, d_shell_radii[8]
 #include "passive_advection.cuh"      // Passive Keplerian advection kernel
 #include "active_region.cuh"          // ActiveRegion struct + in-region mask kernel
+#include "hopfion.cuh"                // Topological reaction algebra + Q LUT
 
 // ============================================================================
 // Spatial Data Structures
@@ -260,6 +261,7 @@ int main(int argc, char** argv) {
     cuda_lut_init();                    // Quarter-sector sine table (2KB)
     cuda_lut_gaussian_init(12.0f);      // Gaussian exp(-r²/2σ²) for density (σ=12)
     cuda_lut_repulsion_init(6.0f);      // Repulsion exp(-r/λ) for soft forces (λ=6)
+    init_Q_lut();                       // Hopfion discrete helicity LUT (256 bytes)
 
     // Clamp user-requested particles to VRAM-safe limit
     if (num_particles > g_runtime_particle_cap) {
