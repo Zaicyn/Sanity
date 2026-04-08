@@ -1418,7 +1418,7 @@ int main(int argc, char** argv) {
                     unsigned int spawn_seed = (unsigned int)(frame * 12345 + (int)(sim_time * 1000));
                     spawnParticlesKernel<<<spawn_blocks, threads, 0, spawn_stream>>>(
                         d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed,
-                        d_in_active_region
+                        d_in_active_region, d_grid_density
                     );
 
                     // Async copy spawn count (will be read NEXT frame)

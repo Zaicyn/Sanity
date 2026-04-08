@@ -36,7 +36,8 @@ __global__ void spawnParticlesKernel(
     unsigned int* spawn_success, // V8-style: counts SUCCESSFUL spawns only
     float time,
     unsigned int seed,       // Per-frame random seed
-    const uint8_t* __restrict__ in_active_region  // Step 3: skip passive parents
+    const uint8_t* __restrict__ in_active_region,  // Step 3: skip passive parents
+    const float* __restrict__ grid_density  // Cell density for Toomre Q (may be 1-30 frames stale, fine)
 ) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_current || !particle_active(disk, i)) return;
@@ -50,18 +51,56 @@ __global__ void spawnParticlesKernel(
     // Check for topological vent override (enforcement kernel set PFLAG_VENT_PENDING)
     bool vent_pending = (disk->flags[i] & PFLAG_VENT_PENDING) != 0;
 
-    // Spawn decision is deterministic from the physics:
-    //   - Pump history > threshold (sustained coherent pumping = gravitationally bound)
-    //   - Pump residual > threshold (energy overflow from completed pump cycle)
-    //   - OR topological vent pending (hopfion dim-4 overflow)
-    // No random probability gate — the siphon pump state machine and
-    // hopfion algebra already determine WHEN spawning should happen.
+    // === TOOMRE INSTABILITY CRITERION ===
+    // Fragmentation occurs when Q = c_s × κ / (π × G × Σ) < 1
+    //
+    //   c_s = local "sound speed" = velocity dispersion ≈ |pump_residual|
+    //         (thermal/turbulent energy not organized by the pump)
+    //   κ   = epicyclic frequency = √(BH_MASS / r³) for Keplerian orbits
+    //   Σ   = surface density ≈ ρ_cell × cell_size (project volume to surface)
+    //   G   = field strength = FIELD_FORCE_STRENGTH
+    //
+    // When gravity overwhelms pressure support at the local density,
+    // the disk fragments. This IS the star formation mechanism.
+
     float history = disk->pump_history[i];
     float scale = disk->pump_scale[i];
-    float residual = fabsf(disk->pump_residual[i]);
+
     if (!vent_pending) {
-        if (history < SPAWN_COHERENCE_THRESH) return;  // not coherent enough
-        if (residual < 0.01f) return;  // no energy overflow — pump hasn't completed a cycle
+        // Must have sustained pumping (gravitationally bound region)
+        if (history < SPAWN_COHERENCE_THRESH) return;
+
+        // Compute Toomre Q from local conditions
+        float px = disk->pos_x[i];
+        float py = disk->pos_y[i];
+        float pz = disk->pos_z[i];
+        float r_cyl = sqrtf(px*px + pz*pz);
+        float r3d = sqrtf(px*px + py*py + pz*pz);
+        float r_safe = fmaxf(r3d, ISCO_R);
+
+        // Epicyclic frequency κ = √(BH_MASS / r³)
+        float kappa = sqrtf(BH_MASS / (r_safe * r_safe * r_safe));
+
+        // Sound speed proxy: pump residual = unorganized thermal energy
+        // Higher residual = more pressure support = harder to fragment
+        float c_s = fabsf(disk->pump_residual[i]) + 0.01f;  // floor prevents div/0
+
+        // Surface density from grid (project volume density through cell height)
+        float Sigma = 1.0f;  // default if no grid available
+        if (grid_density != nullptr) {
+            uint32_t cell = cellIndexFromPos(px, py, pz);
+            if (cell < (uint32_t)d_grid_cells) {
+                float rho = grid_density[cell];
+                Sigma = rho * d_grid_cell_size;  // Σ ≈ ρ × h (thin disk projection)
+            }
+        }
+
+        // Toomre Q: stability parameter
+        // Q < 1 → gravitational instability → fragmentation → spawn
+        // Q > 1 → pressure-supported → stable → no spawn
+        float Q = c_s * kappa / (3.14159f * FIELD_FORCE_STRENGTH * fmaxf(Sigma, 0.1f));
+
+        if (Q >= 1.0f) return;  // stable — no fragmentation
     }
 
     // RNG for position/velocity perturbation only
