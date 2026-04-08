@@ -703,16 +703,17 @@ int main(int argc, char** argv) {
         h_py[i] = y;
         h_pz[i] = z;
 
-        // Initial velocity: Keplerian tangential + thermal noise.
-        // --shell-init uses full Keplerian (1.0×); legacy uses 0.3×.
+        // Initial velocity: full Keplerian tangential + thermal noise.
+        // Particles must orbit at ~100% Keplerian to establish the angular
+        // momentum that flattens the system into a disk. 30% was too slow —
+        // insufficient L means no disk, just a round blob.
         float r_xz = sqrtf(x*x + z*z);
         if (r_xz > 0.1f) {
             float rot_sign = g_retrograde_init ? -1.0f : 1.0f;
-            float v_frac = g_shell_init ? 1.0f : 0.3f;
-            float v_rot = rot_sign * v_frac * sqrtf(BH_MASS / fmaxf(r_xz, ISCO_R));
-            float thermal = g_shell_init ? 0.01f : 0.05f;
+            float v_rot = rot_sign * sqrtf(BH_MASS / fmaxf(r_xz, ISCO_R));
+            float thermal = 0.02f;
             h_vx[i] = -v_rot * (z / r_xz) + rnorm(rng) * thermal;
-            h_vy[i] = rnorm(rng) * (g_shell_init ? 0.005f : 0.03f);
+            h_vy[i] = rnorm(rng) * 0.005f;  // minimal vertical — disk plane
             h_vz[i] = v_rot * (x / r_xz) + rnorm(rng) * thermal;
         } else {
             h_vx[i] = rnorm(rng) * 0.05f;
