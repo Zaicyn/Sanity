@@ -283,7 +283,7 @@ int main(int argc, char** argv) {
     VulkanContext vkCtx;
     // Allocate for full growth potential — spawning can grow 5-10x from seed
     // Using MAX_DISK_PTS ensures buffer never overflows regardless of growth
-    int max_render_particles = MAX_DISK_PTS;
+    int max_render_particles = g_runtime_particle_cap;  // VRAM-safe cap, not compile-time MAX_DISK_PTS
     vkCtx.particleCount = max_render_particles;
 
     // Initialize GLFW for Vulkan (no OpenGL context)
