@@ -179,8 +179,9 @@ __global__ void siphonDiskKernel(
     vy += ay * dt;
     vz += az * dt;
 
-    // Angular momentum sink
-    apply_angular_momentum_sink(px, py, pz, r_safe, vx, vy, vz);
+    // Angular momentum sink REMOVED — the Viviani field self-regulates
+    // through its topology. The sink was draining tangential velocity
+    // with no physical basis in the waveform gravity framework.
 
     px += vx * dt;
     py += vy * dt;

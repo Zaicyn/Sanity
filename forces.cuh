@@ -214,42 +214,10 @@ __device__ __forceinline__ void apply_disk_damping(
     }
 }
 
-// ============================================================================
-// Angular Momentum Sink
-// ============================================================================
-// 1% damping per frame at r=50 (scales as r²).
-// Prevents runaway angular momentum accumulation.
-
-__device__ __forceinline__ void apply_angular_momentum_sink(
-    float px, float py, float pz,
-    float r_safe,
-    float& vx, float& vy, float& vz)
-{
-    // Radial unit vector
-    float inv_r = 1.0f / r_safe;
-    float rx = px * inv_r;
-    float ry = py * inv_r;
-    float rz = pz * inv_r;
-
-    // Radial velocity component
-    float v_radial = vx * rx + vy * ry + vz * rz;
-
-    // Tangential velocity
-    float v_tan_x = vx - v_radial * rx;
-    float v_tan_y = vy - v_radial * ry;
-    float v_tan_z = vz - v_radial * rz;
-
-    // Sink strength scales with r²
-    const float L_sink_radius = 50.0f;
-    const float L_sink_strength = 0.01f;
-    float L_sink_factor = L_sink_strength * (r_safe * r_safe) / (L_sink_radius * L_sink_radius);
-    L_sink_factor = fminf(L_sink_factor, 0.05f);  // Cap at 5%
-
-    // Apply sink to tangential velocity only
-    vx -= v_tan_x * L_sink_factor;
-    vy -= v_tan_y * L_sink_factor;
-    vz -= v_tan_z * L_sink_factor;
-}
+// Angular momentum sink REMOVED — the Viviani field self-regulates
+// through its topology. The sink drained 1-5% of tangential velocity
+// per frame (scaling as r²) with no energy source to replenish it,
+// causing all orbits to decay to zero velocity within ~60 frames.
 
 // ============================================================================
 // Ion Kick: Langevin Noise Term (σR(t))
