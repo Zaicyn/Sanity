@@ -76,9 +76,9 @@ inline void dispatchCorePhysics(
             d_cell_topo_s, d_cell_topo_cnt, g_grid_cells);
         scatterTopoToCells<<<spawn_blocks, threads>>>(
             d_disk, N_current, d_cell_topo_s, d_cell_topo_cnt);
-        cudaMemset(d_Q_sum, 0, sizeof(int));
-        cudaMemset(static_cast<int*>(ctx.topology.buf_Q_delta_sum), 0, sizeof(int));
-        cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
+        V21_MEMSET(d_Q_sum, 0, sizeof(int));
+        V21_MEMSET(static_cast<int*>(ctx.topology.buf_Q_delta_sum), 0, sizeof(int));
+        V21_MEMSET(d_operator_counts, 0, 5 * sizeof(int));
         hopfionEnforceKernel<<<spawn_blocks, threads>>>(
             d_disk, d_in_active_region, N_current,
             d_cell_topo_s, d_cell_topo_cnt,

@@ -4,7 +4,7 @@
 // Each function populates a subsystem of the SimulationContext.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "V21/core/v21_mem.h"
 #include <vector>
 #include <random>
 #include <cstdio>
@@ -149,11 +149,11 @@ inline GPUDisk* initParticles(SimulationContext& ctx, int N, unsigned int seed) 
 
     // GPU allocation and upload
     GPUDisk* d_disk;
-    cudaMalloc(&d_disk, sizeof(GPUDisk));
-    cudaMemset(d_disk, 0, sizeof(GPUDisk));
+    V21_MALLOC(&d_disk, sizeof(GPUDisk));
+    V21_MEMSET(d_disk, 0, sizeof(GPUDisk));
 
     #define UPLOAD(field, hvec) \
-    cudaMemcpy((char*)d_disk + offsetof(GPUDisk, field), hvec.data(), N*sizeof(hvec[0]), cudaMemcpyHostToDevice)
+    V21_MEMCPY((char*)d_disk + offsetof(GPUDisk, field), hvec.data(), N*sizeof(hvec[0]), V21_MEMCPY_H2D)
 
     UPLOAD(pos_x, h_px);    UPLOAD(pos_y, h_py);    UPLOAD(pos_z, h_pz);
     UPLOAD(vel_x, h_vx);    UPLOAD(vel_y, h_vy);    UPLOAD(vel_z, h_vz);
@@ -213,50 +213,50 @@ inline DiagnosticLocals initDiagnostics(SimulationContext& ctx, int N) {
     DiagnosticLocals d = {};
 
     // Stress counters
-    cudaMalloc(&d.d_stress, sizeof(StressCounters));
-    cudaMalloc(&d.d_stress_async, sizeof(StressCounters));
+    V21_MALLOC(&d.d_stress, sizeof(StressCounters));
+    V21_MALLOC(&d.d_stress_async, sizeof(StressCounters));
 
     // Kuramoto reduction buffers
     const int KR_THREADS = 256;
     d.kr_max_blocks = (ctx.particles.particle_cap + KR_THREADS - 1) / KR_THREADS;
-    cudaMalloc(&d.d_kr_sin_sum, d.kr_max_blocks * sizeof(float));
-    cudaMalloc(&d.d_kr_cos_sum, d.kr_max_blocks * sizeof(float));
-    cudaMalloc(&d.d_kr_count, d.kr_max_blocks * sizeof(int));
+    V21_MALLOC(&d.d_kr_sin_sum, d.kr_max_blocks * sizeof(float));
+    V21_MALLOC(&d.d_kr_cos_sum, d.kr_max_blocks * sizeof(float));
+    V21_MALLOC(&d.d_kr_count, d.kr_max_blocks * sizeof(int));
 
     // Phase histogram
-    cudaMalloc(&d.d_phase_hist, PHASE_HIST_BINS * sizeof(int));
-    cudaMalloc(&d.d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float));
-    cudaMalloc(&d.d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float));
+    V21_MALLOC(&d.d_phase_hist, PHASE_HIST_BINS * sizeof(int));
+    V21_MALLOC(&d.d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float));
+    V21_MALLOC(&d.d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float));
 
     // Spawn counters
-    cudaMalloc(&d.d_spawn_idx, sizeof(unsigned int));
-    cudaMalloc(&d.d_spawn_success, sizeof(unsigned int));
-    cudaMemset(d.d_spawn_idx, 0, sizeof(unsigned int));
-    cudaMemset(d.d_spawn_success, 0, sizeof(unsigned int));
+    V21_MALLOC(&d.d_spawn_idx, sizeof(unsigned int));
+    V21_MALLOC(&d.d_spawn_success, sizeof(unsigned int));
+    V21_MEMSET(d.d_spawn_idx, 0, sizeof(unsigned int));
+    V21_MEMSET(d.d_spawn_success, 0, sizeof(unsigned int));
 
     // Stratified sampling
     std::vector<int> h_sample_indices(SAMPLE_COUNT);
     for (int i = 0; i < SAMPLE_COUNT; i++)
         h_sample_indices[i] = (i * N) / SAMPLE_COUNT;
-    cudaMalloc(&d.d_sample_indices, SAMPLE_COUNT * sizeof(int));
+    V21_MALLOC(&d.d_sample_indices, SAMPLE_COUNT * sizeof(int));
     cudaMemcpy(d.d_sample_indices, h_sample_indices.data(),
                SAMPLE_COUNT * sizeof(int), cudaMemcpyHostToDevice);
 
     // Double-buffered sample metrics
-    cudaMalloc(&d.d_sample_metrics[0], sizeof(SampleMetrics));
-    cudaMalloc(&d.d_sample_metrics[1], sizeof(SampleMetrics));
-    cudaMallocHost(&d.h_sample_metrics, sizeof(SampleMetrics));
+    V21_MALLOC(&d.d_sample_metrics[0], sizeof(SampleMetrics));
+    V21_MALLOC(&d.d_sample_metrics[1], sizeof(SampleMetrics));
+    V21_MALLOC_HOST(&d.h_sample_metrics, sizeof(SampleMetrics));
     d.h_sample_metrics->avg_scale = 1.0f;
     d.h_sample_metrics->avg_residual = 0.0f;
     d.h_sample_metrics->total_work = 0.0f;
 
     // Async streams and events
-    cudaStreamCreate(&d.sample_stream);
-    cudaStreamCreate(&d.stats_stream);
-    cudaEventCreate(&d.stats_ready);
-    cudaStreamCreate(&d.spawn_stream);
-    cudaEventCreate(&d.spawn_ready);
-    cudaMallocHost(&d.h_spawn_pinned, sizeof(unsigned int));
+    V21_STREAM_CREATE(&d.sample_stream);
+    V21_STREAM_CREATE(&d.stats_stream);
+    V21_EVENT_CREATE(&d.stats_ready);
+    V21_STREAM_CREATE(&d.spawn_stream);
+    V21_EVENT_CREATE(&d.spawn_ready);
+    V21_MALLOC_HOST(&d.h_spawn_pinned, sizeof(unsigned int));
     *d.h_spawn_pinned = 0;
 
     d.h_stats_cache = {};
@@ -353,31 +353,31 @@ inline OctreeLocals initOctree(SimulationContext& ctx) {
     if (o.morton_capacity > MAX_DISK_PTS) o.morton_capacity = MAX_DISK_PTS;
 
     if (o.octreeEnabled) {
-        cudaMalloc(&o.d_morton_keys, o.morton_capacity * sizeof(uint64_t));
-        cudaMalloc(&o.d_xor_corners, o.morton_capacity * sizeof(uint32_t));
-        cudaMalloc(&o.d_particle_ids, o.morton_capacity * sizeof(uint32_t));
-        cudaMalloc(&o.d_octree_nodes, OCTREE_MAX_NODES * sizeof(OctreeNode));
-        cudaMalloc(&o.d_node_count, sizeof(uint32_t));
-        cudaMemset(o.d_node_count, 0, sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_counts, OCTREE_MAX_NODES * sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_counts_culled, OCTREE_MAX_NODES * sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_offsets, OCTREE_MAX_NODES * sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_node_indices, OCTREE_MAX_NODES * sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_node_count, sizeof(uint32_t));
-        cudaMalloc(&o.d_leaf_vel_x, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&o.d_leaf_vel_y, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&o.d_leaf_vel_z, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&o.d_leaf_phase, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&o.d_leaf_frequency, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&o.d_leaf_coherence, OCTREE_MAX_NODES * sizeof(float));
-        cudaMemset(o.d_leaf_phase, 0, OCTREE_MAX_NODES * sizeof(float));
-        cudaMemset(o.d_leaf_frequency, 0, OCTREE_MAX_NODES * sizeof(float));
-        cudaMemset(o.d_leaf_coherence, 0, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_morton_keys, o.morton_capacity * sizeof(uint64_t));
+        V21_MALLOC(&o.d_xor_corners, o.morton_capacity * sizeof(uint32_t));
+        V21_MALLOC(&o.d_particle_ids, o.morton_capacity * sizeof(uint32_t));
+        V21_MALLOC(&o.d_octree_nodes, OCTREE_MAX_NODES * sizeof(OctreeNode));
+        V21_MALLOC(&o.d_node_count, sizeof(uint32_t));
+        V21_MEMSET(o.d_node_count, 0, sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_counts, OCTREE_MAX_NODES * sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_counts_culled, OCTREE_MAX_NODES * sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_offsets, OCTREE_MAX_NODES * sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_node_indices, OCTREE_MAX_NODES * sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_node_count, sizeof(uint32_t));
+        V21_MALLOC(&o.d_leaf_vel_x, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_leaf_vel_y, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_leaf_vel_z, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_leaf_phase, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_leaf_frequency, OCTREE_MAX_NODES * sizeof(float));
+        V21_MALLOC(&o.d_leaf_coherence, OCTREE_MAX_NODES * sizeof(float));
+        V21_MEMSET(o.d_leaf_phase, 0, OCTREE_MAX_NODES * sizeof(float));
+        V21_MEMSET(o.d_leaf_frequency, 0, OCTREE_MAX_NODES * sizeof(float));
+        V21_MEMSET(o.d_leaf_coherence, 0, OCTREE_MAX_NODES * sizeof(float));
 
         o.h_leaf_hash_size = 262144;
-        cudaMalloc(&o.d_leaf_hash_keys, o.h_leaf_hash_size * sizeof(uint64_t));
-        cudaMalloc(&o.d_leaf_hash_values, o.h_leaf_hash_size * sizeof(uint32_t));
-        cudaMemset(o.d_leaf_hash_keys, 0xFF, o.h_leaf_hash_size * sizeof(uint64_t));
+        V21_MALLOC(&o.d_leaf_hash_keys, o.h_leaf_hash_size * sizeof(uint64_t));
+        V21_MALLOC(&o.d_leaf_hash_values, o.h_leaf_hash_size * sizeof(uint32_t));
+        V21_MEMSET(o.d_leaf_hash_keys, 0xFF, o.h_leaf_hash_size * sizeof(uint64_t));
 
         printf("[octree] Allocated: morton cap=%d (%.1f MB), nodes=%zuMB\n",
                o.morton_capacity, o.morton_capacity * 16 / 1e6,
@@ -392,8 +392,8 @@ inline OctreeLocals initOctree(SimulationContext& ctx) {
         buildAnalyticTree<<<analyticBlocks, 256>>>(
             o.d_octree_nodes, o.d_node_count, boxSize, 0.0f, ANALYTIC_MAX_LEVEL
         );
-        cudaDeviceSynchronize();
-        cudaMemcpy(&o.h_analytic_node_count, o.d_node_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        V21_SYNC();
+        V21_MEMCPY(&o.h_analytic_node_count, o.d_node_count, sizeof(uint32_t), V21_MEMCPY_D2H);
         printf("[octree] Frozen analytic tree: %u nodes (levels 0-%d)\n",
                o.h_analytic_node_count, ANALYTIC_MAX_LEVEL);
     }
@@ -461,23 +461,23 @@ inline GridLocals initGrid(SimulationContext& ctx) {
         size_t cell_array_size = g_grid_cells * sizeof(float);
         size_t particle_cell_size = (size_t)g_runtime_particle_cap * sizeof(uint32_t);
 
-        cudaMalloc(&g.d_grid_density, cell_array_size);
-        cudaMalloc(&g.d_grid_momentum_x, cell_array_size);
-        cudaMalloc(&g.d_grid_momentum_y, cell_array_size);
-        cudaMalloc(&g.d_grid_momentum_z, cell_array_size);
-        cudaMalloc(&g.d_grid_phase_sin, cell_array_size);
-        cudaMalloc(&g.d_grid_phase_cos, cell_array_size);
-        cudaMalloc(&g.d_grid_pressure_x, cell_array_size);
-        cudaMalloc(&g.d_grid_pressure_y, cell_array_size);
-        cudaMalloc(&g.d_grid_pressure_z, cell_array_size);
-        cudaMalloc(&g.d_grid_vorticity_x, cell_array_size);
-        cudaMalloc(&g.d_grid_vorticity_y, cell_array_size);
-        cudaMalloc(&g.d_grid_vorticity_z, cell_array_size);
-        cudaMalloc(&g.d_grid_R_cell, cell_array_size);
-        cudaMalloc(&g.d_rc_bin_R, 16 * sizeof(float));
-        cudaMalloc(&g.d_rc_bin_W, 16 * sizeof(float));
-        cudaMalloc(&g.d_rc_bin_N, 16 * sizeof(float));
-        cudaMalloc(&g.d_particle_cell, particle_cell_size);
+        V21_MALLOC(&g.d_grid_density, cell_array_size);
+        V21_MALLOC(&g.d_grid_momentum_x, cell_array_size);
+        V21_MALLOC(&g.d_grid_momentum_y, cell_array_size);
+        V21_MALLOC(&g.d_grid_momentum_z, cell_array_size);
+        V21_MALLOC(&g.d_grid_phase_sin, cell_array_size);
+        V21_MALLOC(&g.d_grid_phase_cos, cell_array_size);
+        V21_MALLOC(&g.d_grid_pressure_x, cell_array_size);
+        V21_MALLOC(&g.d_grid_pressure_y, cell_array_size);
+        V21_MALLOC(&g.d_grid_pressure_z, cell_array_size);
+        V21_MALLOC(&g.d_grid_vorticity_x, cell_array_size);
+        V21_MALLOC(&g.d_grid_vorticity_y, cell_array_size);
+        V21_MALLOC(&g.d_grid_vorticity_z, cell_array_size);
+        V21_MALLOC(&g.d_grid_R_cell, cell_array_size);
+        V21_MALLOC(&g.d_rc_bin_R, 16 * sizeof(float));
+        V21_MALLOC(&g.d_rc_bin_W, 16 * sizeof(float));
+        V21_MALLOC(&g.d_rc_bin_N, 16 * sizeof(float));
+        V21_MALLOC(&g.d_particle_cell, particle_cell_size);
 
         size_t total_grid_mem = 12 * cell_array_size + particle_cell_size;
         printf("[grid] DNA/RNA streaming grid allocated: %zuMB\n",
@@ -497,16 +497,16 @@ inline GridLocals initGrid(SimulationContext& ctx) {
         size_t active_list_size = g_grid_cells * sizeof(uint32_t);
         size_t tile_list_size = NUM_TILES * sizeof(uint32_t);
 
-        cudaMalloc(&g.d_active_flags, cell_flags_size);
-        cudaMalloc(&g.d_tile_flags, tile_flags_size);
-        cudaMalloc(&g.d_compact_active_list, active_list_size);
-        cudaMalloc(&g.d_compact_active_count, sizeof(uint32_t));
-        cudaMalloc(&g.d_active_tiles, tile_list_size);
-        cudaMalloc(&g.d_active_tile_count, sizeof(uint32_t));
-        cudaMemset(g.d_active_flags, 0, cell_flags_size);
-        cudaMemset(g.d_tile_flags, 0, tile_flags_size);
-        cudaMemset(g.d_compact_active_count, 0, sizeof(uint32_t));
-        cudaMemset(g.d_active_tile_count, 0, sizeof(uint32_t));
+        V21_MALLOC(&g.d_active_flags, cell_flags_size);
+        V21_MALLOC(&g.d_tile_flags, tile_flags_size);
+        V21_MALLOC(&g.d_compact_active_list, active_list_size);
+        V21_MALLOC(&g.d_compact_active_count, sizeof(uint32_t));
+        V21_MALLOC(&g.d_active_tiles, tile_list_size);
+        V21_MALLOC(&g.d_active_tile_count, sizeof(uint32_t));
+        V21_MEMSET(g.d_active_flags, 0, cell_flags_size);
+        V21_MEMSET(g.d_tile_flags, 0, tile_flags_size);
+        V21_MEMSET(g.d_compact_active_count, 0, sizeof(uint32_t));
+        V21_MEMSET(g.d_active_tile_count, 0, sizeof(uint32_t));
 
         size_t total_mem = cell_flags_size + tile_flags_size + active_list_size + tile_list_size;
         printf("[flags+tiles] Hierarchical tiled compaction: %.1fMB\n", total_mem / (1024.0 * 1024.0));
@@ -517,18 +517,18 @@ inline GridLocals initGrid(SimulationContext& ctx) {
         size_t particle_cap = (size_t)g_runtime_particle_cap;
         size_t cell_array_size = g_grid_cells * sizeof(float);
 
-        cudaMalloc(&g_active_particles.d_prev_cell, particle_cap * sizeof(uint32_t));
-        cudaMalloc(&g_active_particles.d_active_mask, particle_cap * sizeof(uint8_t));
-        cudaMalloc(&g_active_particles.d_active_list, particle_cap * sizeof(uint32_t));
-        cudaMalloc(&g_active_particles.d_active_count, sizeof(uint32_t));
-        cudaMalloc(&g_active_particles.d_static_density, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_x, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_y, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_z, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_phase_sin, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_phase_cos, cell_array_size);
-        cudaMemset(g_active_particles.d_prev_cell, 0xFF, particle_cap * sizeof(uint32_t));
-        cudaMemset(g_active_particles.d_active_count, 0, sizeof(uint32_t));
+        V21_MALLOC(&g_active_particles.d_prev_cell, particle_cap * sizeof(uint32_t));
+        V21_MALLOC(&g_active_particles.d_active_mask, particle_cap * sizeof(uint8_t));
+        V21_MALLOC(&g_active_particles.d_active_list, particle_cap * sizeof(uint32_t));
+        V21_MALLOC(&g_active_particles.d_active_count, sizeof(uint32_t));
+        V21_MALLOC(&g_active_particles.d_static_density, cell_array_size);
+        V21_MALLOC(&g_active_particles.d_static_momentum_x, cell_array_size);
+        V21_MALLOC(&g_active_particles.d_static_momentum_y, cell_array_size);
+        V21_MALLOC(&g_active_particles.d_static_momentum_z, cell_array_size);
+        V21_MALLOC(&g_active_particles.d_static_phase_sin, cell_array_size);
+        V21_MALLOC(&g_active_particles.d_static_phase_cos, cell_array_size);
+        V21_MEMSET(g_active_particles.d_prev_cell, 0xFF, particle_cap * sizeof(uint32_t));
+        V21_MEMSET(g_active_particles.d_active_count, 0, sizeof(uint32_t));
         g_active_particles.initialized = true;
         g_active_particles.static_baked = false;
         g_active_particles.h_active_count = 0;
@@ -595,26 +595,26 @@ inline TopologyLocals initTopology(SimulationContext& ctx) {
 
     // Passive/active region mask
     size_t in_active_region_size = (size_t)g_runtime_particle_cap * sizeof(uint8_t);
-    cudaMalloc(&t.d_in_active_region, in_active_region_size);
-    cudaMemset(t.d_in_active_region, 0xFF, in_active_region_size);
+    V21_MALLOC(&t.d_in_active_region, in_active_region_size);
+    V21_MEMSET(t.d_in_active_region, 0xFF, in_active_region_size);
     printf("[passive] d_in_active_region allocated: %zu bytes, init=all-in-region\n",
            in_active_region_size);
 
     // Hopfion enforcement
-    cudaMalloc(&t.d_Q_sum, sizeof(int));
-    cudaMalloc(&t.d_Q_delta_sum, sizeof(int));  // Writer monad: conservation audit
-    cudaMalloc(&t.d_operator_counts, 5 * sizeof(int));
-    cudaMemset(t.d_Q_sum, 0, sizeof(int));
-    cudaMemset(t.d_Q_delta_sum, 0, sizeof(int));
-    cudaMemset(t.d_operator_counts, 0, 5 * sizeof(int));
-    cudaMalloc(&t.d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
-    cudaMalloc(&t.d_cell_topo_cnt, g_grid_cells * sizeof(int));
+    V21_MALLOC(&t.d_Q_sum, sizeof(int));
+    V21_MALLOC(&t.d_Q_delta_sum, sizeof(int));  // Writer monad: conservation audit
+    V21_MALLOC(&t.d_operator_counts, 5 * sizeof(int));
+    V21_MEMSET(t.d_Q_sum, 0, sizeof(int));
+    V21_MEMSET(t.d_Q_delta_sum, 0, sizeof(int));
+    V21_MEMSET(t.d_operator_counts, 0, 5 * sizeof(int));
+    V21_MALLOC(&t.d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
+    V21_MALLOC(&t.d_cell_topo_cnt, g_grid_cells * sizeof(int));
     printf("[hopfion] Enforcement buffers allocated: Q_sum + 4 counters + cell topo (%.1f MB)\n",
            (4 * g_grid_cells * sizeof(int) + g_grid_cells * sizeof(int)) / 1e6);
 
     // Bootstrap ActiveRegion (all-encompassing)
-    cudaMalloc(&t.d_active_regions, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
-    cudaMemset(t.d_active_regions, 0, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+    V21_MALLOC(&t.d_active_regions, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+    V21_MEMSET(t.d_active_regions, 0, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
     ActiveRegion h_bootstrap = {};
     h_bootstrap.gate_positions[0] = make_float3(-500.0f, -500.0f, -500.0f);
     h_bootstrap.gate_positions[1] = make_float3( 500.0f,  500.0f,  500.0f);
@@ -650,9 +650,9 @@ inline void initAccumulators(SimulationContext& ctx) {
     // PhotonAccumulator array + atomic counter
     void* d_acc = nullptr;
     void* d_cnt = nullptr;
-    cudaMalloc(&d_acc, ACCUMULATOR_MAX_COUNT * sizeof(PhotonAccumulator));
-    cudaMalloc(&d_cnt, sizeof(int));
-    cudaMemset(d_cnt, 0, sizeof(int));
+    V21_MALLOC(&d_acc, ACCUMULATOR_MAX_COUNT * sizeof(PhotonAccumulator));
+    V21_MALLOC(&d_cnt, sizeof(int));
+    V21_MEMSET(d_cnt, 0, sizeof(int));
 
     ctx.accumulators.buf_accumulators = d_acc;
     ctx.accumulators.buf_count = d_cnt;

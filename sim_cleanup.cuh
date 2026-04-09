@@ -4,7 +4,7 @@
 // Rendering cleanup (Vulkan/OpenGL) stays in main — it's backend-specific.
 #pragma once
 
-#include <cuda_runtime.h>
+#include "V21/core/v21_mem.h"
 #include <cstdio>
 #include "sim_context.h"
 #include "sim_init.cuh"  // DiagnosticLocals, OctreeLocals, etc.
@@ -21,16 +21,16 @@ inline void cleanupSimulation(
     OctreeLocals& octree)
 {
     // 1. Destroy streams and events
-    cudaStreamDestroy(diag.sample_stream);
-    cudaStreamDestroy(diag.stats_stream);
-    cudaEventDestroy(diag.stats_ready);
-    cudaStreamDestroy(diag.spawn_stream);
-    cudaEventDestroy(diag.spawn_ready);
-    cudaFree(diag.d_stress_async);
+    V21_STREAM_DESTROY(diag.sample_stream);
+    V21_STREAM_DESTROY(diag.stats_stream);
+    V21_EVENT_DESTROY(diag.stats_ready);
+    V21_STREAM_DESTROY(diag.spawn_stream);
+    V21_EVENT_DESTROY(diag.spawn_ready);
+    V21_FREE(diag.d_stress_async);
     printf("[shutdown] CUDA streams destroyed\n");
 
     // 2. Free main particle data
-    cudaFree(ctx.particles.buf_disk);
+    V21_FREE(ctx.particles.buf_disk);
     printf("[shutdown] Main particle data freed\n");
 
     // 3. Free topology ring buffer and mip-tree
@@ -40,79 +40,79 @@ inline void cleanupSimulation(
     printf("[shutdown] Mip-tree hierarchy freed\n");
 
     // 4. Free diagnostic buffers
-    cudaFree(diag.d_stress);
-    cudaFree(diag.d_sample_indices);
-    cudaFree(diag.d_sample_metrics[0]);
-    cudaFree(diag.d_sample_metrics[1]);
-    cudaFreeHost(diag.h_sample_metrics);
-    cudaFreeHost(diag.h_spawn_pinned);
-    cudaFree(diag.d_kr_sin_sum);
-    cudaFree(diag.d_kr_cos_sum);
-    cudaFree(diag.d_kr_count);
-    cudaFree(diag.d_phase_hist);
-    cudaFree(diag.d_phase_omega_sum);
-    cudaFree(diag.d_phase_omega_sq);
-    cudaFree(diag.d_spawn_idx);
-    cudaFree(diag.d_spawn_success);
+    V21_FREE(diag.d_stress);
+    V21_FREE(diag.d_sample_indices);
+    V21_FREE(diag.d_sample_metrics[0]);
+    V21_FREE(diag.d_sample_metrics[1]);
+    V21_FREE_HOST(diag.h_sample_metrics);
+    V21_FREE_HOST(diag.h_spawn_pinned);
+    V21_FREE(diag.d_kr_sin_sum);
+    V21_FREE(diag.d_kr_cos_sum);
+    V21_FREE(diag.d_kr_count);
+    V21_FREE(diag.d_phase_hist);
+    V21_FREE(diag.d_phase_omega_sum);
+    V21_FREE(diag.d_phase_omega_sq);
+    V21_FREE(diag.d_spawn_idx);
+    V21_FREE(diag.d_spawn_success);
     printf("[shutdown] Diagnostic buffers freed\n");
 
     // 5. Free octree allocations
     if (octree.octreeEnabled) {
-        cudaFree(octree.d_morton_keys);
-        cudaFree(octree.d_xor_corners);
-        cudaFree(octree.d_particle_ids);
-        cudaFree(octree.d_octree_nodes);
-        cudaFree(octree.d_node_count);
-        cudaFree(octree.d_leaf_counts);
-        cudaFree(octree.d_leaf_counts_culled);
-        cudaFree(octree.d_leaf_offsets);
-        cudaFree(octree.d_leaf_node_indices);
-        cudaFree(octree.d_leaf_node_count);
-        cudaFree(octree.d_leaf_vel_x);
-        cudaFree(octree.d_leaf_vel_y);
-        cudaFree(octree.d_leaf_vel_z);
-        cudaFree(octree.d_leaf_phase);
-        cudaFree(octree.d_leaf_frequency);
-        cudaFree(octree.d_leaf_coherence);
-        cudaFree(octree.d_leaf_hash_keys);
-        cudaFree(octree.d_leaf_hash_values);
+        V21_FREE(octree.d_morton_keys);
+        V21_FREE(octree.d_xor_corners);
+        V21_FREE(octree.d_particle_ids);
+        V21_FREE(octree.d_octree_nodes);
+        V21_FREE(octree.d_node_count);
+        V21_FREE(octree.d_leaf_counts);
+        V21_FREE(octree.d_leaf_counts_culled);
+        V21_FREE(octree.d_leaf_offsets);
+        V21_FREE(octree.d_leaf_node_indices);
+        V21_FREE(octree.d_leaf_node_count);
+        V21_FREE(octree.d_leaf_vel_x);
+        V21_FREE(octree.d_leaf_vel_y);
+        V21_FREE(octree.d_leaf_vel_z);
+        V21_FREE(octree.d_leaf_phase);
+        V21_FREE(octree.d_leaf_frequency);
+        V21_FREE(octree.d_leaf_coherence);
+        V21_FREE(octree.d_leaf_hash_keys);
+        V21_FREE(octree.d_leaf_hash_values);
         printf("[shutdown] Octree data freed\n");
     }
 
     // 6. Free topology buffers
-    cudaFree(ctx.topology.buf_in_active_region);
-    cudaFree(ctx.topology.buf_Q_sum);
-    cudaFree(ctx.topology.buf_Q_delta_sum);
-    cudaFree(ctx.topology.buf_operator_counts);
-    cudaFree(ctx.topology.buf_cell_topo_s);
-    cudaFree(ctx.topology.buf_cell_topo_cnt);
-    cudaFree(ctx.topology.buf_active_regions);
+    V21_FREE(ctx.topology.buf_in_active_region);
+    V21_FREE(ctx.topology.buf_Q_sum);
+    V21_FREE(ctx.topology.buf_Q_delta_sum);
+    V21_FREE(ctx.topology.buf_operator_counts);
+    V21_FREE(ctx.topology.buf_cell_topo_s);
+    V21_FREE(ctx.topology.buf_cell_topo_cnt);
+    V21_FREE(ctx.topology.buf_active_regions);
 
     // 7. Free accumulators
-    cudaFree(ctx.accumulators.buf_accumulators);
-    cudaFree(ctx.accumulators.buf_count);
+    V21_FREE(ctx.accumulators.buf_accumulators);
+    V21_FREE(ctx.accumulators.buf_count);
 
-    // 8. Free grid buffers (null-safe — cudaFree(nullptr) is a no-op)
-    cudaFree(ctx.grid.buf_density);
-    cudaFree(ctx.grid.buf_momentum_x);
-    cudaFree(ctx.grid.buf_momentum_y);
-    cudaFree(ctx.grid.buf_momentum_z);
-    cudaFree(ctx.grid.buf_phase_sin);
-    cudaFree(ctx.grid.buf_phase_cos);
-    cudaFree(ctx.grid.buf_pressure_x);
-    cudaFree(ctx.grid.buf_pressure_y);
-    cudaFree(ctx.grid.buf_pressure_z);
-    cudaFree(ctx.grid.buf_vorticity_x);
-    cudaFree(ctx.grid.buf_vorticity_y);
-    cudaFree(ctx.grid.buf_vorticity_z);
-    cudaFree(ctx.grid.buf_R_cell);
-    cudaFree(ctx.grid.buf_particle_cell);
-    cudaFree(ctx.grid.buf_active_flags);
-    cudaFree(ctx.grid.buf_tile_flags);
-    cudaFree(ctx.grid.buf_compact_active_list);
-    cudaFree(ctx.grid.buf_compact_active_count);
-    cudaFree(ctx.grid.buf_active_tiles);
-    cudaFree(ctx.grid.buf_active_tile_count);
+    // 8. Free grid buffers (null-safe — V21_FREE(nullptr) is a no-op)
+    V21_FREE(ctx.grid.buf_density);
+    V21_FREE(ctx.grid.buf_momentum_x);
+    V21_FREE(ctx.grid.buf_momentum_y);
+    V21_FREE(ctx.grid.buf_momentum_z);
+    V21_FREE(ctx.grid.buf_phase_sin);
+    V21_FREE(ctx.grid.buf_phase_cos);
+    V21_FREE(ctx.grid.buf_pressure_x);
+    V21_FREE(ctx.grid.buf_pressure_y);
+    V21_FREE(ctx.grid.buf_pressure_z);
+    V21_FREE(ctx.grid.buf_vorticity_x);
+    V21_FREE(ctx.grid.buf_vorticity_y);
+    V21_FREE(ctx.grid.buf_vorticity_z);
+    V21_FREE(ctx.grid.buf_R_cell);
+    V21_FREE(ctx.grid.buf_particle_cell);
+    V21_FREE(ctx.grid.buf_active_flags);
+    V21_FREE(ctx.grid.buf_tile_flags);
+    V21_FREE(ctx.grid.buf_compact_active_list);
+    V21_FREE(ctx.grid.buf_compact_active_count);
+    V21_FREE(ctx.grid.buf_active_tiles);
+    V21_FREE(ctx.grid.buf_active_tile_count);
 
     printf("[shutdown] Cleanup complete!\n");
 }
