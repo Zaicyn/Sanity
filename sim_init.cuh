@@ -425,3 +425,214 @@ inline OctreeLocals initOctree(SimulationContext& ctx) {
 
     return o;
 }
+
+// ============================================================================
+// initGrid — Cell grid + sparse flags + active compaction buffers
+// ============================================================================
+
+struct GridLocals {
+    float* d_grid_density;
+    float* d_grid_momentum_x, *d_grid_momentum_y, *d_grid_momentum_z;
+    float* d_grid_phase_sin, *d_grid_phase_cos;
+    float* d_grid_pressure_x, *d_grid_pressure_y, *d_grid_pressure_z;
+    float* d_grid_vorticity_x, *d_grid_vorticity_y, *d_grid_vorticity_z;
+    float* d_grid_R_cell;
+    float* d_rc_bin_R, *d_rc_bin_W, *d_rc_bin_N;
+    uint32_t* d_particle_cell;
+    // Sparse flags
+    uint8_t* d_active_flags;
+    uint8_t* d_tile_flags;
+    uint32_t* d_compact_active_list;
+    uint32_t* d_compact_active_count;
+    uint32_t* d_active_tiles;
+    uint32_t* d_active_tile_count;
+};
+
+inline GridLocals initGrid(SimulationContext& ctx) {
+    GridLocals g = {};
+
+    extern bool g_grid_physics;
+    extern bool g_grid_flags;
+    extern bool g_active_compaction;
+    extern ActiveParticleState g_active_particles;
+
+    if (g_grid_physics) {
+        size_t cell_array_size = g_grid_cells * sizeof(float);
+        size_t particle_cell_size = (size_t)g_runtime_particle_cap * sizeof(uint32_t);
+
+        cudaMalloc(&g.d_grid_density, cell_array_size);
+        cudaMalloc(&g.d_grid_momentum_x, cell_array_size);
+        cudaMalloc(&g.d_grid_momentum_y, cell_array_size);
+        cudaMalloc(&g.d_grid_momentum_z, cell_array_size);
+        cudaMalloc(&g.d_grid_phase_sin, cell_array_size);
+        cudaMalloc(&g.d_grid_phase_cos, cell_array_size);
+        cudaMalloc(&g.d_grid_pressure_x, cell_array_size);
+        cudaMalloc(&g.d_grid_pressure_y, cell_array_size);
+        cudaMalloc(&g.d_grid_pressure_z, cell_array_size);
+        cudaMalloc(&g.d_grid_vorticity_x, cell_array_size);
+        cudaMalloc(&g.d_grid_vorticity_y, cell_array_size);
+        cudaMalloc(&g.d_grid_vorticity_z, cell_array_size);
+        cudaMalloc(&g.d_grid_R_cell, cell_array_size);
+        cudaMalloc(&g.d_rc_bin_R, 16 * sizeof(float));
+        cudaMalloc(&g.d_rc_bin_W, 16 * sizeof(float));
+        cudaMalloc(&g.d_rc_bin_N, 16 * sizeof(float));
+        cudaMalloc(&g.d_particle_cell, particle_cell_size);
+
+        size_t total_grid_mem = 12 * cell_array_size + particle_cell_size;
+        printf("[grid] DNA/RNA streaming grid allocated: %zuMB\n",
+               total_grid_mem / (1024 * 1024));
+        printf("[grid] Grid: %dx%dx%d cells (%.2f units/cell)\n",
+               g_grid_dim, g_grid_dim, g_grid_dim, g_grid_cell_size);
+
+        if (!mip_tree_init(g_grid_dim, 0.1f)) {
+            fprintf(stderr, "[mip] WARNING: Failed to initialize mip-tree\n");
+        }
+    }
+
+    // Sparse flags
+    if (g_grid_flags && g_grid_physics) {
+        size_t cell_flags_size = g_grid_cells * sizeof(uint8_t);
+        size_t tile_flags_size = NUM_TILES * sizeof(uint8_t);
+        size_t active_list_size = g_grid_cells * sizeof(uint32_t);
+        size_t tile_list_size = NUM_TILES * sizeof(uint32_t);
+
+        cudaMalloc(&g.d_active_flags, cell_flags_size);
+        cudaMalloc(&g.d_tile_flags, tile_flags_size);
+        cudaMalloc(&g.d_compact_active_list, active_list_size);
+        cudaMalloc(&g.d_compact_active_count, sizeof(uint32_t));
+        cudaMalloc(&g.d_active_tiles, tile_list_size);
+        cudaMalloc(&g.d_active_tile_count, sizeof(uint32_t));
+        cudaMemset(g.d_active_flags, 0, cell_flags_size);
+        cudaMemset(g.d_tile_flags, 0, tile_flags_size);
+        cudaMemset(g.d_compact_active_count, 0, sizeof(uint32_t));
+        cudaMemset(g.d_active_tile_count, 0, sizeof(uint32_t));
+
+        size_t total_mem = cell_flags_size + tile_flags_size + active_list_size + tile_list_size;
+        printf("[flags+tiles] Hierarchical tiled compaction: %.1fMB\n", total_mem / (1024.0 * 1024.0));
+    }
+
+    // Active compaction
+    if (g_active_compaction && g_grid_physics) {
+        size_t particle_cap = (size_t)g_runtime_particle_cap;
+        size_t cell_array_size = g_grid_cells * sizeof(float);
+
+        cudaMalloc(&g_active_particles.d_prev_cell, particle_cap * sizeof(uint32_t));
+        cudaMalloc(&g_active_particles.d_active_mask, particle_cap * sizeof(uint8_t));
+        cudaMalloc(&g_active_particles.d_active_list, particle_cap * sizeof(uint32_t));
+        cudaMalloc(&g_active_particles.d_active_count, sizeof(uint32_t));
+        cudaMalloc(&g_active_particles.d_static_density, cell_array_size);
+        cudaMalloc(&g_active_particles.d_static_momentum_x, cell_array_size);
+        cudaMalloc(&g_active_particles.d_static_momentum_y, cell_array_size);
+        cudaMalloc(&g_active_particles.d_static_momentum_z, cell_array_size);
+        cudaMalloc(&g_active_particles.d_static_phase_sin, cell_array_size);
+        cudaMalloc(&g_active_particles.d_static_phase_cos, cell_array_size);
+        cudaMemset(g_active_particles.d_prev_cell, 0xFF, particle_cap * sizeof(uint32_t));
+        cudaMemset(g_active_particles.d_active_count, 0, sizeof(uint32_t));
+        g_active_particles.initialized = true;
+        g_active_particles.static_baked = false;
+        g_active_particles.h_active_count = 0;
+
+        size_t total_active_mem = particle_cap * (sizeof(uint32_t) * 2 + sizeof(uint8_t)) + 6 * cell_array_size;
+        printf("[active-compact] Active particle compaction: %.1fMB\n", total_active_mem / (1024.0 * 1024.0));
+    }
+
+    // Wire into context
+    ctx.grid.buf_density = g.d_grid_density;
+    ctx.grid.buf_momentum_x = g.d_grid_momentum_x;
+    ctx.grid.buf_momentum_y = g.d_grid_momentum_y;
+    ctx.grid.buf_momentum_z = g.d_grid_momentum_z;
+    ctx.grid.buf_phase_sin = g.d_grid_phase_sin;
+    ctx.grid.buf_phase_cos = g.d_grid_phase_cos;
+    ctx.grid.buf_pressure_x = g.d_grid_pressure_x;
+    ctx.grid.buf_pressure_y = g.d_grid_pressure_y;
+    ctx.grid.buf_pressure_z = g.d_grid_pressure_z;
+    ctx.grid.buf_vorticity_x = g.d_grid_vorticity_x;
+    ctx.grid.buf_vorticity_y = g.d_grid_vorticity_y;
+    ctx.grid.buf_vorticity_z = g.d_grid_vorticity_z;
+    ctx.grid.buf_R_cell = g.d_grid_R_cell;
+    ctx.grid.buf_particle_cell = g.d_particle_cell;
+    ctx.grid.buf_active_flags = g.d_active_flags;
+    ctx.grid.buf_tile_flags = g.d_tile_flags;
+    ctx.grid.buf_compact_active_list = g.d_compact_active_list;
+    ctx.grid.buf_compact_active_count = g.d_compact_active_count;
+    ctx.grid.buf_active_tiles = g.d_active_tiles;
+    ctx.grid.buf_active_tile_count = g.d_active_tile_count;
+    ctx.grid.enabled = g_grid_physics;
+    ctx.grid.flags_enabled = g_grid_flags;
+    ctx.active_compact.buf_prev_cell = g_active_particles.d_prev_cell;
+    ctx.active_compact.buf_active_mask = g_active_particles.d_active_mask;
+    ctx.active_compact.buf_active_list = g_active_particles.d_active_list;
+    ctx.active_compact.buf_active_count = g_active_particles.d_active_count;
+    ctx.active_compact.buf_static_density = g_active_particles.d_static_density;
+    ctx.active_compact.buf_static_momentum_x = g_active_particles.d_static_momentum_x;
+    ctx.active_compact.buf_static_momentum_y = g_active_particles.d_static_momentum_y;
+    ctx.active_compact.buf_static_momentum_z = g_active_particles.d_static_momentum_z;
+    ctx.active_compact.buf_static_phase_sin = g_active_particles.d_static_phase_sin;
+    ctx.active_compact.buf_static_phase_cos = g_active_particles.d_static_phase_cos;
+    ctx.active_compact.enabled = g_active_compaction && g_grid_physics;
+
+    return g;
+}
+
+// ============================================================================
+// initTopology — Passive advection mask, hopfion enforcement, ActiveRegion
+// ============================================================================
+
+struct TopologyLocals {
+    uint8_t* d_in_active_region;
+    int* d_Q_sum;
+    int* d_operator_counts;
+    int* d_cell_topo_s;
+    int* d_cell_topo_cnt;
+    ActiveRegion* d_active_regions;
+    int h_num_active_regions;
+};
+
+inline TopologyLocals initTopology(SimulationContext& ctx) {
+    TopologyLocals t = {};
+
+    // Passive/active region mask
+    size_t in_active_region_size = (size_t)g_runtime_particle_cap * sizeof(uint8_t);
+    cudaMalloc(&t.d_in_active_region, in_active_region_size);
+    cudaMemset(t.d_in_active_region, 0xFF, in_active_region_size);
+    printf("[passive] d_in_active_region allocated: %zu bytes, init=all-in-region\n",
+           in_active_region_size);
+
+    // Hopfion enforcement
+    cudaMalloc(&t.d_Q_sum, sizeof(int));
+    cudaMalloc(&t.d_operator_counts, 5 * sizeof(int));
+    cudaMemset(t.d_Q_sum, 0, sizeof(int));
+    cudaMemset(t.d_operator_counts, 0, 5 * sizeof(int));
+    cudaMalloc(&t.d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
+    cudaMalloc(&t.d_cell_topo_cnt, g_grid_cells * sizeof(int));
+    printf("[hopfion] Enforcement buffers allocated: Q_sum + 4 counters + cell topo (%.1f MB)\n",
+           (4 * g_grid_cells * sizeof(int) + g_grid_cells * sizeof(int)) / 1e6);
+
+    // Bootstrap ActiveRegion (all-encompassing)
+    cudaMalloc(&t.d_active_regions, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+    cudaMemset(t.d_active_regions, 0, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
+    ActiveRegion h_bootstrap = {};
+    h_bootstrap.gate_positions[0] = make_float3(-500.0f, -500.0f, -500.0f);
+    h_bootstrap.gate_positions[1] = make_float3( 500.0f,  500.0f,  500.0f);
+    h_bootstrap.gate_positions[2] = make_float3(0.0f, 0.0f, 0.0f);
+    h_bootstrap.parent_shell = -1;
+    h_bootstrap.birth_frame = 0;
+    h_bootstrap.stability_integral = 0.0f;
+    h_bootstrap.state = REGION_STATE_ACTIVE;
+    cudaMemcpy(t.d_active_regions, &h_bootstrap, sizeof(ActiveRegion),
+               cudaMemcpyHostToDevice);
+    t.h_num_active_regions = 1;
+    printf("[passive] ActiveRegion bootstrap: 1 all-encompassing region seeded\n");
+
+    // Wire into context
+    ctx.topology.buf_in_active_region = t.d_in_active_region;
+    ctx.topology.buf_Q_sum = t.d_Q_sum;
+    ctx.topology.buf_operator_counts = t.d_operator_counts;
+    ctx.topology.buf_cell_topo_s = t.d_cell_topo_s;
+    ctx.topology.buf_cell_topo_cnt = t.d_cell_topo_cnt;
+    ctx.topology.buf_active_regions = t.d_active_regions;
+    ctx.topology.h_num_active_regions = t.h_num_active_regions;
+    ctx.topology.hopfion_flip_scale = 1.0f;
+
+    return t;
+}

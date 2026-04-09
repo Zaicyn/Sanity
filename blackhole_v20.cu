@@ -645,224 +645,53 @@ int main(int argc, char** argv) {
     float substrate_k = octree.substrate_k;
     float phase_coupling_k = octree.phase_coupling_k;
 
-    // === CELL GRID ALLOCATION (DNA/RNA Streaming Architecture) ===
-    // Fixed-topology grid for forward-only physics passes
-    extern bool g_grid_physics;
-    float* d_grid_density = nullptr;
-    float* d_grid_momentum_x = nullptr;
-    float* d_grid_momentum_y = nullptr;
-    float* d_grid_momentum_z = nullptr;
-    float* d_grid_phase_sin = nullptr;
-    float* d_grid_phase_cos = nullptr;
-    float* d_grid_pressure_x = nullptr;
-    float* d_grid_pressure_y = nullptr;
-    float* d_grid_pressure_z = nullptr;
-    float* d_grid_vorticity_x = nullptr;
-    float* d_grid_vorticity_y = nullptr;
-    float* d_grid_vorticity_z = nullptr;
-    float* d_grid_R_cell = nullptr;      // per-cell Kuramoto order parameter
-    uint32_t* d_particle_cell = nullptr;
-
-    // Tree Architecture Step 2: passive/active region membership flag.
-    // 1 = particle is inside an active region (handled by siphonDiskKernel).
-    // 0 = particle is passive (handled by advectPassiveParticles).
-    // Initialized to all-1s below so Step 2 is zero-behavior-change: the
-    // passive kernel early-returns on every particle. Sized to
-    // g_runtime_particle_cap (not N_current) because spawning can grow N.
-    uint8_t* d_in_active_region = nullptr;
-
-    // Hopfion enforcement buffers
-    int* d_Q_sum = nullptr;
-    int* d_operator_counts = nullptr;  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions, [4]=vents
-    int h_Q_sum = 0;
-    int h_operator_counts[5] = {};
-    int g_Q_target = 0;               // Set at frame 0, checked every frame
-    float g_hopfion_flip_scale = 1.0f; // Recycling equilibrium multiplier
-
-    // Cell-level topo statistics for fusion/tension operators
-    int* d_cell_topo_s = nullptr;     // 4 × GRID_CELLS axis sums
-    int* d_cell_topo_cnt = nullptr;   // particle count per cell
-
-    // Radial profile of R_cell — 16 bins from center to box edge
+    // Initialize grid physics + sparse flags + active compaction
+    GridLocals grid = initGrid(ctx);
+    float* d_grid_density = grid.d_grid_density;
+    float* d_grid_momentum_x = grid.d_grid_momentum_x;
+    float* d_grid_momentum_y = grid.d_grid_momentum_y;
+    float* d_grid_momentum_z = grid.d_grid_momentum_z;
+    float* d_grid_phase_sin = grid.d_grid_phase_sin;
+    float* d_grid_phase_cos = grid.d_grid_phase_cos;
+    float* d_grid_pressure_x = grid.d_grid_pressure_x;
+    float* d_grid_pressure_y = grid.d_grid_pressure_y;
+    float* d_grid_pressure_z = grid.d_grid_pressure_z;
+    float* d_grid_vorticity_x = grid.d_grid_vorticity_x;
+    float* d_grid_vorticity_y = grid.d_grid_vorticity_y;
+    float* d_grid_vorticity_z = grid.d_grid_vorticity_z;
+    float* d_grid_R_cell = grid.d_grid_R_cell;
+    float* d_rc_bin_R = grid.d_rc_bin_R;
+    float* d_rc_bin_W = grid.d_rc_bin_W;
+    float* d_rc_bin_N = grid.d_rc_bin_N;
+    uint32_t* d_particle_cell = grid.d_particle_cell;
+    uint8_t* d_active_flags = grid.d_active_flags;
+    uint8_t* d_tile_flags = grid.d_tile_flags;
+    uint32_t* d_compact_active_list = grid.d_compact_active_list;
+    uint32_t* d_compact_active_count = grid.d_compact_active_count;
+    uint32_t* d_active_tiles = grid.d_active_tiles;
+    uint32_t* d_active_tile_count = grid.d_active_tile_count;
+    uint32_t h_compact_active_count = 0;
+    uint32_t h_active_tile_count = 0;
     const int RC_RADIAL_BINS = 16;
-    float* d_rc_bin_R = nullptr;
-    float* d_rc_bin_W = nullptr;
-    float* d_rc_bin_N = nullptr;  // cell count per bin
     std::vector<float> h_rc_bin_R(RC_RADIAL_BINS);
     std::vector<float> h_rc_bin_W(RC_RADIAL_BINS);
     std::vector<float> h_rc_bin_N(RC_RADIAL_BINS);
-
-    if (g_grid_physics) {
-        size_t cell_array_size = GRID_CELLS * sizeof(float);
-        // CRITICAL: Must allocate for MAX particles, not initial N
-        // Otherwise spawning beyond N causes OOB access
-        size_t particle_cell_size = (size_t)g_runtime_particle_cap * sizeof(uint32_t);
-
-        // Accumulated fields (Pass 1)
-        cudaMalloc(&d_grid_density, cell_array_size);
-        cudaMalloc(&d_grid_momentum_x, cell_array_size);
-        cudaMalloc(&d_grid_momentum_y, cell_array_size);
-        cudaMalloc(&d_grid_momentum_z, cell_array_size);
-        cudaMalloc(&d_grid_phase_sin, cell_array_size);
-        cudaMalloc(&d_grid_phase_cos, cell_array_size);
-
-        // Derived fields (Pass 2)
-        cudaMalloc(&d_grid_pressure_x, cell_array_size);
-        cudaMalloc(&d_grid_pressure_y, cell_array_size);
-        cudaMalloc(&d_grid_pressure_z, cell_array_size);
-        cudaMalloc(&d_grid_vorticity_x, cell_array_size);
-        cudaMalloc(&d_grid_vorticity_y, cell_array_size);
-        cudaMalloc(&d_grid_vorticity_z, cell_array_size);
-
-        // Per-cell Kuramoto order parameter and radial profile bins
-        cudaMalloc(&d_grid_R_cell, cell_array_size);
-        cudaMalloc(&d_rc_bin_R, RC_RADIAL_BINS * sizeof(float));
-        cudaMalloc(&d_rc_bin_W, RC_RADIAL_BINS * sizeof(float));
-        cudaMalloc(&d_rc_bin_N, RC_RADIAL_BINS * sizeof(float));
-
-        // Per-particle cell assignment
-        cudaMalloc(&d_particle_cell, particle_cell_size);
-
-        size_t total_grid_mem = 12 * cell_array_size + particle_cell_size;
-        printf("[grid] DNA/RNA streaming grid allocated: %zuMB\n",
-               total_grid_mem / (1024 * 1024));
-        printf("[grid] Grid: %dx%dx%d cells (%.2f units/cell)\n",
-               GRID_DIM, GRID_DIM, GRID_DIM, GRID_CELL_SIZE);
-
-        // Initialize mip-tree for hierarchical coherence
-        // This replaces Morton-sorted octree for scale coupling
-        // Pass actual grid dimension (g_grid_dim can be 128, 96, or 64)
-        if (!mip_tree_init(g_grid_dim, 0.1f)) {
-            fprintf(stderr, "[mip] WARNING: Failed to initialize mip-tree (hierarchy disabled)\n");
-        }
-    }
-
-    // === SPARSE FLAGS BUFFER ALLOCATION ===
-    // Hierarchical tiled flags: O(tiles) + O(active_tiles × cells_per_tile)
-    // Instead of scanning 2M cells, scan 4096 tiles then ~150 × 512 cells
+    extern bool g_grid_physics;
     extern bool g_grid_flags;
-    uint8_t* d_active_flags = nullptr;       // Cell-level flags [2M]
-    uint8_t* d_tile_flags = nullptr;         // Tile-level flags [4096]
-    uint32_t* d_compact_active_list = nullptr;
-    uint32_t* d_compact_active_count = nullptr;
-    uint32_t* d_active_tiles = nullptr;      // Compacted tile list
-    uint32_t* d_active_tile_count = nullptr;
-    uint32_t h_compact_active_count = 0;
-    uint32_t h_active_tile_count = 0;
 
-    if (g_grid_flags && g_grid_physics) {
-        size_t cell_flags_size = GRID_CELLS * sizeof(uint8_t);  // 2MB
-        size_t tile_flags_size = NUM_TILES * sizeof(uint8_t);   // 4KB
-        size_t active_list_size = GRID_CELLS * sizeof(uint32_t);  // 8MB worst case
-        size_t tile_list_size = NUM_TILES * sizeof(uint32_t);   // 16KB
-
-        cudaMalloc(&d_active_flags, cell_flags_size);
-        cudaMalloc(&d_tile_flags, tile_flags_size);
-        cudaMalloc(&d_compact_active_list, active_list_size);
-        cudaMalloc(&d_compact_active_count, sizeof(uint32_t));
-        cudaMalloc(&d_active_tiles, tile_list_size);
-        cudaMalloc(&d_active_tile_count, sizeof(uint32_t));
-
-        // Initialize all flags to zero
-        cudaMemset(d_active_flags, 0, cell_flags_size);
-        cudaMemset(d_tile_flags, 0, tile_flags_size);
-        cudaMemset(d_compact_active_count, 0, sizeof(uint32_t));
-        cudaMemset(d_active_tile_count, 0, sizeof(uint32_t));
-
-        size_t total_mem = cell_flags_size + tile_flags_size + active_list_size + tile_list_size;
-        printf("[flags+tiles] Hierarchical tiled compaction: %.1fMB\n", total_mem / (1024.0 * 1024.0));
-        printf("[flags+tiles] Cell flags: %.1fMB | Tile flags: %.1fKB | Tiles: %d\n",
-               cell_flags_size / (1024.0 * 1024.0), tile_flags_size / 1024.0, NUM_TILES);
-    }
-
-    // === ACTIVE PARTICLE COMPACTION BUFFERS ===
-    // Skip static shell mass by only scatter/gather "active" (moving/cell-changed) particles
-    extern bool g_active_compaction;
-    extern ActiveParticleState g_active_particles;
-    if (g_active_compaction && g_grid_physics) {
-        size_t particle_cap = (size_t)g_runtime_particle_cap;
-        size_t cell_array_size = GRID_CELLS * sizeof(float);
-
-        // Per-particle tracking
-        cudaMalloc(&g_active_particles.d_prev_cell, particle_cap * sizeof(uint32_t));
-        cudaMalloc(&g_active_particles.d_active_mask, particle_cap * sizeof(uint8_t));
-        cudaMalloc(&g_active_particles.d_active_list, particle_cap * sizeof(uint32_t));
-        cudaMalloc(&g_active_particles.d_active_count, sizeof(uint32_t));
-
-        // Static grid (baked contribution from non-moving particles)
-        cudaMalloc(&g_active_particles.d_static_density, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_x, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_y, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_momentum_z, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_phase_sin, cell_array_size);
-        cudaMalloc(&g_active_particles.d_static_phase_cos, cell_array_size);
-
-        // Initialize prev_cell to invalid (forces all particles active on first frame)
-        cudaMemset(g_active_particles.d_prev_cell, 0xFF, particle_cap * sizeof(uint32_t));
-        cudaMemset(g_active_particles.d_active_count, 0, sizeof(uint32_t));
-
-        g_active_particles.initialized = true;
-        g_active_particles.static_baked = false;
-        g_active_particles.h_active_count = 0;
-
-        size_t total_active_mem = particle_cap * (sizeof(uint32_t) * 2 + sizeof(uint8_t)) + 6 * cell_array_size;
-        printf("[active-compact] Active particle compaction: %.1fMB\n", total_active_mem / (1024.0 * 1024.0));
-        printf("[active-compact] Particle tracking: %.1fMB | Static grid: %.1fMB\n",
-               particle_cap * (sizeof(uint32_t) * 2 + sizeof(uint8_t)) / (1024.0 * 1024.0),
-               6 * cell_array_size / (1024.0 * 1024.0));
-    }
-
-    // === TREE ARCHITECTURE STEP 2: in_active_region buffer ===
-    // Unconditional allocation — the passive kernel is orthogonal to grid
-    // physics and active-compaction. Initialized to all-1s so every particle
-    // is "in the all-encompassing bootstrap region"; the passive kernel
-    // early-returns on every particle in Step 2 (zero behavior change).
-    {
-        size_t in_active_region_size = (size_t)g_runtime_particle_cap * sizeof(uint8_t);
-        cudaMalloc(&d_in_active_region, in_active_region_size);
-        cudaMemset(d_in_active_region, 0xFF, in_active_region_size);  // all-1s = all in region
-        printf("[passive] d_in_active_region allocated: %zu bytes, init=all-in-region\n",
-               in_active_region_size);
-    }
-
-    // === HOPFION ENFORCEMENT BUFFERS ===
-    cudaMalloc(&d_Q_sum, sizeof(int));
-    cudaMalloc(&d_operator_counts, 5 * sizeof(int));
-    cudaMemset(d_Q_sum, 0, sizeof(int));
-    cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
-    // Cell-level topo: 4 axis sums + 1 count per cell
-    cudaMalloc(&d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
-    cudaMalloc(&d_cell_topo_cnt, g_grid_cells * sizeof(int));
-    printf("[hopfion] Enforcement buffers allocated: Q_sum + 4 counters + cell topo (%.1f MB)\n",
-           (4 * g_grid_cells * sizeof(int) + g_grid_cells * sizeof(int)) / 1e6);
-
-    // === TREE ARCHITECTURE STEP 2: bootstrap ActiveRegion ===
-    // Allocate a small fixed-size array of ActiveRegion slots and seed
-    // exactly one all-encompassing region that covers the entire simulation
-    // volume. Every alive particle will test as "inside" this region, so
-    // computeInActiveRegionMask will write 1 to in_active_region[i] for
-    // every alive particle, the passive kernel's third early-return will
-    // trigger on every particle, and behavior is byte-identical to
-    // pre-Step-2. Step 3 will replace this with dynamic region lifecycle.
-    ActiveRegion* d_active_regions = nullptr;
-    int h_num_active_regions = 0;
-    {
-        cudaMalloc(&d_active_regions, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
-        cudaMemset(d_active_regions, 0, MAX_ACTIVE_REGIONS * sizeof(ActiveRegion));
-
-        ActiveRegion h_bootstrap = {};
-        h_bootstrap.gate_positions[0] = make_float3(-500.0f, -500.0f, -500.0f);
-        h_bootstrap.gate_positions[1] = make_float3( 500.0f,  500.0f,  500.0f);
-        h_bootstrap.gate_positions[2] = make_float3(0.0f, 0.0f, 0.0f);
-        h_bootstrap.parent_shell = -1;
-        h_bootstrap.birth_frame = 0;
-        h_bootstrap.stability_integral = 0.0f;
-        h_bootstrap.state = REGION_STATE_ACTIVE;
-        cudaMemcpy(d_active_regions, &h_bootstrap, sizeof(ActiveRegion),
-                   cudaMemcpyHostToDevice);
-        h_num_active_regions = 1;
-        printf("[passive] ActiveRegion bootstrap: 1 all-encompassing region seeded (state=ACTIVE, bounds=±500)\n");
-    }
+    // Initialize topology (passive/active mask, hopfion, ActiveRegion bootstrap)
+    TopologyLocals topo = initTopology(ctx);
+    uint8_t* d_in_active_region = topo.d_in_active_region;
+    int* d_Q_sum = topo.d_Q_sum;
+    int* d_operator_counts = topo.d_operator_counts;
+    int* d_cell_topo_s = topo.d_cell_topo_s;
+    int* d_cell_topo_cnt = topo.d_cell_topo_cnt;
+    ActiveRegion* d_active_regions = topo.d_active_regions;
+    int h_num_active_regions = topo.h_num_active_regions;
+    int h_Q_sum = 0;
+    int h_operator_counts[5] = {};
+    int g_Q_target = 0;
+    float g_hopfion_flip_scale = 1.0f;
 
     // === WIRE SIMULATION CONTEXT ===
     // Shadow-wire all buffer pointers into the backend-agnostic context.
