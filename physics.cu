@@ -150,9 +150,14 @@ __global__ void siphonDiskKernel(
     vy += ay * dt;
     vz += az * dt;
 
-    // Angular momentum sink REMOVED — the Viviani field self-regulates
-    // through its topology. The sink was draining tangential velocity
-    // with no physical basis in the waveform gravity framework.
+    // Monadic short-circuit: if Viviani field produced non-finite values,
+    // write back unchanged state and skip all remaining physics for this frame.
+    // NaN from r≈0 divergence would otherwise poison the entire pipeline.
+    if (!isfinite(vx) || !isfinite(vy) || !isfinite(vz)) {
+        // Restore original velocity (don't write NaN back)
+        disk->pos_x[i] = px; disk->pos_y[i] = py; disk->pos_z[i] = pz;
+        return;
+    }
 
     px += vx * dt;
     py += vy * dt;
@@ -222,8 +227,6 @@ __global__ void siphonDiskKernel(
     // States 2 and 3 need special handling (coherence filter)
 
     if (state == PUMP_UPSTROKE_COHERENT) {
-        // Math.md Step 8: Coherence filter -λm_⊥
-        // Removes orthogonal components (entropy)
         float nx, ny, nz;
         compute_coherence_direction(px, py, pz, heartbeat, inv_r_cyl, nx, ny, nz,
                                     frx, fry, frz, ftx, fty, ftz, flx, fly, flz);
@@ -231,12 +234,15 @@ __global__ void siphonDiskKernel(
         float lambda = COHERENCE_LAMBDA * rate_mod;
         apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
 
-        scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, 1.0f);
-        coherent++;
-        state = PUMP_EXPAND;
+        // Monadic guard: if filter produced non-finite velocity (zero-velocity
+        // edge case), don't update scale — keep previous value and skip transition.
+        if (isfinite(vx) && isfinite(vy) && isfinite(vz)) {
+            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, 1.0f);
+            coherent++;
+            state = PUMP_EXPAND;
+        }
     }
     else if (state == PUMP_UPSTROKE_HOP) {
-        // Stronger filter for φ-hop — use 3D radial from local frame
         float nx = frx;
         float ny = fry;
         float nz = frz;
@@ -244,9 +250,11 @@ __global__ void siphonDiskKernel(
         float lambda = COHERENCE_LAMBDA * d_PHI * rate_mod;
         apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
 
-        scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, d_PHI);
-        coherent = 0;
-        state = PUMP_EXPAND;
+        if (isfinite(vx) && isfinite(vy) && isfinite(vz)) {
+            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, d_PHI);
+            coherent = 0;
+            state = PUMP_EXPAND;
+        }
     }
     else {
         // Other states handled by state machine
@@ -299,7 +307,6 @@ __global__ void siphonDiskKernel(
     // ========================================================================
     // STEP 15: FINAL COALESCED WRITE-BACK
     // ========================================================================
-
     disk->pos_x[i] = px;
     disk->pos_y[i] = py;
     disk->pos_z[i] = pz;
