@@ -652,8 +652,16 @@ inline bool topology_recorder_update(
             tr.crystal_confirmed = true;
         }
     } else {
-        tr.crystal_candidate_streak = 0;
-        tr.crystal_confirmed = false;
+        // Soft decay: decrement by 1 instead of hard reset to 0.
+        // A single noisy frame shouldn't erase 15 frames of crystal evidence.
+        // The streak is an analog nullable — 0 = no crystal evidence (null guard).
+        if (tr.crystal_candidate_streak > 0) {
+            tr.crystal_candidate_streak--;
+        }
+        // Only un-confirm if streak drops to zero (sustained noise, not a blip)
+        if (tr.crystal_candidate_streak == 0) {
+            tr.crystal_confirmed = false;
+        }
     }
 
     // Advance ring buffer
