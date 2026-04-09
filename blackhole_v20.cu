@@ -173,6 +173,7 @@ namespace vk {
 #include "cell_grid_kernels.cuh"      // scatter/field/gather 3-pass grid physics
 #include "kuramoto.cuh"               // R_cell, global R reduction, phase histogram
 #include "active_compact.cuh"         // Active compaction + sparse tile flags
+#include "sim_dispatch.cuh"           // dispatchCorePhysics()
 
 // ============================================================================
 // Main
@@ -864,106 +865,12 @@ int main(int argc, char** argv) {
                 arm_constants_dirty = false;
             }
 
-            // Use dynamic particle count (N_current grows via spawning)
+            // Core physics dispatch: mask → siphon → passive → hopfion → spawn
             int spawn_blocks = (N_current + threads - 1) / threads;
-
-#if ENABLE_PASSIVE_ADVECTION
-            // Tree Architecture Step 3 dispatch ordering:
-            // 1. computeInActiveRegionMask reads PREVIOUS frame's pump_residual
-            //    to classify particles as active (siphon) or passive (advect).
-            //    The one-frame lag is acceptable — pump_residual changes slowly.
-            // 2. siphonDiskKernel reads the mask and skips passive particles.
-            // 3. advectPassiveParticles reads the mask and processes passive ones.
-            // INVARIANT: for every alive particle, exactly one of siphon or
-            // passive does position/theta writes per frame. Both kernels'
-            // early-return conditions are mutually exclusive on in_active_region.
-            computeInActiveRegionMask<<<spawn_blocks, threads>>>(
-                d_disk, d_active_regions, h_num_active_regions,
-                d_in_active_region, N_current, g_corner_threshold);
-#endif
-
-            siphonDiskKernel<<<spawn_blocks, threads>>>(d_disk, d_in_active_region, N_current, sim_time, dt_sim * 2.0f, g_cam.seam_bits, g_cam.bias);
-
-#if ENABLE_PASSIVE_ADVECTION
-            advectPassiveParticles<<<spawn_blocks, threads>>>(
-                d_disk, d_in_active_region, N_current,
-                dt_sim * 2.0f, g_passive_residual_tau);
-#endif
-
-            // === HOPFION ENFORCEMENT: topological boundary conditions ===
-            // 1. Clear cell topo buffers
-            // 2. Scatter per-particle topo state to cell accumulators
-            // 3. Enforce: phason flip, fusion, tension explosion, iron freeze
-            {
-                int clear_blocks = (g_grid_cells + threads - 1) / threads;
-                clearTopoBuffers<<<clear_blocks, threads>>>(
-                    d_cell_topo_s, d_cell_topo_cnt, g_grid_cells);
-                scatterTopoToCells<<<spawn_blocks, threads>>>(
-                    d_disk, N_current, d_cell_topo_s, d_cell_topo_cnt);
-                cudaMemset(d_Q_sum, 0, sizeof(int));
-                cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
-                hopfionEnforceKernel<<<spawn_blocks, threads>>>(
-                    d_disk, d_in_active_region, N_current,
-                    d_cell_topo_s, d_cell_topo_cnt,
-                    d_Q_sum, d_operator_counts, sim_time, g_hopfion_flip_scale);
-            }
-
-            // === NATURAL GROWTH: Spawn new particles in coherent regions ===
-            if (SPAWN_ENABLE && N_current < MAX_DISK_PTS) {
-                // === ASYNC SPAWN: Apply previous frame's spawns first ===
-                // This avoids blocking - we read spawns one frame late, which is fine
-                if (spawn_pending) {
-                    cudaError_t status = cudaEventQuery(spawn_ready);
-                    if (status == cudaSuccess) {
-                        unsigned int h_spawned = *h_spawn_pinned;
-                        spawn_pending = false;
-
-                        if (h_spawned > 0) {
-                            // OOM protection: cap at RUNTIME_PARTICLE_CAP
-                            int new_total = N_current + (int)h_spawned;
-                            if (new_total > RUNTIME_PARTICLE_CAP) {
-                                static bool oom_warned = false;
-                                if (!oom_warned) {
-                                    printf("[OOM PROTECTION] Particle cap reached: %d (limit %d) — spawning disabled\n",
-                                           N_current, RUNTIME_PARTICLE_CAP);
-                                    oom_warned = true;
-                                }
-                                h_spawned = 0;
-                            }
-                            N_current += h_spawned;
-                            spawn_blocks = (N_current + threads - 1) / threads;
-
-                            // Log growth events (every 10k frames to reduce spam)
-                            static int last_log_frame = 0;
-                            if (frame - last_log_frame >= 10000) {
-                                printf("[growth] Frame %d: %d particles (%.1f%% capacity)\n",
-                                       frame, N_current,
-                                       100.0f * N_current / (float)MAX_DISK_PTS);
-                                last_log_frame = frame;
-                            }
-                        }
-                    }
-                    // If not ready, just wait until next frame (no stall)
-                }
-
-                // Launch spawn kernel for THIS frame (unless disabled for clean measurements)
-                if (g_spawn_enabled) {
-                    cudaMemsetAsync(d_spawn_idx, 0, sizeof(unsigned int), spawn_stream);
-                    cudaMemsetAsync(d_spawn_success, 0, sizeof(unsigned int), spawn_stream);
-
-                    unsigned int spawn_seed = (unsigned int)(frame * 12345 + (int)(sim_time * 1000));
-                    spawnParticlesKernel<<<spawn_blocks, threads, 0, spawn_stream>>>(
-                        d_disk, N_current, MAX_DISK_PTS, d_spawn_idx, d_spawn_success, sim_time, spawn_seed,
-                        d_in_active_region, d_grid_density
-                    );
-
-                    // Async copy spawn count (will be read NEXT frame)
-                    cudaMemcpyAsync(h_spawn_pinned, d_spawn_success, sizeof(unsigned int),
-                                   cudaMemcpyDeviceToHost, spawn_stream);
-                    cudaEventRecord(spawn_ready, spawn_stream);
-                    spawn_pending = true;
-                }
-            }
+            dispatchCorePhysics(ctx, sim_time, dt_sim, frame,
+                                g_cam.seam_bits, g_cam.bias,
+                                N_current, spawn_blocks, threads,
+                                spawn_pending, g_hopfion_flip_scale);
             if (do_timing) cudaEventRecord(t_siphon);
 
             // === OCTREE UPDATE (every N frames) ===
