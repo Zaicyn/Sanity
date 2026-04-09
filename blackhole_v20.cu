@@ -92,7 +92,8 @@
 #include "cli_args.cuh"               // parseCLI() — command line argument handling
 #include "diagnostics.cuh"            // StressCounters, PumpMetrics, sampling kernel
 #include "sim_context.h"              // SimulationContext — backend-agnostic state bundle
-#include "sim_init.cuh"               // initParticles() — particle setup + GPU upload
+#include "sim_init.cuh"               // initParticles(), initDiagnostics(), initOctree(), initGrid(), initTopology()
+#include "sim_cleanup.cuh"            // cleanupSimulation()
 
 // ============================================================================
 // Global Instances
@@ -3271,49 +3272,8 @@ int main(int argc, char** argv) {
     }
 #endif
 
-    // 3. Destroy streams before freeing resources allocated in them
-    cudaStreamDestroy(sample_stream);
-    cudaStreamDestroy(stats_stream);
-    cudaEventDestroy(stats_ready);
-    cudaFree(d_stress_async);
-    printf("[shutdown] CUDA streams destroyed\n");
-
-    // 4. Free large allocations (GPUDisk is ~280MB)
-    cudaFree(d_disk);
-    printf("[shutdown] Main particle data freed\n");
-
-    // 4b. Free topology ring buffer
-    topology_recorder_cleanup();
-    printf("[shutdown] Topology ring buffer freed\n");
-
-    // 4c. Free mip-tree hierarchy
-    mip_tree_cleanup();
-    printf("[shutdown] Mip-tree hierarchy freed\n");
-
-    // 5. Free smaller allocations
-    cudaFree(d_stress);
-    cudaFree(d_sample_indices);
-    cudaFree(d_sample_metrics[0]);
-    cudaFree(d_sample_metrics[1]);
-    cudaFreeHost(h_sample_metrics);
-    printf("[shutdown] Auxiliary data freed\n");
-
-    // 6. Free octree allocations
-    if (octreeEnabled) {
-        cudaFree(d_morton_keys);
-        cudaFree(d_xor_corners);
-        cudaFree(d_particle_ids);
-        cudaFree(d_octree_nodes);
-        cudaFree(d_node_count);
-        cudaFree(d_leaf_counts);
-        cudaFree(d_leaf_counts_culled);
-        cudaFree(d_leaf_offsets);
-        cudaFree(d_leaf_node_indices);
-        cudaFree(d_leaf_node_count);
-        printf("[shutdown] Octree data freed\n");
-    }
-
-    printf("[shutdown] Cleanup complete!\n");
+    // 3. Free all CUDA resources via context
+    cleanupSimulation(ctx, diag, octree);
 
     return 0;
 }
