@@ -91,6 +91,7 @@
 #include "sim_globals.h"              // Camera, physics flags, test suite globals
 #include "cli_args.cuh"               // parseCLI() — command line argument handling
 #include "diagnostics.cuh"            // StressCounters, PumpMetrics, sampling kernel
+#include "sim_context.h"              // SimulationContext — backend-agnostic state bundle
 
 // ============================================================================
 // Global Instances
@@ -209,6 +210,12 @@ int main(int argc, char** argv) {
     printf("[config] Particles: %d\n", num_particles);
     printf("[config] Topology: %s\n", g_use_hopfion_topology ? "Hopfion shells (discrete)" : "Smooth gradient (continuous)");
     printf("[config] Mode: %s\n", g_headless ? "HEADLESS (physics + logging only)" : "INTERACTIVE (with rendering)");
+
+    // === SIMULATION CONTEXT (backend-agnostic state bundle) ===
+    SimulationContext ctx = {};
+    ctx.particles.N_seed = num_particles;
+    ctx.particles.particle_cap = g_runtime_particle_cap;
+    ctx.timing.threads = 256;
 
     // === CONDITIONAL RENDERING SETUP ===
 #ifdef VULKAN_INTEROP
@@ -707,6 +714,8 @@ int main(int argc, char** argv) {
     // GPU allocation
     GPUDisk* d_disk;
     cudaMalloc(&d_disk, sizeof(GPUDisk));
+    ctx.particles.buf_disk = d_disk;
+    ctx.particles.N_current = N;
 
     // V8-STYLE: Zero-initialize ENTIRE struct before uploading seed particles
     // This ensures active[i]=false and ejected[i]=false for all i >= N
@@ -1164,6 +1173,80 @@ int main(int argc, char** argv) {
         h_num_active_regions = 1;
         printf("[passive] ActiveRegion bootstrap: 1 all-encompassing region seeded (state=ACTIVE, bounds=±500)\n");
     }
+
+    // === WIRE SIMULATION CONTEXT ===
+    // Shadow-wire all buffer pointers into the backend-agnostic context.
+    // Existing d_* locals remain for backward compat; ctx is the portable view.
+    // Particles
+    ctx.particles.buf_disk = d_disk;
+    ctx.particles.N_current = N_current;
+    // Diagnostics
+    ctx.diagnostics.buf_stress = d_stress;
+    ctx.diagnostics.buf_stress_async = d_stress_async;
+    ctx.diagnostics.buf_kr_sin_sum = d_kr_sin_sum;
+    ctx.diagnostics.buf_kr_cos_sum = d_kr_cos_sum;
+    ctx.diagnostics.buf_kr_count = d_kr_count;
+    ctx.diagnostics.buf_phase_hist = d_phase_hist;
+    ctx.diagnostics.buf_phase_omega_sum = d_phase_omega_sum;
+    ctx.diagnostics.buf_phase_omega_sq = d_phase_omega_sq;
+    ctx.diagnostics.buf_sample_indices = d_sample_indices;
+    ctx.diagnostics.buf_sample_metrics[0] = d_sample_metrics[0];
+    ctx.diagnostics.buf_sample_metrics[1] = d_sample_metrics[1];
+    ctx.diagnostics.buf_spawn_idx = d_spawn_idx;
+    ctx.diagnostics.buf_spawn_success = d_spawn_success;
+    ctx.diagnostics.kr_max_blocks = kr_max_blocks;
+    // Grid
+    ctx.grid.buf_density = d_grid_density;
+    ctx.grid.buf_momentum_x = d_grid_momentum_x;
+    ctx.grid.buf_momentum_y = d_grid_momentum_y;
+    ctx.grid.buf_momentum_z = d_grid_momentum_z;
+    ctx.grid.buf_phase_sin = d_grid_phase_sin;
+    ctx.grid.buf_phase_cos = d_grid_phase_cos;
+    ctx.grid.buf_pressure_x = d_grid_pressure_x;
+    ctx.grid.buf_pressure_y = d_grid_pressure_y;
+    ctx.grid.buf_pressure_z = d_grid_pressure_z;
+    ctx.grid.buf_vorticity_x = d_grid_vorticity_x;
+    ctx.grid.buf_vorticity_y = d_grid_vorticity_y;
+    ctx.grid.buf_vorticity_z = d_grid_vorticity_z;
+    ctx.grid.buf_R_cell = d_grid_R_cell;
+    ctx.grid.buf_particle_cell = d_particle_cell;
+    ctx.grid.buf_active_flags = d_active_flags;
+    ctx.grid.buf_tile_flags = d_tile_flags;
+    ctx.grid.buf_compact_active_list = d_compact_active_list;
+    ctx.grid.buf_compact_active_count = d_compact_active_count;
+    ctx.grid.buf_active_tiles = d_active_tiles;
+    ctx.grid.buf_active_tile_count = d_active_tile_count;
+    ctx.grid.enabled = g_grid_physics;
+    ctx.grid.flags_enabled = g_grid_flags;
+    // Active compaction
+    ctx.active_compact.buf_prev_cell = g_active_particles.d_prev_cell;
+    ctx.active_compact.buf_active_mask = g_active_particles.d_active_mask;
+    ctx.active_compact.buf_active_list = g_active_particles.d_active_list;
+    ctx.active_compact.buf_active_count = g_active_particles.d_active_count;
+    ctx.active_compact.buf_static_density = g_active_particles.d_static_density;
+    ctx.active_compact.buf_static_momentum_x = g_active_particles.d_static_momentum_x;
+    ctx.active_compact.buf_static_momentum_y = g_active_particles.d_static_momentum_y;
+    ctx.active_compact.buf_static_momentum_z = g_active_particles.d_static_momentum_z;
+    ctx.active_compact.buf_static_phase_sin = g_active_particles.d_static_phase_sin;
+    ctx.active_compact.buf_static_phase_cos = g_active_particles.d_static_phase_cos;
+    ctx.active_compact.enabled = g_active_compaction && g_grid_physics;
+    // Topology
+    ctx.topology.buf_in_active_region = d_in_active_region;
+    ctx.topology.buf_Q_sum = d_Q_sum;
+    ctx.topology.buf_operator_counts = d_operator_counts;
+    ctx.topology.buf_cell_topo_s = d_cell_topo_s;
+    ctx.topology.buf_cell_topo_cnt = d_cell_topo_cnt;
+    ctx.topology.buf_active_regions = d_active_regions;
+    ctx.topology.h_num_active_regions = h_num_active_regions;
+    ctx.topology.hopfion_flip_scale = g_hopfion_flip_scale;
+    // Async
+    ctx.async.sample_stream = &sample_stream;
+    ctx.async.stats_stream = &stats_stream;
+    ctx.async.spawn_stream = &spawn_stream;
+    ctx.async.stats_ready_event = &stats_ready;
+    ctx.async.spawn_ready_event = &spawn_ready;
+    ctx.async.pinned_sample_metrics = h_sample_metrics;
+    ctx.async.pinned_spawn_count = h_spawn_pinned;
 
     // Timing
     float sim_time = 0.0f;
