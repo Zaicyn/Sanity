@@ -164,6 +164,15 @@ struct SimulationContext {
     } topology;
 
     // ================================================================
+    // ACCUMULATORS — Sparse photonic representations of coherent clusters
+    // ================================================================
+    struct {
+        void* buf_accumulators;      // PhotonAccumulator* [ACCUMULATOR_MAX_COUNT]
+        void* buf_count;             // int* (atomic counter, reset each frame)
+        int   h_count;               // Host-side readback of accumulator count
+    } accumulators;
+
+    // ================================================================
     // ASYNC — Streams, events, pinned host memory
     // ================================================================
     struct {

@@ -684,6 +684,9 @@ int main(int argc, char** argv) {
     int g_Q_target = 0;
     float g_hopfion_flip_scale = 1.0f;
 
+    // Initialize photonic accumulators (sparse coherent cluster representation)
+    initAccumulators(ctx);
+
     // Context fully wired by init functions above — no manual shadow wiring needed.
 
     // Timing
@@ -1405,6 +1408,17 @@ int main(int argc, char** argv) {
                             pressure_k,
                             vorticity_k
                         );
+                    }
+
+                    // Collapse coherent cells into photonic accumulators
+                    {
+                        int* d_acc_count = static_cast<int*>(ctx.accumulators.buf_count);
+                        cudaMemset(d_acc_count, 0, sizeof(int));
+                        collapseToAccumulators<<<clearBlocks, 256>>>(
+                            d_grid_density, d_grid_phase_sin, d_grid_phase_cos,
+                            d_grid_momentum_x, d_grid_momentum_y, d_grid_momentum_z,
+                            static_cast<PhotonAccumulator*>(ctx.accumulators.buf_accumulators),
+                            d_acc_count, g_grid_cells);
                     }
 
                     // Pass 3: Gather cell forces to particles (every frame, O(1) lookup)
@@ -2145,9 +2159,12 @@ int main(int argc, char** argv) {
                            g_Q_target, h_Q_sum, h_Q_sum - g_Q_target, frame);
                     g_Q_target = h_Q_sum;
                 }
-                printf("[TOPO] frame %d Q=%d Qdelta=%d flips=%d freezes=%d fusions=%d tensions=%d vents=%d\n",
+                // Readback accumulator count
+                cudaMemcpy(&ctx.accumulators.h_count, ctx.accumulators.buf_count, sizeof(int), cudaMemcpyDeviceToHost);
+                printf("[TOPO] frame %d Q=%d Qdelta=%d flips=%d freezes=%d fusions=%d tensions=%d vents=%d acc=%d\n",
                        frame, h_Q_sum, h_Q_delta, h_operator_counts[0], h_operator_counts[1],
-                       h_operator_counts[2], h_operator_counts[3], h_operator_counts[4]);
+                       h_operator_counts[2], h_operator_counts[3], h_operator_counts[4],
+                       ctx.accumulators.h_count);
 
                 // Recycling equilibrium: adjust phason flip rate to balance fusion/vent
                 int fusions = h_operator_counts[2];

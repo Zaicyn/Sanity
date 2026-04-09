@@ -88,7 +88,11 @@ inline void cleanupSimulation(
     cudaFree(ctx.topology.buf_cell_topo_cnt);
     cudaFree(ctx.topology.buf_active_regions);
 
-    // 7. Free grid buffers (null-safe — cudaFree(nullptr) is a no-op)
+    // 7. Free accumulators
+    cudaFree(ctx.accumulators.buf_accumulators);
+    cudaFree(ctx.accumulators.buf_count);
+
+    // 8. Free grid buffers (null-safe — cudaFree(nullptr) is a no-op)
     cudaFree(ctx.grid.buf_density);
     cudaFree(ctx.grid.buf_momentum_x);
     cudaFree(ctx.grid.buf_momentum_y);

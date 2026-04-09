@@ -11,6 +11,7 @@
 #include "sim_context.h"
 #include "disk.cuh"
 #include "kuramoto.cuh"              // PHASE_HIST_BINS
+#include "photon_accumulator.cuh"    // PhotonAccumulator, ACCUMULATOR_MAX_COUNT
 
 // ============================================================================
 // initParticles — Host-side particle setup + GPU allocation + upload
@@ -639,4 +640,25 @@ inline TopologyLocals initTopology(SimulationContext& ctx) {
     ctx.topology.hopfion_flip_scale = 1.0f;
 
     return t;
+}
+
+// ============================================================================
+// initAccumulators — Sparse photonic accumulator buffers
+// ============================================================================
+
+inline void initAccumulators(SimulationContext& ctx) {
+    // PhotonAccumulator array + atomic counter
+    void* d_acc = nullptr;
+    void* d_cnt = nullptr;
+    cudaMalloc(&d_acc, ACCUMULATOR_MAX_COUNT * sizeof(PhotonAccumulator));
+    cudaMalloc(&d_cnt, sizeof(int));
+    cudaMemset(d_cnt, 0, sizeof(int));
+
+    ctx.accumulators.buf_accumulators = d_acc;
+    ctx.accumulators.buf_count = d_cnt;
+    ctx.accumulators.h_count = 0;
+
+    printf("[accumulator] Allocated: %d max accumulators (%.1f KB)\n",
+           ACCUMULATOR_MAX_COUNT,
+           ACCUMULATOR_MAX_COUNT * sizeof(PhotonAccumulator) / 1024.0f);
 }
