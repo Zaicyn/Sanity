@@ -77,11 +77,13 @@ inline void dispatchCorePhysics(
         scatterTopoToCells<<<spawn_blocks, threads>>>(
             d_disk, N_current, d_cell_topo_s, d_cell_topo_cnt);
         cudaMemset(d_Q_sum, 0, sizeof(int));
+        cudaMemset(static_cast<int*>(ctx.topology.buf_Q_delta_sum), 0, sizeof(int));
         cudaMemset(d_operator_counts, 0, 5 * sizeof(int));
         hopfionEnforceKernel<<<spawn_blocks, threads>>>(
             d_disk, d_in_active_region, N_current,
             d_cell_topo_s, d_cell_topo_cnt,
-            d_Q_sum, nullptr,  // d_Q_delta_sum: nullptr until conservation audit is wired
+            d_Q_sum,
+            static_cast<int*>(ctx.topology.buf_Q_delta_sum),
             d_operator_counts, sim_time, g_hopfion_flip_scale);
     }
 

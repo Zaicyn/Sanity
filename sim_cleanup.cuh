@@ -82,6 +82,7 @@ inline void cleanupSimulation(
     // 6. Free topology buffers
     cudaFree(ctx.topology.buf_in_active_region);
     cudaFree(ctx.topology.buf_Q_sum);
+    cudaFree(ctx.topology.buf_Q_delta_sum);
     cudaFree(ctx.topology.buf_operator_counts);
     cudaFree(ctx.topology.buf_cell_topo_s);
     cudaFree(ctx.topology.buf_cell_topo_cnt);

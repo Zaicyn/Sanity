@@ -2136,15 +2136,17 @@ int main(int argc, char** argv) {
 
                 // Hopfion Q_discrete readback (one-frame lag is fine)
                 cudaMemcpy(&h_Q_sum, topo.d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
+                int h_Q_delta = 0;
+                cudaMemcpy(&h_Q_delta, topo.d_Q_delta_sum, sizeof(int), cudaMemcpyDeviceToHost);
                 cudaMemcpy(h_operator_counts, topo.d_operator_counts, 5 * sizeof(int), cudaMemcpyDeviceToHost);
-                if (frame == 0) g_Q_target = h_Q_sum;  // Set conservation target on first read
+                if (frame == 0) g_Q_target = h_Q_sum;
                 if (h_Q_sum != g_Q_target) {
                     printf("[TOPO] Q DRIFT: %d → %d (Δ=%d) at frame %d\n",
                            g_Q_target, h_Q_sum, h_Q_sum - g_Q_target, frame);
-                    g_Q_target = h_Q_sum;  // Update target (statistical conservation)
+                    g_Q_target = h_Q_sum;
                 }
-                printf("[TOPO] frame %d Q_discrete=%d flips=%d freezes=%d fusions=%d tensions=%d vents=%d\n",
-                       frame, h_Q_sum, h_operator_counts[0], h_operator_counts[1],
+                printf("[TOPO] frame %d Q=%d Qdelta=%d flips=%d freezes=%d fusions=%d tensions=%d vents=%d\n",
+                       frame, h_Q_sum, h_Q_delta, h_operator_counts[0], h_operator_counts[1],
                        h_operator_counts[2], h_operator_counts[3], h_operator_counts[4]);
 
                 // Recycling equilibrium: adjust phason flip rate to balance fusion/vent

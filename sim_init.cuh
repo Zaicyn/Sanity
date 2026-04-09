@@ -581,6 +581,7 @@ inline GridLocals initGrid(SimulationContext& ctx) {
 struct TopologyLocals {
     uint8_t* d_in_active_region;
     int* d_Q_sum;
+    int* d_Q_delta_sum;      // Writer monad: per-frame Q conservation delta
     int* d_operator_counts;
     int* d_cell_topo_s;
     int* d_cell_topo_cnt;
@@ -600,8 +601,10 @@ inline TopologyLocals initTopology(SimulationContext& ctx) {
 
     // Hopfion enforcement
     cudaMalloc(&t.d_Q_sum, sizeof(int));
+    cudaMalloc(&t.d_Q_delta_sum, sizeof(int));  // Writer monad: conservation audit
     cudaMalloc(&t.d_operator_counts, 5 * sizeof(int));
     cudaMemset(t.d_Q_sum, 0, sizeof(int));
+    cudaMemset(t.d_Q_delta_sum, 0, sizeof(int));
     cudaMemset(t.d_operator_counts, 0, 5 * sizeof(int));
     cudaMalloc(&t.d_cell_topo_s, 4 * g_grid_cells * sizeof(int));
     cudaMalloc(&t.d_cell_topo_cnt, g_grid_cells * sizeof(int));
@@ -627,6 +630,7 @@ inline TopologyLocals initTopology(SimulationContext& ctx) {
     // Wire into context
     ctx.topology.buf_in_active_region = t.d_in_active_region;
     ctx.topology.buf_Q_sum = t.d_Q_sum;
+    ctx.topology.buf_Q_delta_sum = t.d_Q_delta_sum;
     ctx.topology.buf_operator_counts = t.d_operator_counts;
     ctx.topology.buf_cell_topo_s = t.d_cell_topo_s;
     ctx.topology.buf_cell_topo_cnt = t.d_cell_topo_cnt;

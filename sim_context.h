@@ -151,6 +151,7 @@ struct SimulationContext {
     struct {
         void* buf_in_active_region;
         void* buf_Q_sum;
+        void* buf_Q_delta_sum;       // Writer monad: per-frame Q conservation delta
         void* buf_operator_counts;
         void* buf_cell_topo_s;
         void* buf_cell_topo_cnt;
