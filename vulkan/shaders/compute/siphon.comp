@@ -1,0 +1,202 @@
+// siphon.comp — Core Viviani field physics kernel
+// =================================================
+// GLSL compute shader equivalent of siphonDiskKernel (CUDA).
+// Applies the Viviani field force, orbital-plane damping, coherence
+// filter, and pump state machine to active particles.
+//
+// This is the PRIMARY physics kernel — everything emerges from here.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// SoA particle buffers
+// ============================================================================
+
+layout(std430, set = 0, binding = 0) buffer PosX   { float pos_x[];   };
+layout(std430, set = 0, binding = 1) buffer PosY   { float pos_y[];   };
+layout(std430, set = 0, binding = 2) buffer PosZ   { float pos_z[];   };
+layout(std430, set = 0, binding = 3) buffer VelX   { float vel_x[];   };
+layout(std430, set = 0, binding = 4) buffer VelY   { float vel_y[];   };
+layout(std430, set = 0, binding = 5) buffer VelZ   { float vel_z[];   };
+layout(std430, set = 0, binding = 6) buffer PumpState   { int   pump_state[];   };
+layout(std430, set = 0, binding = 7) buffer PumpScale   { float pump_scale[];   };
+layout(std430, set = 0, binding = 8) buffer PumpCoherent{ int   pump_coherent[];};
+layout(std430, set = 0, binding = 9) buffer PumpResidual{ float pump_residual[];};
+layout(std430, set = 0, binding = 10) buffer PumpWork   { float pump_work[];    };
+layout(std430, set = 0, binding = 11) buffer PumpHistory{ float pump_history[]; };
+layout(std430, set = 0, binding = 12) buffer Theta      { float theta[];        };
+layout(std430, set = 0, binding = 13) buffer OmegaNat   { float omega_nat[];    };
+layout(std430, set = 0, binding = 14) buffer Flags      { uint  flags[];        };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion{ uint in_active_region[]; };
+
+// ============================================================================
+// Push constants
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const float TWO_PI = 6.28318530718;
+const float SCHW_R = 2.0;
+const uint  PFLAG_ACTIVE  = 0x01u;
+const uint  PFLAG_EJECTED = 0x02u;
+
+// ============================================================================
+// Viviani field force — the one primitive
+// ============================================================================
+//   x(θ) = sin(θ) - ½·sin(3θ)
+//   y(θ) = -cos(θ) + ½·cos(3θ)
+//   z(θ) = cos(θ)·cos(3θ)
+//
+// Tangent = dx/dθ, dy/dθ, dz/dθ
+
+void apply_viviani_field(
+    float px, float py, float pz,
+    float r3d, float inv_r3d,
+    inout float ax, inout float ay, inout float az)
+{
+    float r_safe = max(r3d, SCHW_R * 0.5);
+    float inv_r = (r3d >= SCHW_R * 0.5) ? inv_r3d : (1.0 / r_safe);
+
+    // Orbital phase
+    float theta_pos = atan(pz, px);
+
+    // Viviani curve tangent at this phase
+    float s1 = sin(theta_pos);
+    float c1 = cos(theta_pos);
+    float s3 = sin(3.0 * theta_pos);
+    float c3 = cos(3.0 * theta_pos);
+
+    float fx = c1 - 1.5 * c3;
+    float fy = s1 - 1.5 * s3;
+    float fz = -s1 * c3 - 3.0 * c1 * s3;
+
+    float inv_f = inversesqrt(fx*fx + fy*fy + fz*fz + 1e-8);
+    fx *= inv_f;
+    fy *= inv_f;
+    fz *= inv_f;
+
+    // Weight = field_strength / (1 + r²/falloff)
+    float weight = pc.FIELD_STRENGTH / (1.0 + r_safe * r_safe / pc.FIELD_FALLOFF);
+
+    // Radial unit vector
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    // Tangential: field direction projected ⊥ to radial
+    float f_dot_r = fx * rx + fy * ry + fz * rz;
+    float tx = fx - f_dot_r * rx;
+    float ty = fy - f_dot_r * ry;
+    float tz = fz - f_dot_r * rz;
+
+    // Centripetal (radial inward)
+    ax += -rx * weight;
+    ay += -ry * weight;
+    az += -rz * weight;
+
+    // Tangential (rotation)
+    ax += tx * weight * pc.TANGENT_SCALE;
+    ay += ty * weight * pc.TANGENT_SCALE;
+    az += tz * weight * pc.TANGENT_SCALE;
+}
+
+// ============================================================================
+// Main — simplified siphon step (Viviani field + integration)
+// ============================================================================
+// NOTE: This is the CORE physics only (field + damping + integration).
+// The full pump state machine (8 states, coherence filter, ejection)
+// will be added incrementally as separate compute passes or extended here.
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    // Skip passive/dead/ejected
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if (in_active_region[i] == 0u) return;
+
+    // Load state
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // Distances
+    float r3d_sq = px*px + py*py + pz*pz;
+    float inv_r3d = inversesqrt(r3d_sq + 1e-8);
+    float r3d = r3d_sq * inv_r3d;
+
+    // Viviani field force
+    float ax = 0.0, ay = 0.0, az = 0.0;
+    apply_viviani_field(px, py, pz, r3d, inv_r3d, ax, ay, az);
+
+    // Orbital-plane damping
+    float Lx = py * vz - pz * vy;
+    float Ly = pz * vx - px * vz;
+    float Lz = px * vy - py * vx;
+    float inv_L = inversesqrt(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8);
+    float lx = Lx * inv_L;
+    float ly = Ly * inv_L;
+    float lz = Lz * inv_L;
+
+    float v_sq = vx*vx + vy*vy + vz*vz;
+    if (v_sq > 0.001) {
+        float v_normal = vx * lx + vy * ly + vz * lz;
+        // Critically damped: γ(r) = 2·ω_z(r) = 2·√(BH_MASS/r³)
+        float r3 = r3d * r3d * r3d;
+        float omega_z = sqrt(pc.BH_MASS / max(r3, 1.0));
+        float damping = min(2.0 * omega_z, 0.50);
+        vx -= damping * v_normal * lx;
+        vy -= damping * v_normal * ly;
+        vz -= damping * v_normal * lz;
+    }
+
+    // Integrate velocity + position
+    vx += ax * pc.dt;
+    vy += ay * pc.dt;
+    vz += az * pc.dt;
+
+    // NaN guard (monadic short-circuit)
+    if (!isinf(vx) && !isnan(vx) &&
+        !isinf(vy) && !isnan(vy) &&
+        !isinf(vz) && !isnan(vz)) {
+        px += vx * pc.dt;
+        py += vy * pc.dt;
+        pz += vz * pc.dt;
+    }
+
+    // Write back
+    pos_x[i] = px;
+    pos_y[i] = py;
+    pos_z[i] = pz;
+    vel_x[i] = vx;
+    vel_y[i] = vy;
+    vel_z[i] = vz;
+
+    // Update pump history (exponential smoothing)
+    float scale = pump_scale[i];
+    float history = pump_history[i];
+    pump_history[i] = history * 0.98 + scale * 0.02;
+}

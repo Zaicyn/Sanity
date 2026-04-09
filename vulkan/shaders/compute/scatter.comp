@@ -1,0 +1,78 @@
+// scatter.comp — Particle-to-cell scatter (density + momentum + phase)
+// ====================================================================
+// GLSL equivalent of scatterParticlesToCells (CUDA).
+// Each thread processes one particle, atomically accumulating into grid cells.
+//
+// Dispatch: ceil(N / 256) workgroups
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Particle buffers (SoA)
+layout(std430, set = 0, binding = 0) readonly buffer PosX   { float pos_x[];   };
+layout(std430, set = 0, binding = 1) readonly buffer PosY   { float pos_y[];   };
+layout(std430, set = 0, binding = 2) readonly buffer PosZ   { float pos_z[];   };
+layout(std430, set = 0, binding = 3) readonly buffer VelX   { float vel_x[];   };
+layout(std430, set = 0, binding = 4) readonly buffer VelY   { float vel_y[];   };
+layout(std430, set = 0, binding = 5) readonly buffer VelZ   { float vel_z[];   };
+layout(std430, set = 0, binding = 6) readonly buffer Theta  { float theta[];   };
+layout(std430, set = 0, binding = 7) readonly buffer Flags  { uint  flags[];   };
+
+// Grid buffers (accumulation targets — atomicAdd)
+// Using uint for atomic operations; reinterpret as float on read
+layout(std430, set = 1, binding = 0) buffer GridDensity { uint grid_density[];   };
+layout(std430, set = 1, binding = 1) buffer GridMomX   { uint grid_momentum_x[];};
+layout(std430, set = 1, binding = 2) buffer GridMomY   { uint grid_momentum_y[];};
+layout(std430, set = 1, binding = 3) buffer GridMomZ   { uint grid_momentum_z[];};
+layout(std430, set = 1, binding = 4) buffer GridPhaseS { uint grid_phase_sin[]; };
+layout(std430, set = 1, binding = 5) buffer GridPhaseC { uint grid_phase_cos[]; };
+layout(std430, set = 1, binding = 6) buffer ParticleCell { uint particle_cell[];};
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    int   grid_dim;
+    float grid_cell_size;
+    float grid_half_size;
+} pc;
+
+const uint PFLAG_ACTIVE = 0x01u;
+
+// Note: Float atomic add requires GL_EXT_shader_atomic_float extension
+// or a CAS loop on the SSBO element. For now, density uses uint atomics
+// and momentum/phase accumulation is deferred to a separate pass.
+
+uint cellIndex(float px, float py, float pz) {
+    uint cx = uint(clamp((px + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    uint cy = uint(clamp((py + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    uint cz = uint(clamp((pz + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    return cx + cy * uint(pc.grid_dim) + cz * uint(pc.grid_dim * pc.grid_dim);
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    if ((flags[i] & PFLAG_ACTIVE) == 0u) return;
+
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+
+    uint cell = cellIndex(px, py, pz);
+    uint total_cells = uint(pc.grid_dim * pc.grid_dim * pc.grid_dim);
+    if (cell >= total_cells) return;
+
+    // Store cell assignment for gather phase
+    particle_cell[i] = cell;
+
+    // Atomic accumulation (using integer atomics, will convert on read)
+    atomicAdd(grid_density[cell], 1u);
+
+    // For momentum and phase, we need float atomics.
+    // GLSL 4.5 supports atomicAdd on uint SSBOs. Float atomics
+    // require the GL_EXT_shader_atomic_float extension or CAS loop.
+    // For now, accumulate density only (uint-safe).
+    // Momentum and phase accumulation will use the CAS pattern or
+    // a separate reduction pass.
+}
