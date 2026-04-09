@@ -1,0 +1,188 @@
+// spawn.comp — Toomre instability-driven particle spawning
+// ========================================================
+// GLSL equivalent of spawnParticlesKernel (CUDA).
+// Spawn fires when Toomre Q < 1 (gravitational instability).
+//
+// Dispatch: ceil(N / 256) workgroups
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Particle buffers (SoA)
+layout(std430, set = 0, binding = 0) buffer PosX    { float pos_x[];    };
+layout(std430, set = 0, binding = 1) buffer PosY    { float pos_y[];    };
+layout(std430, set = 0, binding = 2) buffer PosZ    { float pos_z[];    };
+layout(std430, set = 0, binding = 3) buffer VelX    { float vel_x[];    };
+layout(std430, set = 0, binding = 4) buffer VelY    { float vel_y[];    };
+layout(std430, set = 0, binding = 5) buffer VelZ    { float vel_z[];    };
+layout(std430, set = 0, binding = 6) buffer PScale  { float pump_scale[];  };
+layout(std430, set = 0, binding = 7) buffer PResid  { float pump_residual[];};
+layout(std430, set = 0, binding = 8) buffer PHist   { float pump_history[];};
+layout(std430, set = 0, binding = 9) buffer PState  { int   pump_state_arr[];};
+layout(std430, set = 0, binding = 10) buffer Flags  { uint  flags[];     };
+layout(std430, set = 0, binding = 11) buffer TopoSt { uint  topo_state[];};
+layout(std430, set = 0, binding = 12) buffer Theta  { float theta[];    };
+layout(std430, set = 0, binding = 13) buffer Omega  { float omega_nat[];};
+layout(std430, set = 0, binding = 14) readonly buffer ActiveReg { uint in_active_region[]; };
+
+// Spawn control
+layout(std430, set = 1, binding = 0) buffer SpawnIdx { uint spawn_idx; };
+layout(std430, set = 1, binding = 1) buffer SpawnOK  { uint spawn_success; };
+layout(std430, set = 1, binding = 2) readonly buffer GridDens { float grid_density[]; };
+
+layout(push_constant) uniform PushConstants {
+    int   N_current;
+    int   N_max;
+    float time;
+    uint  seed;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float SPAWN_COHERENCE_THRESH;
+    int   grid_dim;
+    float grid_cell_size;
+    float grid_half_size;
+} pc;
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+const uint PFLAG_VENT    = 0x04u;
+const float PI = 3.14159265;
+
+// Topo helpers
+int topo_get_axis(uint state, int axis) {
+    uint bits = (state >> (axis * 2)) & 0x03u;
+    return (bits == 1u) ? 1 : (bits == 2u) ? -1 : 0;
+}
+
+uint topo_set_axis(uint state, int axis, int val) {
+    uint bits = (val > 0) ? 1u : (val < 0) ? 2u : 0u;
+    uint mask = ~(0x03u << (axis * 2));
+    return (state & mask) | (bits << (axis * 2));
+}
+
+int topo_dim(uint state) {
+    int d = 0;
+    for (int a = 0; a < 4; a++)
+        if (topo_get_axis(state, a) != 0) d++;
+    return d;
+}
+
+uint cellIndex(float px, float py, float pz) {
+    uint cx = uint(clamp((px + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    uint cy = uint(clamp((py + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    uint cz = uint(clamp((pz + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    return cx + cy * uint(pc.grid_dim) + cz * uint(pc.grid_dim * pc.grid_dim);
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N_current) return;
+
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if (in_active_region[i] == 0u) return;
+
+    bool vent_pending = (f & PFLAG_VENT) != 0u;
+    float history = pump_history[i];
+    float scale = pump_scale[i];
+
+    if (!vent_pending) {
+        if (history < pc.SPAWN_COHERENCE_THRESH) return;
+
+        // Toomre Q check
+        float px = pos_x[i], py = pos_y[i], pz = pos_z[i];
+        float r_cyl = sqrt(px*px + pz*pz);
+        float r3d = sqrt(px*px + py*py + pz*pz);
+        float r_safe = max(r3d, 6.0);
+        float kappa = sqrt(pc.BH_MASS / (r_safe * r_safe * r_safe));
+        float c_s = abs(pump_residual[i]) + 0.01;
+
+        float Sigma = 1.0;
+        uint total_cells = uint(pc.grid_dim * pc.grid_dim * pc.grid_dim);
+        uint cell = cellIndex(px, py, pz);
+        if (cell < total_cells) {
+            Sigma = grid_density[cell] * pc.grid_cell_size;
+        }
+
+        float Q = c_s * kappa / (PI * pc.FIELD_STRENGTH * max(Sigma, 0.1));
+        if (Q >= 1.0) return;
+    }
+
+    // Energy budget
+    float vx = vel_x[i], vy = vel_y[i], vz = vel_z[i];
+    float v2 = vx*vx + vy*vy + vz*vz;
+    float T = 0.5 * v2;
+    float S = 0.1 * scale + 0.05 * history;
+    float E = T + S;
+    float E_child = E * 0.2;
+    float E_removed = E_child * 1.1;
+    if (E - E_removed < E * 0.01) return;
+
+    // Allocate spawn slot
+    int available = pc.N_max - pc.N_current;
+    if (available <= 0) return;
+    uint slot = atomicAdd(spawn_idx, 1u);
+    if (slot >= uint(available)) return;
+    int new_idx = pc.N_current + int(slot);
+
+    // Reduce parent velocity
+    float ke_frac = min((E_removed * 0.7) / max(T, 0.001), 0.5);
+    float vf = sqrt(1.0 - ke_frac);
+    vel_x[i] *= vf; vel_y[i] *= vf; vel_z[i] *= vf;
+
+    // RNG
+    uint rng = pc.seed ^ (uint(i) * 1664525u + 1013904223u);
+
+    // Child position (small offset from parent)
+    rng = rng * 1664525u + 1013904223u;
+    float dx = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 2.0;
+    rng = rng * 1664525u + 1013904223u;
+    float dy = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 0.5;
+    rng = rng * 1664525u + 1013904223u;
+    float dz = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 2.0;
+
+    pos_x[new_idx] = pos_x[i] + dx;
+    pos_y[new_idx] = pos_y[i] + dy;
+    pos_z[new_idx] = pos_z[i] + dz;
+
+    // Child velocity (fraction of parent)
+    float cvs = sqrt(E_child * 0.7 / max(T, 0.001));
+    cvs = min(cvs, 0.5);
+    rng = rng * 1664525u + 1013904223u;
+    float vxp = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 0.05;
+    rng = rng * 1664525u + 1013904223u;
+    float vyp = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 0.01;
+    rng = rng * 1664525u + 1013904223u;
+    float vzp = (float(rng & 0xFFFFu) / 65536.0 - 0.5) * 0.05;
+    vel_x[new_idx] = vx * cvs + vxp;
+    vel_y[new_idx] = vy * cvs + vyp;
+    vel_z[new_idx] = vz * cvs + vzp;
+
+    // Init child pump state
+    pump_scale[new_idx] = 1.0;
+    pump_residual[new_idx] = 0.0;
+    pump_history[new_idx] = history * 0.3;
+    pump_state_arr[new_idx] = 0;
+    theta[new_idx] = theta[i];
+    omega_nat[new_idx] = omega_nat[i];
+    flags[new_idx] = PFLAG_ACTIVE;
+
+    // Child topo: activate different axis than parent
+    uint parent_topo = topo_state[i] & 0xFFu;
+    uint child_topo = parent_topo;
+    rng = rng * 1664525u + 1013904223u;
+    int new_axis = int(rng & 0x03u);
+    for (int tries = 0; tries < 4; tries++) {
+        int a = (new_axis + tries) & 0x03;
+        if (topo_get_axis(parent_topo, a) == 0) {
+            rng = rng * 1664525u + 1013904223u;
+            int sign = ((rng & 1u) != 0u) ? 1 : -1;
+            child_topo = topo_set_axis(parent_topo, a, sign);
+            break;
+        }
+    }
+    topo_state[new_idx] = child_topo;
+
+    atomicAdd(spawn_success, 1u);
+}

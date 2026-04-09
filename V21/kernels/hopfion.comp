@@ -1,0 +1,131 @@
+// hopfion.comp — Topological enforcement kernel
+// ===============================================
+// GLSL equivalent of hopfionEnforceKernel (CUDA).
+// Applies phason flip, iron freeze, and accumulates Q_discrete.
+//
+// Dispatch: ceil(N / 256) workgroups
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Particle buffers
+layout(std430, set = 0, binding = 0) buffer TopoState   { uint  topo_state[]; };
+layout(std430, set = 0, binding = 1) readonly buffer PumpResidual { float pump_residual[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PumpState { int pump_state_arr[]; };
+layout(std430, set = 0, binding = 3) readonly buffer PumpHistory { float pump_history[]; };
+layout(std430, set = 0, binding = 4) buffer Flags { uint flags[]; };  // read-write: venting sets PFLAG_VENT_PENDING
+layout(std430, set = 0, binding = 5) readonly buffer ActiveRegion { uint in_active_region[]; };
+
+// Output counters
+layout(std430, set = 1, binding = 0) buffer QSum { int q_sum; };
+layout(std430, set = 1, binding = 1) buffer OpCounts { int op_counts[5]; }; // flips, freezes, fusions, tensions, vents
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float sim_time;
+    float flip_rate_scale;
+} pc;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+const uint TOPO_FROZEN   = 0xFFu;
+const float FLIP_BASE_RATE = 0.01;
+const float FREEZE_HISTORY = 0.01;
+const float VENT_HISTORY   = 0.5;
+
+// ============================================================================
+// Topo state helpers (2-bit per axis encoding)
+// ============================================================================
+
+int topo_get_axis(uint state, int axis) {
+    uint bits = (state >> (axis * 2)) & 0x03u;
+    return (bits == 1u) ? 1 : (bits == 2u) ? -1 : 0;
+}
+
+uint topo_set_axis(uint state, int axis, int val) {
+    uint bits = (val > 0) ? 1u : (val < 0) ? 2u : 0u;
+    uint mask = ~(0x03u << (axis * 2));
+    return (state & mask) | (bits << (axis * 2));
+}
+
+int topo_dim(uint state) {
+    int d = 0;
+    for (int a = 0; a < 4; a++)
+        if (topo_get_axis(state, a) != 0) d++;
+    return d;
+}
+
+// Discrete helicity Q = Σ_{i<j<k} ε_{ijk} s_i s_j s_k
+int topo_compute_Q(uint state) {
+    int s0 = topo_get_axis(state, 0);
+    int s1 = topo_get_axis(state, 1);
+    int s2 = topo_get_axis(state, 2);
+    int s3 = topo_get_axis(state, 3);
+    return s0*s1*s2 - s0*s1*s3 + s0*s2*s3 - s1*s2*s3;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if (in_active_region[i] == 0u) return;
+
+    uint state = topo_state[i] & 0xFFu;  // byte
+    int Q_before = (state == TOPO_FROZEN) ? 0 : topo_compute_Q(state);
+
+    // Simple LCG RNG
+    uint rng = uint(i) * 2654435761u + floatBitsToUint(pc.sim_time);
+
+    if (state != TOPO_FROZEN) {
+        // Phason flip: stochastic relaxation
+        float residual = abs(pump_residual[i]);
+        float flip_prob = FLIP_BASE_RATE * residual * pc.flip_rate_scale;
+        rng = rng * 1664525u + 1013904223u;
+        float r = float(rng & 0xFFFFu) / 65536.0;
+
+        if (r < flip_prob) {
+            int axis = int((rng >> 16) & 0x03u);
+            if (topo_get_axis(state, axis) != 0) {
+                // Phason flip = negate one axis
+                int s = topo_get_axis(state, axis);
+                uint flipped = topo_set_axis(state, axis, -s);
+                if (topo_dim(flipped) <= topo_dim(state)) {
+                    state = flipped;
+                    atomicAdd(op_counts[0], 1);
+                }
+            }
+        }
+
+        // Venting: dim-4 + high history → mark for spawn
+        if (topo_dim(state) == 4 && pump_history[i] > VENT_HISTORY) {
+            flags[i] = f | 0x04u;  // PFLAG_VENT_PENDING
+            atomicAdd(op_counts[4], 1);
+        }
+
+        // Iron freeze: dim-4 + IDLE + low history
+        if (topo_dim(state) == 4 &&
+            pump_state_arr[i] == 0 &&
+            pump_history[i] < FREEZE_HISTORY) {
+            state = TOPO_FROZEN;
+            atomicAdd(op_counts[1], 1);
+        }
+
+        topo_state[i] = state;
+    }
+
+    // Q accumulation (all particles, including frozen)
+    int Q_after = (state == TOPO_FROZEN) ? 0 : topo_compute_Q(state);
+    atomicAdd(q_sum, Q_after);
+}

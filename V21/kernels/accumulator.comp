@@ -1,0 +1,90 @@
+// accumulator.comp — Sparse photonic accumulator collapse
+// ========================================================
+// GLSL equivalent of collapseToAccumulators (CUDA).
+// Scans grid cells and emits accumulators for coherent clusters.
+//
+// Dispatch: ceil(total_cells / 256) workgroups
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Grid buffers (read after scatter pass)
+layout(std430, set = 0, binding = 0) readonly buffer GDensity { float density[];    };
+layout(std430, set = 0, binding = 1) readonly buffer GPhaseSin{ float phase_sin[];  };
+layout(std430, set = 0, binding = 2) readonly buffer GPhaseCos{ float phase_cos[];  };
+layout(std430, set = 0, binding = 3) readonly buffer GMomX    { float momentum_x[]; };
+layout(std430, set = 0, binding = 4) readonly buffer GMomY    { float momentum_y[]; };
+layout(std430, set = 0, binding = 5) readonly buffer GMomZ    { float momentum_z[]; };
+
+// Output: sparse accumulator array + atomic counter
+struct PhotonAccumulator {
+    float pos_x, pos_y, pos_z;
+    float frequency;
+    float amplitude;
+    float phase;
+    float coherence;
+    int   particle_count;
+};
+
+layout(std430, set = 1, binding = 0) buffer AccBuf { PhotonAccumulator accumulators[]; };
+layout(std430, set = 1, binding = 1) buffer AccCnt { int accumulator_count; };
+
+layout(push_constant) uniform PushConstants {
+    int   total_cells;
+    int   max_accumulators;
+    int   grid_dim;
+    float grid_cell_size;
+    float grid_half_size;
+    float min_density;      // 10.0
+    float min_coherence;    // 0.7
+} pc;
+
+void main() {
+    int cell = int(gl_GlobalInvocationID.x);
+    if (cell >= pc.total_cells) return;
+
+    float rho = density[cell];
+    if (rho < pc.min_density) return;
+
+    // Phase coherence R = |⟨e^{iθ}⟩| = √(sin² + cos²) / ρ
+    float ps = phase_sin[cell];
+    float pcos = phase_cos[cell];
+    float R = sqrt(ps * ps + pcos * pcos) / rho;
+
+    if (R < pc.min_coherence) return;
+
+    // Emit accumulator
+    int slot = atomicAdd(accumulator_count, 1);
+    if (slot >= pc.max_accumulators) return;
+
+    // Reconstruct cell center from index
+    uint cx = uint(cell) % uint(pc.grid_dim);
+    uint cy = (uint(cell) / uint(pc.grid_dim)) % uint(pc.grid_dim);
+    uint cz = uint(cell) / uint(pc.grid_dim * pc.grid_dim);
+
+    PhotonAccumulator acc;
+    acc.pos_x = float(cx) * pc.grid_cell_size - pc.grid_half_size + pc.grid_cell_size * 0.5;
+    acc.pos_y = float(cy) * pc.grid_cell_size - pc.grid_half_size + pc.grid_cell_size * 0.5;
+    acc.pos_z = float(cz) * pc.grid_cell_size - pc.grid_half_size + pc.grid_cell_size * 0.5;
+
+    // Amplitude = √ρ (wave superposition)
+    acc.amplitude = sqrt(rho);
+
+    // Phase = circular mean
+    acc.phase = atan(ps / rho, pcos / rho);
+
+    // Coherence
+    acc.coherence = R;
+    acc.particle_count = int(rho);
+
+    // Frequency = mean orbital velocity / radius
+    float mx = momentum_x[cell];
+    float my = momentum_y[cell];
+    float mz = momentum_z[cell];
+    float v_mean = sqrt(mx*mx + my*my + mz*mz) / rho;
+    float r = sqrt(acc.pos_x*acc.pos_x + acc.pos_y*acc.pos_y + acc.pos_z*acc.pos_z);
+    acc.frequency = (r > 1.0) ? v_mean / r : v_mean;
+
+    accumulators[slot] = acc;
+}

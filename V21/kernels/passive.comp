@@ -1,0 +1,144 @@
+// passive_advection.comp — Keplerian advection for passive particles
+// ==================================================================
+// GLSL compute shader equivalent of advectPassiveParticles (CUDA).
+// Passive particles orbit at Keplerian velocity with orbital-plane damping.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads
+// Each thread processes one particle.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// SoA particle buffers — matches GPUDisk layout
+// Each array is a separate SSBO binding for coalesced access.
+// ============================================================================
+
+layout(std430, set = 0, binding = 0) buffer PosX   { float pos_x[];   };
+layout(std430, set = 0, binding = 1) buffer PosY   { float pos_y[];   };
+layout(std430, set = 0, binding = 2) buffer PosZ   { float pos_z[];   };
+layout(std430, set = 0, binding = 3) buffer VelX   { float vel_x[];   };
+layout(std430, set = 0, binding = 4) buffer VelY   { float vel_y[];   };
+layout(std430, set = 0, binding = 5) buffer VelZ   { float vel_z[];   };
+layout(std430, set = 0, binding = 6) buffer Theta  { float theta[];   };
+layout(std430, set = 0, binding = 7) buffer OmegaN { float omega_nat[]; };
+layout(std430, set = 0, binding = 8) buffer Resid  { float pump_residual[]; };
+layout(std430, set = 0, binding = 9) buffer Flags  { uint  flags[];    };
+layout(std430, set = 0, binding = 10) buffer ActiveRegion { uint in_active_region[]; };
+
+// ============================================================================
+// Push constants — per-dispatch parameters
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;              // particle count
+    float dt;             // timestep
+    float residual_tau;   // decay time constant
+    float BH_MASS;        // central mass (100.0)
+} pc;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const float TWO_PI = 6.28318530718;
+const float PASSIVE_R_MIN = 3.0;
+const float PASSIVE_R_MAX = 200.0;
+const uint  PFLAG_ACTIVE  = 0x01u;
+const uint  PFLAG_EJECTED = 0x02u;
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    // Early returns: ownership invariants
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;          // dead
+    if ((f & PFLAG_EJECTED) != 0u) return;         // in jet
+    if (in_active_region[i] != 0u) return;         // siphon owns
+
+    // Load position and velocity
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // 3D radius
+    float r3d = sqrt(px*px + py*py + pz*pz);
+    if (r3d < PASSIVE_R_MIN || r3d > PASSIVE_R_MAX) return;
+
+    // Local orbital frame from angular momentum
+    float Lx = py * vz - pz * vy;
+    float Ly = pz * vx - px * vz;
+    float Lz = px * vy - py * vx;
+    float inv_L = inversesqrt(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8);
+    float lx = Lx * inv_L;
+    float ly = Ly * inv_L;
+    float lz = Lz * inv_L;
+
+    float inv_r3d = 1.0 / (r3d + 1e-8);
+    float rx = px * inv_r3d;
+    float ry = py * inv_r3d;
+    float rz = pz * inv_r3d;
+
+    // Tangential: t = L_hat × r_hat
+    float tx = ly * rz - lz * ry;
+    float ty = lz * rx - lx * rz;
+    float tz = lx * ry - ly * rx;
+    float inv_t = inversesqrt(tx*tx + ty*ty + tz*tz + 1e-8);
+    tx *= inv_t; ty *= inv_t; tz *= inv_t;
+
+    // Keplerian angular velocity
+    float r3 = r3d * r3d * r3d;
+    float omega_kep = sqrt(pc.BH_MASS / r3);
+    float dtheta = omega_kep * pc.dt;
+
+    // Rodrigues rotation around L_hat by dtheta
+    float cos_dt = cos(dtheta);
+    float sin_dt = sin(dtheta);
+
+    float crx = ly * pz - lz * py;
+    float cry = lz * px - lx * pz;
+    float crz = lx * py - ly * px;
+    float ldotr = lx * px + ly * py + lz * pz;
+
+    float px_new = px * cos_dt + crx * sin_dt + lx * ldotr * (1.0 - cos_dt);
+    float py_new = py * cos_dt + cry * sin_dt + ly * ldotr * (1.0 - cos_dt);
+    float pz_new = pz * cos_dt + crz * sin_dt + lz * ldotr * (1.0 - cos_dt);
+
+    // Orbital-plane damping
+    float v_normal = vx * lx + vy * ly + vz * lz;
+    float damping = 0.02;
+    vx -= damping * v_normal * lx;
+    vy -= damping * v_normal * ly;
+    vz -= damping * v_normal * lz;
+
+    // Write Keplerian tangential velocity
+    float v_kep = omega_kep * r3d;
+    vel_x[i] = v_kep * tx;
+    vel_y[i] = v_kep * ty;
+    vel_z[i] = v_kep * tz;
+
+    // Write back position
+    pos_x[i] = px_new;
+    pos_y[i] = py_new;
+    pos_z[i] = pz_new;
+
+    // Advance Kuramoto phase
+    float th = theta[i] + omega_nat[i] * pc.dt;
+    if (th >= TWO_PI) th -= TWO_PI;
+    if (th < 0.0) th += TWO_PI;
+    theta[i] = th;
+
+    // Decay pump residual
+    float decay = 1.0 - pc.dt / pc.residual_tau;
+    if (decay < 0.0) decay = 0.0;
+    pump_residual[i] *= decay;
+}
