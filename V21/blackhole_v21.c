@@ -259,6 +259,113 @@ static void physics_step(ParticleState* ps, float dt, float time) {
 }
 
 /* ========================================================================
+ * FRAME RENDERER — PPM image output (no libraries needed)
+ *
+ * Projects particles to 2D with orthographic projection.
+ * Color from topo_dim (same classification as V20 rendering).
+ * Additive blending for density — brighter = more particles.
+ *
+ * Output: PPM files → convert to video with:
+ *   ffmpeg -framerate 30 -i "frames/frame_%05d.ppm" -c:v libx264 output.mp4
+ * ======================================================================== */
+
+#define RENDER_WIDTH   1024
+#define RENDER_HEIGHT  1024
+
+/* Blackbody-ish color from topo_dim */
+static void dim_to_rgb(int dim, uint8_t* r, uint8_t* g, uint8_t* b) {
+    switch (dim) {
+        case 0: *r = 80;  *g = 20;  *b = 20;  break;  /* deep red */
+        case 1: *r = 255; *g = 140; *b = 40;  break;  /* orange */
+        case 2: *r = 255; *g = 240; *b = 180; break;  /* yellow-white */
+        case 3: *r = 160; *g = 200; *b = 255; break;  /* blue-white */
+        case 4: *r = 100; *g = 150; *b = 255; break;  /* bright blue */
+        default:*r = 255; *g = 255; *b = 255; break;
+    }
+}
+
+static int topo_dim_simple(uint8_t state) {
+    int d = 0;
+    for (int a = 0; a < 4; a++) {
+        uint8_t bits = (state >> (a * 2)) & 0x03;
+        if (bits == 1 || bits == 2) d++;
+    }
+    return d;
+}
+
+static void render_frame_ppm(const char* filename, ParticleState* ps,
+                              float cam_dist, float cam_yaw, float cam_pitch) {
+    /* Framebuffer: RGB accumulation (uint16 to handle additive blending) */
+    uint16_t* fb_r = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
+    uint16_t* fb_g = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
+    uint16_t* fb_b = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
+
+    /* Simple orbital camera */
+    float cy = cosf(cam_yaw), sy = sinf(cam_yaw);
+    float cp = cosf(cam_pitch), sp = sinf(cam_pitch);
+
+    float scale = (float)RENDER_WIDTH / (cam_dist * 2.0f);
+
+    for (int i = 0; i < ps->N; i++) {
+        if (!(ps->flags[i] & 0x01)) continue;
+
+        float px = ps->pos_x[i], py = ps->pos_y[i], pz = ps->pos_z[i];
+
+        /* Rotate by camera yaw (around Y) */
+        float rx = px * cy + pz * sy;
+        float rz = -px * sy + pz * cy;
+        float ry = py;
+
+        /* Rotate by camera pitch (around X) */
+        float ry2 = ry * cp - rz * sp;
+        float rz2 = ry * sp + rz * cp;
+
+        /* Orthographic projection */
+        int sx = (int)(rx * scale + RENDER_WIDTH / 2);
+        int sy2 = (int)(-ry2 * scale + RENDER_HEIGHT / 2);
+
+        if (sx < 0 || sx >= RENDER_WIDTH || sy2 < 0 || sy2 >= RENDER_HEIGHT) continue;
+
+        /* Color from topo_dim */
+        uint8_t r, g, b;
+        dim_to_rgb(topo_dim_simple(ps->topo_state[i]), &r, &g, &b);
+
+        /* Velocity brightness boost */
+        float vel = sqrtf(ps->vel_x[i]*ps->vel_x[i] + ps->vel_y[i]*ps->vel_y[i] + ps->vel_z[i]*ps->vel_z[i]);
+        float brightness = fminf(vel * 0.5f + 0.5f, 2.0f);
+
+        /* Additive blend (2x2 splat for visibility) */
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = 0; dx <= 1; dx++) {
+                int px2 = sx + dx, py2 = sy2 + dy;
+                if (px2 >= 0 && px2 < RENDER_WIDTH && py2 >= 0 && py2 < RENDER_HEIGHT) {
+                    int idx = py2 * RENDER_WIDTH + px2;
+                    fb_r[idx] += (uint16_t)(r * brightness);
+                    fb_g[idx] += (uint16_t)(g * brightness);
+                    fb_b[idx] += (uint16_t)(b * brightness);
+                }
+            }
+        }
+    }
+
+    /* Write PPM (P6 binary format) */
+    FILE* f = fopen(filename, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", RENDER_WIDTH, RENDER_HEIGHT);
+        for (int i = 0; i < RENDER_WIDTH * RENDER_HEIGHT; i++) {
+            uint8_t pixel[3];
+            pixel[0] = (uint8_t)fminf(fb_r[i], 255);
+            pixel[1] = (uint8_t)fminf(fb_g[i], 255);
+            pixel[2] = (uint8_t)fminf(fb_b[i], 255);
+            fwrite(pixel, 3, 1, f);
+        }
+        fclose(f);
+    }
+
+    free(fb_r); free(fb_g); free(fb_b);
+}
+
+/* ========================================================================
  * DIAGNOSTICS — minimal output
  * ======================================================================== */
 
@@ -289,6 +396,10 @@ int main(int argc, char** argv) {
     unsigned int seed = DEFAULT_SEED;
     float dt = DEFAULT_DT;
     int stats_interval = 90;
+    int render_interval = 0;   /* 0 = no rendering; >0 = write PPM every N frames */
+    float cam_dist = 250.0f;
+    float cam_yaw = 0.3f;
+    float cam_pitch = 0.5f;
 
     /* Simple CLI parsing */
     for (int i = 1; i < argc; i++) {
@@ -298,8 +409,15 @@ int main(int argc, char** argv) {
             num_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "--rng-seed") == 0 && i+1 < argc)
             seed = (unsigned int)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--render-ppm") == 0 && i+1 < argc)
+            render_interval = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--cam-dist") == 0 && i+1 < argc)
+            cam_dist = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21 [-n particles] [--frames N] [--rng-seed S]\n");
+            printf("       [--render-ppm interval] [--cam-dist D]\n");
+            printf("  --render-ppm N  Write PPM image every N frames to frames/\n");
+            printf("  --cam-dist D    Camera distance (default 250)\n");
             return 0;
         }
     }
@@ -310,7 +428,10 @@ int main(int argc, char** argv) {
     printf("================================================================\n\n");
     printf("[config] Particles: %d, Frames: %d, Seed: %u\n", num_particles, num_frames, seed);
     printf("[config] Backend: CPU (pure C reference implementation)\n");
-    printf("[config] Physics: Viviani field + orbital damping + Kuramoto\n\n");
+    printf("[config] Physics: Viviani field + orbital damping + Kuramoto\n");
+    if (render_interval > 0)
+        printf("[config] Rendering: PPM every %d frames (cam_dist=%.0f)\n", render_interval, cam_dist);
+    printf("\n");
 
     /* Initialize particles */
     ParticleState particles;
@@ -320,12 +441,32 @@ int main(int argc, char** argv) {
     float sim_time = 0.0f;
     clock_t start = clock();
 
+    /* Create frames directory if rendering */
+    if (render_interval > 0) {
+        #ifdef _WIN32
+        system("mkdir frames 2>nul");
+        #else
+        system("mkdir -p frames");
+        #endif
+    }
+
     for (int frame = 0; frame < num_frames; frame++) {
         physics_step(&particles, dt * 2.0f, sim_time);
         sim_time += dt;
 
+        /* Slowly rotate camera for visual interest */
+        float yaw = cam_yaw + (float)frame * 0.001f;
+
         if (frame % stats_interval == 0) {
             print_diagnostics(&particles, frame, sim_time);
+        }
+
+        if (render_interval > 0 && frame % render_interval == 0) {
+            char filename[256];
+            snprintf(filename, sizeof(filename), "frames/frame_%05d.ppm", frame);
+            render_frame_ppm(filename, &particles, cam_dist, yaw, cam_pitch);
+            if (frame % (render_interval * 10) == 0)
+                printf("[render] Wrote %s\n", filename);
         }
     }
 
