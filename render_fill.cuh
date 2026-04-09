@@ -113,8 +113,17 @@ __global__ void fillVulkanParticleBuffer(
         output[i].position[2] = pz;
         output[i].pump_scale = disk->pump_scale[i];
         output[i].pump_residual = disk->pump_residual[i];
-        float r_cyl = compute_disk_r(px, pz);
-        output[i].temp = compute_temp(r_cyl);
+        // Classification color from topological dimension (N).
+        // Maps to blackbody temperature for physically meaningful colors:
+        //   dim=0: unoccupied → deep red (1500K)
+        //   dim=1: moons/cores → orange (3000K)
+        //   dim=2: planets → yellow-white (5500K)
+        //   dim=3: stars → blue-white (8500K)
+        //   dim=4: galaxy core → bright blue (15000K)
+        // The hierarchy N=4→3→2→1 maps to decreasing temperature = cooling.
+        int dim = topo_dim(disk->topo_state[i]);
+        static const float dim_to_temp[] = {1.5f, 3.0f, 5.5f, 8.5f, 15.0f};
+        output[i].temp = dim_to_temp[dim];
         output[i].velocity[0] = disk->vel_x[i];
         output[i].velocity[1] = disk->vel_y[i];
         output[i].velocity[2] = disk->vel_z[i];
@@ -272,9 +281,11 @@ __global__ void fillVulkanParticleBufferLOD(
     // Get particle data
     float pump_scale = disk->pump_scale[i];
     float pump_residual = disk->pump_residual[i];
-    // Compute temp on-demand (saves 4 bytes/particle storage)
+    // Classification color from topological dimension
     float r_cyl = compute_disk_r(px, pz);
-    float temp = compute_temp(r_cyl);
+    int dim = topo_dim(disk->topo_state[i]);
+    static const float dim_to_temp_lod[] = {1.5f, 3.0f, 5.5f, 8.5f, 15.0f};
+    float temp = dim_to_temp_lod[dim];
     float vx = disk->vel_x[i];
     float vy = disk->vel_y[i];
     float vz = disk->vel_z[i];
