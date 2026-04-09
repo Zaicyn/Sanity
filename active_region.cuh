@@ -126,16 +126,16 @@ __global__ void computeInActiveRegionMask(
     float effective_residual = fabsf(residual);
 
     // Force active (siphon owns) if ANY of these hold:
-    //   - effective_residual > corner_threshold: off-shell or dynamically active
-    //   - r_cyl near ISCO or at boundary: violent physics / recycle territory
-    //   - ejected: in Aizawa jet, siphon owns entirely
-    //   - pump_history < 0.7: newborn (cf. SPAWN_COHERENCE_THRESH in disk.cuh:114)
+    //   - effective_residual > corner_threshold: dynamically active
+    //   - r_cyl near ISCO or at boundary: violent physics territory
+    //   - ejected: in jet, siphon owns entirely
+    //   - pump_history < 0.7: uninitialized or newborn (analog nullable:
+    //     history = 0.0 at init, converges to scale > 0.7 after pump cycles)
     bool force_active = (effective_residual > corner_threshold)
                      || (r_cyl < PASSIVE_R_MIN)
                      || (r_cyl > PASSIVE_R_MAX)
                      || particle_ejected(disk, i)
-                     || (disk->pump_history[i] < 0.7f)
-                     || (disk->pump_state[i] <= 1);  // IDLE or PRIMED — pump hasn't cycled yet
+                     || (disk->pump_history[i] < 0.7f);
 
     uint8_t new_val = force_active ? 1 : 0;
     uint8_t old_val = in_active_region[i];  // previous frame's classification

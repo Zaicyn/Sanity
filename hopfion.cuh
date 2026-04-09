@@ -85,6 +85,19 @@ inline void init_Q_lut() {
 // ============================================================================
 
 __device__ __forceinline__ int topo_Q_fast(uint8_t state) {
+    // Analog nullable: 0x00 = unoccupied (Q=0), 0xFF = frozen (Q=0)
+    // Any other byte with a reserved axis encoding (0x03) is invalid —
+    // the LUT maps it to 0 silently. In debug builds, flag it.
+#if defined(DEBUG_HOPFION) && DEBUG_HOPFION
+    if (state != 0x00 && state != 0xFF) {
+        for (int a = 0; a < 4; a++) {
+            if (((state >> (a * 2)) & 0x03) == TOPO_AXIS_RSVD) {
+                printf("[hopfion] WARNING: invalid topo_state 0x%02x (axis %d = reserved)\n", state, a);
+                break;
+            }
+        }
+    }
+#endif
     return d_Q_lut[state];
 }
 

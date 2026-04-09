@@ -7,6 +7,12 @@
 // Naming convention: buf_ prefix (not d_) — no backend assumption.
 // Rendering buffers are NOT included (they belong to the graphics layer).
 //
+// Analog nullable conventions (see nullable.h):
+//   void* buf_* = nullptr  → buffer not allocated (subsystem disabled)
+//   float fields = 0.0f    → uninitialized / inactive (exact 0 is collision-free
+//                             in continuous simulation — only occurs by explicit assignment)
+//   int indices = -1       → unassigned / no parent
+//
 // Usage:
 //   SimulationContext ctx = {};
 //   initParticles(ctx, ...);

@@ -109,7 +109,7 @@ inline GPUDisk* initParticles(SimulationContext& ctx, int N, unsigned int seed) 
         h_seam[i] = 0x00;
         h_residual[i] = 0.0f;
         h_work[i] = 0.0f;
-        h_history[i] = 1.0f;
+        h_history[i] = 0.0f;  // Analog nullable: 0.0 = uninitialized (forces active until pump cycles)
 
         // Kuramoto: uniform random phase, Gaussian natural frequency
         h_theta[i] = rphase(rng);
