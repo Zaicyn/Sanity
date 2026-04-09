@@ -87,14 +87,52 @@ struct CellGrid {
 // ============================================================================
 // Cell Grid Device Functions
 // ============================================================================
-// Note: Device functions that depend on d_grid_* constants are implemented
-// in blackhole_v20.cu since CUDA __constant__ variables can't be externed.
-//
-// Functions provided in .cu file:
-//   - cellToTile(cell) -> tile index
-//   - tileToFirstCell(tile) -> first cell in tile
-//   - cellIndexFromPos(px, py, pz) -> cell index
-//   - cellCoords(cell, &cx, &cy, &cz) -> extract coordinates
-//   - neighborCellIndex(cell, dx, dy, dz) -> neighbor cell
+// Spatial indexing primitives. Depend on d_grid_* __constant__ variables
+// from vram_config.cuh (included via disk.cuh → vram_config.cuh chain).
+
+#include "vram_config.cuh"
+
+#ifndef CELL_INDEX_FROM_POS_DEFINED
+#define CELL_INDEX_FROM_POS_DEFINED
+
+__device__ __forceinline__ uint32_t cellToTile(uint32_t cell) {
+    int tiles_per_dim = d_grid_dim / TILE_DIM;
+    uint32_t cx = cell % d_grid_dim;
+    uint32_t cy = (cell / d_grid_stride_y) % d_grid_dim;
+    uint32_t cz = cell / d_grid_stride_z;
+    return (cx / TILE_DIM) + (cy / TILE_DIM) * tiles_per_dim + (cz / TILE_DIM) * tiles_per_dim * tiles_per_dim;
+}
+
+__device__ __forceinline__ uint32_t tileToFirstCell(uint32_t tile) {
+    int tiles_per_dim = d_grid_dim / TILE_DIM;
+    uint32_t tx = tile % tiles_per_dim;
+    uint32_t ty = (tile / tiles_per_dim) % tiles_per_dim;
+    uint32_t tz = tile / (tiles_per_dim * tiles_per_dim);
+    return (tx * TILE_DIM) + (ty * TILE_DIM) * d_grid_stride_y + (tz * TILE_DIM) * d_grid_stride_z;
+}
+
+__device__ __forceinline__ uint32_t cellIndexFromPos(float px, float py, float pz) {
+    uint32_t cx = (uint32_t)fminf(fmaxf((px + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    uint32_t cy = (uint32_t)fminf(fmaxf((py + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    uint32_t cz = (uint32_t)fminf(fmaxf((pz + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
+    return cx + cy * d_grid_stride_y + cz * d_grid_stride_z;
+}
+
+__device__ __forceinline__ void cellCoords(uint32_t cell, uint32_t* cx, uint32_t* cy, uint32_t* cz) {
+    *cx = cell % d_grid_dim;
+    *cy = (cell / d_grid_stride_y) % d_grid_dim;
+    *cz = cell / d_grid_stride_z;
+}
+
+__device__ __forceinline__ uint32_t neighborCellIndex(uint32_t cell, int dx, int dy, int dz) {
+    uint32_t cx, cy, cz;
+    cellCoords(cell, &cx, &cy, &cz);
+    int nx = (int)cx + dx, ny = (int)cy + dy, nz = (int)cz + dz;
+    if (nx < 0 || nx >= d_grid_dim || ny < 0 || ny >= d_grid_dim || nz < 0 || nz >= d_grid_dim)
+        return UINT32_MAX;
+    return (uint32_t)nx + (uint32_t)ny * d_grid_stride_y + (uint32_t)nz * d_grid_stride_z;
+}
+
+#endif // CELL_INDEX_FROM_POS_DEFINED
 
 // End of cell_grid.cuh

@@ -22,20 +22,7 @@
 #pragma once
 
 #include "disk.cuh"
-#include "vram_config.cuh"  // d_grid_dim, d_grid_cells, d_grid_cell_size, d_grid_stride_y/z
-
-// Grid helper — needs GRID_HALF_SIZE and grid constants from cell_grid.cuh
-#include "cell_grid.cuh"
-
-#ifndef CELL_INDEX_FROM_POS_DEFINED
-#define CELL_INDEX_FROM_POS_DEFINED
-__device__ __forceinline__ uint32_t cellIndexFromPos(float px, float py, float pz) {
-    uint32_t cx = (uint32_t)fminf(fmaxf((px + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
-    uint32_t cy = (uint32_t)fminf(fmaxf((py + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
-    uint32_t cz = (uint32_t)fminf(fmaxf((pz + GRID_HALF_SIZE) / d_grid_cell_size, 0.f), (float)(d_grid_dim - 1));
-    return cx + cy * d_grid_stride_y + cz * d_grid_stride_z;
-}
-#endif
+#include "cell_grid.cuh"  // cellIndexFromPos, d_grid_cells, GRID_HALF_SIZE
 
 // ============================================================================
 // Compile-time constants (tune empirically before adding CLI flags)
