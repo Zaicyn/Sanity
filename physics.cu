@@ -41,40 +41,11 @@
 
 // ============================================================================
 // Device Constant Definitions
-// ============================================================================
-// These are declared extern in disk.cuh, defined here.
-// When included from blackhole_v20.cu (USE_MODULAR_PHYSICS), the constants
-// are already defined in blackhole_v20.cu, so we skip them here.
-
-#ifndef PHYSICS_CONSTANTS_DEFINED
-#define PHYSICS_CONSTANTS_DEFINED
-
-__device__ __constant__ float d_PI = 3.14159265358979f;
-__device__ __constant__ float d_TWO_PI = 6.28318530717959f;
-__device__ __constant__ float d_ISCO = 6.0f;
-__device__ __constant__ float d_BH_MASS = BH_MASS;  // Must match BH_MASS (100.0f) from disk.cuh
-__device__ __constant__ float d_SCHW_R = 2.0f;
-__device__ __constant__ float d_DISK_THICKNESS = 0.8f;
-__device__ __constant__ float d_PHI = 1.6180339887498948f;
-__device__ __constant__ float d_SCALE_RATIO = 1.6875f;        // 27/16
-__device__ __constant__ float d_BIAS = 0.75f;
-__device__ __constant__ float d_PHI_EXCESS = 0.09017f;        // φ - 1.5 ≈ 0.118
-
-// Spiral arm topology
-__device__ __constant__ int d_NUM_ARMS = 3;
-__device__ __constant__ float d_ARM_WIDTH_DEG = 45.0f;
-__device__ __constant__ float d_ARM_TRAP_STRENGTH = 0.15f;
-__device__ __constant__ bool d_USE_ARM_TOPOLOGY = true;
-__device__ __constant__ float d_ARM_BOOST_OVERRIDE = 0.0f;
-
-// Dynamic particle count
-__device__ unsigned int d_current_particle_count = 0;
-__device__ unsigned int d_spawn_count = 0;
-
-// Include topology.cuh here AFTER arm constants are defined
+// Physics constants — unified in physics_constants.cuh.
+// When included from blackhole_v20.cu, the header is already included.
+// When compiled standalone, include it here.
+#include "physics_constants.cuh"
 #include "topology.cuh"
-
-#endif // PHYSICS_CONSTANTS_DEFINED
 
 // ============================================================================
 // Siphon Disk Kernel — Main Physics Integration

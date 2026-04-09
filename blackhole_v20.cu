@@ -156,32 +156,8 @@ namespace vk {
 #define GRID_STRIDE_Y   g_grid_dim
 #define GRID_STRIDE_Z   (g_grid_dim * g_grid_dim)
 
-// ============================================================================
-// Device Constants
-// ============================================================================
-#define PHYSICS_CONSTANTS_DEFINED  // Guard: physics.cu won't redefine these
-
-__device__ __constant__ float d_PI = 3.14159265358979f;
-__device__ __constant__ float d_TWO_PI = 6.28318530717959f;
-__device__ __constant__ float d_ISCO = 6.0f;
-__device__ __constant__ float d_BH_MASS = BH_MASS;  // 100.0f from disk.cuh
-__device__ __constant__ float d_SCHW_R = 2.0f;
-__device__ __constant__ float d_DISK_THICKNESS = 0.8f;
-__device__ __constant__ float d_PHI = 1.6180339887498948f;
-__device__ __constant__ float d_SCALE_RATIO = 1.6875f;
-__device__ __constant__ float d_BIAS = 0.75f;
-__device__ __constant__ float d_PHI_EXCESS = 0.09017f;
-
-__device__ __constant__ int d_NUM_ARMS = 3;
-__device__ __constant__ float d_ARM_WIDTH_DEG = 45.0f;
-__device__ __constant__ float d_ARM_TRAP_STRENGTH = 0.15f;
-__device__ __constant__ bool d_USE_ARM_TOPOLOGY = true;
-__device__ __constant__ float d_ARM_BOOST_OVERRIDE = 0.0f;
-
-#include "topology.cuh"  // Must follow d_NUM_ARMS etc.
-
-__device__ unsigned int d_current_particle_count = 0;
-__device__ unsigned int d_spawn_count = 0;
+#include "physics_constants.cuh"  // d_PI, d_BH_MASS, d_PHI, arm constants, atomic counters
+#include "topology.cuh"           // Must follow arm constants from physics_constants.cuh
 
 // Cell grid device functions now in cell_grid.cuh (included above)
 
