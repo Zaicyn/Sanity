@@ -242,19 +242,26 @@ __global__ void spawnParticlesKernel(
         // Clear vent flag
         disk->flags[i] &= ~(uint8_t)PFLAG_VENT_PENDING;
     } else {
-        // Normal spawn: child inherits parent's state with one axis negated (phason flip)
-        int parent_dim = topo_dim(parent_topo);
-        if (parent_dim > 0) {
-            rng = rng * 1664525u + 1013904223u;
-            int start_axis = (int)(rng & 0x03);
-            for (int tries = 0; tries < 4; tries++) {
-                int a = (start_axis + tries) & 0x03;
-                if (topo_get_axis(parent_topo, a) != 0) {
-                    child_topo = hopfion_phason_flip(parent_topo, a);
-                    break;
-                }
+        // Normal spawn: child activates a DIFFERENT axis than parent.
+        // This seeds dimensional diversity — the recycling equilibrium
+        // needs multi-axis states to bootstrap fusion/venting.
+        // A spawn event creates a new degree of freedom (new orbital
+        // configuration), not a mirror of the parent.
+        rng = rng * 1664525u + 1013904223u;
+        int new_axis = (int)(rng & 0x03);
+        // Find an axis the parent DOESN'T occupy
+        for (int tries = 0; tries < 4; tries++) {
+            int a = (new_axis + tries) & 0x03;
+            if (topo_get_axis(parent_topo, a) == 0) {
+                // Child gets this new axis with random sign
+                rng = rng * 1664525u + 1013904223u;
+                int sign = (rng & 1) ? 1 : -1;
+                child_topo = topo_set_axis(parent_topo, a, sign);
+                break;
             }
         }
+        // If parent occupies all 4 axes (dim=4), child gets exact copy
+        // (venting will handle the overflow via PFLAG_VENT_PENDING)
     }
     disk->topo_state[new_idx] = child_topo;
 
