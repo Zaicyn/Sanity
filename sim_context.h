@@ -23,8 +23,14 @@
 
 #pragma once
 #include <cstdint>
+#include "sim_backend.h"
 
 struct SimulationContext {
+
+    // ================================================================
+    // COMPUTE BACKEND — vendor-neutral dispatch interface
+    // ================================================================
+    SimBackend backend;  // Function pointers for alloc/free/launch/sync
 
     // ================================================================
     // PARTICLES — The main SoA particle data

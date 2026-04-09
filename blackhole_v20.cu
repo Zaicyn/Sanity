@@ -92,6 +92,7 @@
 #include "cli_args.cuh"               // parseCLI() — command line argument handling
 #include "diagnostics.cuh"            // StressCounters, PumpMetrics, sampling kernel
 #include "sim_context.h"              // SimulationContext — backend-agnostic state bundle
+#include "cuda_backend.cuh"           // CUDA implementation of SimBackend
 #include "sim_init.cuh"               // initParticles(), initDiagnostics(), initOctree(), initGrid(), initTopology()
 #include "sim_cleanup.cuh"            // cleanupSimulation()
 
@@ -216,9 +217,12 @@ int main(int argc, char** argv) {
 
     // === SIMULATION CONTEXT (backend-agnostic state bundle) ===
     SimulationContext ctx = {};
+    ctx.backend = create_cuda_backend();  // CUDA backend (swap to Vulkan with -DBACKEND=vulkan)
     ctx.particles.N_seed = num_particles;
     ctx.particles.particle_cap = g_runtime_particle_cap;
     ctx.timing.threads = 256;
+    printf("[backend] Using %s (%.1f MB free / %.1f MB total)\n",
+           ctx.backend.name, ctx.backend.free_memory / 1e6, ctx.backend.total_memory / 1e6);
 
     // === CONDITIONAL RENDERING SETUP ===
 #ifdef VULKAN_INTEROP
