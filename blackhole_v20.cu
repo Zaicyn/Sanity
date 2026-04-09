@@ -571,7 +571,8 @@ int main(int argc, char** argv) {
     // Initialize diagnostics, sampling, async streams, topology recorder
     DiagnosticLocals diag = initDiagnostics(ctx, N);
 
-    // Unpack locals still referenced by the main loop
+    // Diagnostic locals still referenced by main loop (octree, grid, diagnostics output)
+    // These alias the struct fields — will be eliminated when those sections are extracted too.
     StressCounters* d_stress = diag.d_stress;
     StressCounters* d_stress_async = diag.d_stress_async;
     float* d_kr_sin_sum = diag.d_kr_sin_sum;
@@ -581,8 +582,6 @@ int main(int argc, char** argv) {
     int* d_phase_hist = diag.d_phase_hist;
     float* d_phase_omega_sum = diag.d_phase_omega_sum;
     float* d_phase_omega_sq = diag.d_phase_omega_sq;
-    unsigned int* d_spawn_idx = diag.d_spawn_idx;
-    unsigned int* d_spawn_success = diag.d_spawn_success;
     int* d_sample_indices = diag.d_sample_indices;
     SampleMetrics* d_sample_metrics[2] = { diag.d_sample_metrics[0], diag.d_sample_metrics[1] };
     SampleMetrics* h_sample_metrics = diag.h_sample_metrics;
@@ -590,18 +589,14 @@ int main(int argc, char** argv) {
     cudaStream_t sample_stream = diag.sample_stream;
     cudaStream_t stats_stream = diag.stats_stream;
     cudaEvent_t stats_ready = diag.stats_ready;
-    cudaStream_t spawn_stream = diag.spawn_stream;
-    cudaEvent_t spawn_ready = diag.spawn_ready;
-    unsigned int* h_spawn_pinned = diag.h_spawn_pinned;
     bool stats_pending = false;
     bool spawn_pending = false;
     int current_buffer = 0;
     int N_current = N;
     float R_global_cached = 0.0f;
+    const int KR_THREADS = 256;
 
-    const int KR_THREADS = 256;  // Block size for Kuramoto reduction
-
-    // Host readback vectors (small, needed every stats frame)
+    // Host readback vectors
     std::vector<float> h_kr_sin_sum(kr_max_blocks);
     std::vector<float> h_kr_cos_sum(kr_max_blocks);
     std::vector<int> h_kr_count(kr_max_blocks);
@@ -683,91 +678,13 @@ int main(int argc, char** argv) {
 
     // Initialize topology (passive/active mask, hopfion, ActiveRegion bootstrap)
     TopologyLocals topo = initTopology(ctx);
-    uint8_t* d_in_active_region = topo.d_in_active_region;
-    int* d_Q_sum = topo.d_Q_sum;
-    int* d_operator_counts = topo.d_operator_counts;
-    int* d_cell_topo_s = topo.d_cell_topo_s;
-    int* d_cell_topo_cnt = topo.d_cell_topo_cnt;
-    ActiveRegion* d_active_regions = topo.d_active_regions;
-    int h_num_active_regions = topo.h_num_active_regions;
+    // Topology locals used by diagnostics readback in main loop
     int h_Q_sum = 0;
     int h_operator_counts[5] = {};
     int g_Q_target = 0;
     float g_hopfion_flip_scale = 1.0f;
 
-    // === WIRE SIMULATION CONTEXT ===
-    // Shadow-wire all buffer pointers into the backend-agnostic context.
-    // Existing d_* locals remain for backward compat; ctx is the portable view.
-    // Particles
-    ctx.particles.buf_disk = d_disk;
-    ctx.particles.N_current = N_current;
-    // Diagnostics
-    ctx.diagnostics.buf_stress = d_stress;
-    ctx.diagnostics.buf_stress_async = d_stress_async;
-    ctx.diagnostics.buf_kr_sin_sum = d_kr_sin_sum;
-    ctx.diagnostics.buf_kr_cos_sum = d_kr_cos_sum;
-    ctx.diagnostics.buf_kr_count = d_kr_count;
-    ctx.diagnostics.buf_phase_hist = d_phase_hist;
-    ctx.diagnostics.buf_phase_omega_sum = d_phase_omega_sum;
-    ctx.diagnostics.buf_phase_omega_sq = d_phase_omega_sq;
-    ctx.diagnostics.buf_sample_indices = d_sample_indices;
-    ctx.diagnostics.buf_sample_metrics[0] = d_sample_metrics[0];
-    ctx.diagnostics.buf_sample_metrics[1] = d_sample_metrics[1];
-    ctx.diagnostics.buf_spawn_idx = d_spawn_idx;
-    ctx.diagnostics.buf_spawn_success = d_spawn_success;
-    ctx.diagnostics.kr_max_blocks = kr_max_blocks;
-    // Grid
-    ctx.grid.buf_density = d_grid_density;
-    ctx.grid.buf_momentum_x = d_grid_momentum_x;
-    ctx.grid.buf_momentum_y = d_grid_momentum_y;
-    ctx.grid.buf_momentum_z = d_grid_momentum_z;
-    ctx.grid.buf_phase_sin = d_grid_phase_sin;
-    ctx.grid.buf_phase_cos = d_grid_phase_cos;
-    ctx.grid.buf_pressure_x = d_grid_pressure_x;
-    ctx.grid.buf_pressure_y = d_grid_pressure_y;
-    ctx.grid.buf_pressure_z = d_grid_pressure_z;
-    ctx.grid.buf_vorticity_x = d_grid_vorticity_x;
-    ctx.grid.buf_vorticity_y = d_grid_vorticity_y;
-    ctx.grid.buf_vorticity_z = d_grid_vorticity_z;
-    ctx.grid.buf_R_cell = d_grid_R_cell;
-    ctx.grid.buf_particle_cell = d_particle_cell;
-    ctx.grid.buf_active_flags = d_active_flags;
-    ctx.grid.buf_tile_flags = d_tile_flags;
-    ctx.grid.buf_compact_active_list = d_compact_active_list;
-    ctx.grid.buf_compact_active_count = d_compact_active_count;
-    ctx.grid.buf_active_tiles = d_active_tiles;
-    ctx.grid.buf_active_tile_count = d_active_tile_count;
-    ctx.grid.enabled = g_grid_physics;
-    ctx.grid.flags_enabled = g_grid_flags;
-    // Active compaction
-    ctx.active_compact.buf_prev_cell = g_active_particles.d_prev_cell;
-    ctx.active_compact.buf_active_mask = g_active_particles.d_active_mask;
-    ctx.active_compact.buf_active_list = g_active_particles.d_active_list;
-    ctx.active_compact.buf_active_count = g_active_particles.d_active_count;
-    ctx.active_compact.buf_static_density = g_active_particles.d_static_density;
-    ctx.active_compact.buf_static_momentum_x = g_active_particles.d_static_momentum_x;
-    ctx.active_compact.buf_static_momentum_y = g_active_particles.d_static_momentum_y;
-    ctx.active_compact.buf_static_momentum_z = g_active_particles.d_static_momentum_z;
-    ctx.active_compact.buf_static_phase_sin = g_active_particles.d_static_phase_sin;
-    ctx.active_compact.buf_static_phase_cos = g_active_particles.d_static_phase_cos;
-    ctx.active_compact.enabled = g_active_compaction && g_grid_physics;
-    // Topology
-    ctx.topology.buf_in_active_region = d_in_active_region;
-    ctx.topology.buf_Q_sum = d_Q_sum;
-    ctx.topology.buf_operator_counts = d_operator_counts;
-    ctx.topology.buf_cell_topo_s = d_cell_topo_s;
-    ctx.topology.buf_cell_topo_cnt = d_cell_topo_cnt;
-    ctx.topology.buf_active_regions = d_active_regions;
-    ctx.topology.h_num_active_regions = h_num_active_regions;
-    ctx.topology.hopfion_flip_scale = g_hopfion_flip_scale;
-    // Async
-    ctx.async.sample_stream = &sample_stream;
-    ctx.async.stats_stream = &stats_stream;
-    ctx.async.spawn_stream = &spawn_stream;
-    ctx.async.stats_ready_event = &stats_ready;
-    ctx.async.spawn_ready_event = &spawn_ready;
-    ctx.async.pinned_sample_metrics = h_sample_metrics;
-    ctx.async.pinned_spawn_count = h_spawn_pinned;
+    // Context fully wired by init functions above — no manual shadow wiring needed.
 
     // Timing
     float sim_time = 0.0f;
@@ -1048,7 +965,7 @@ int main(int argc, char** argv) {
                     h_leaf_hash_size - 1, // Hash mask
                     h_leaf_node_count,
                     h_num_active,
-                    d_in_active_region,   // Step 3: skip passive particles
+                    topo.d_in_active_region,   // Step 3: skip passive particles
                     dt_sim,
                     pressure_k,
                     vorticity_k
@@ -1408,7 +1325,7 @@ int main(int argc, char** argv) {
                             d_disk, d_grid_density, d_grid_pressure_x, d_grid_pressure_y, d_grid_pressure_z,
                             d_grid_vorticity_x, d_grid_vorticity_y, d_grid_vorticity_z,
                             d_grid_phase_sin, d_grid_phase_cos,
-                            d_particle_cell, d_in_active_region,
+                            d_particle_cell, topo.d_in_active_region,
                             N_current, dt_sim, substrate_k, g_shear_k, shear_rho_ref,
                             g_kuramoto_k, g_n12_envelope ? 1 : 0, g_envelope_scale
                         );
@@ -1505,7 +1422,7 @@ int main(int argc, char** argv) {
                         d_grid_phase_sin,
                         d_grid_phase_cos,
                         d_particle_cell,
-                        d_in_active_region,
+                        topo.d_in_active_region,
                         N,
                         dt_sim,
                         substrate_k,
@@ -2197,7 +2114,7 @@ int main(int argc, char** argv) {
                 {
                     uint32_t h_active_region_count = 0;
                     std::vector<uint8_t> h_region_mask(N_current);
-                    cudaMemcpy(h_region_mask.data(), d_in_active_region,
+                    cudaMemcpy(h_region_mask.data(), topo.d_in_active_region,
                                N_current * sizeof(uint8_t), cudaMemcpyDeviceToHost);
                     for (int j = 0; j < N_current; j++)
                         if (h_region_mask[j]) h_active_region_count++;
@@ -2218,8 +2135,8 @@ int main(int argc, char** argv) {
                        active_frac);
 
                 // Hopfion Q_discrete readback (one-frame lag is fine)
-                cudaMemcpy(&h_Q_sum, d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_operator_counts, d_operator_counts, 5 * sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(&h_Q_sum, topo.d_Q_sum, sizeof(int), cudaMemcpyDeviceToHost);
+                cudaMemcpy(h_operator_counts, topo.d_operator_counts, 5 * sizeof(int), cudaMemcpyDeviceToHost);
                 if (frame == 0) g_Q_target = h_Q_sum;  // Set conservation target on first read
                 if (h_Q_sum != g_Q_target) {
                     printf("[TOPO] Q DRIFT: %d → %d (Δ=%d) at frame %d\n",
