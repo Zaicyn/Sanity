@@ -10,6 +10,7 @@
 #include <cstdio>
 #include "sim_context.h"
 #include "disk.cuh"
+#include "kuramoto.cuh"              // PHASE_HIST_BINS
 
 // ============================================================================
 // initParticles — Host-side particle setup + GPU allocation + upload
@@ -173,4 +174,119 @@ inline GPUDisk* initParticles(SimulationContext& ctx, int N, unsigned int seed) 
     ctx.particles.N_current = N;
 
     return d_disk;
+}
+
+// ============================================================================
+// initDiagnostics — Stress counters, Kuramoto reduction, phase histogram,
+//                   spawn counters, sampling, async streams/events
+// ============================================================================
+// Allocates all diagnostic and async infrastructure buffers.
+// Host-side readback vectors (h_kr_*, h_phase_*) remain in the caller
+// since they're read every stats frame — only device pointers go in ctx.
+
+struct DiagnosticLocals {
+    StressCounters* d_stress;
+    StressCounters* d_stress_async;
+    float* d_kr_sin_sum;
+    float* d_kr_cos_sum;
+    int* d_kr_count;
+    int kr_max_blocks;
+    int* d_phase_hist;
+    float* d_phase_omega_sum;
+    float* d_phase_omega_sq;
+    unsigned int* d_spawn_idx;
+    unsigned int* d_spawn_success;
+    int* d_sample_indices;
+    SampleMetrics* d_sample_metrics[2];
+    SampleMetrics* h_sample_metrics;
+    StressCounters h_stats_cache;
+    cudaStream_t sample_stream;
+    cudaStream_t stats_stream;
+    cudaEvent_t stats_ready;
+    cudaStream_t spawn_stream;
+    cudaEvent_t spawn_ready;
+    unsigned int* h_spawn_pinned;
+};
+
+inline DiagnosticLocals initDiagnostics(SimulationContext& ctx, int N) {
+    DiagnosticLocals d = {};
+
+    // Stress counters
+    cudaMalloc(&d.d_stress, sizeof(StressCounters));
+    cudaMalloc(&d.d_stress_async, sizeof(StressCounters));
+
+    // Kuramoto reduction buffers
+    const int KR_THREADS = 256;
+    d.kr_max_blocks = (ctx.particles.particle_cap + KR_THREADS - 1) / KR_THREADS;
+    cudaMalloc(&d.d_kr_sin_sum, d.kr_max_blocks * sizeof(float));
+    cudaMalloc(&d.d_kr_cos_sum, d.kr_max_blocks * sizeof(float));
+    cudaMalloc(&d.d_kr_count, d.kr_max_blocks * sizeof(int));
+
+    // Phase histogram
+    cudaMalloc(&d.d_phase_hist, PHASE_HIST_BINS * sizeof(int));
+    cudaMalloc(&d.d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float));
+    cudaMalloc(&d.d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float));
+
+    // Spawn counters
+    cudaMalloc(&d.d_spawn_idx, sizeof(unsigned int));
+    cudaMalloc(&d.d_spawn_success, sizeof(unsigned int));
+    cudaMemset(d.d_spawn_idx, 0, sizeof(unsigned int));
+    cudaMemset(d.d_spawn_success, 0, sizeof(unsigned int));
+
+    // Stratified sampling
+    std::vector<int> h_sample_indices(SAMPLE_COUNT);
+    for (int i = 0; i < SAMPLE_COUNT; i++)
+        h_sample_indices[i] = (i * N) / SAMPLE_COUNT;
+    cudaMalloc(&d.d_sample_indices, SAMPLE_COUNT * sizeof(int));
+    cudaMemcpy(d.d_sample_indices, h_sample_indices.data(),
+               SAMPLE_COUNT * sizeof(int), cudaMemcpyHostToDevice);
+
+    // Double-buffered sample metrics
+    cudaMalloc(&d.d_sample_metrics[0], sizeof(SampleMetrics));
+    cudaMalloc(&d.d_sample_metrics[1], sizeof(SampleMetrics));
+    cudaMallocHost(&d.h_sample_metrics, sizeof(SampleMetrics));
+    d.h_sample_metrics->avg_scale = 1.0f;
+    d.h_sample_metrics->avg_residual = 0.0f;
+    d.h_sample_metrics->total_work = 0.0f;
+
+    // Async streams and events
+    cudaStreamCreate(&d.sample_stream);
+    cudaStreamCreate(&d.stats_stream);
+    cudaEventCreate(&d.stats_ready);
+    cudaStreamCreate(&d.spawn_stream);
+    cudaEventCreate(&d.spawn_ready);
+    cudaMallocHost(&d.h_spawn_pinned, sizeof(unsigned int));
+    *d.h_spawn_pinned = 0;
+
+    d.h_stats_cache = {};
+
+    // Topology ring buffer
+    if (!topology_recorder_init()) {
+        fprintf(stderr, "[topo] WARNING: Failed to initialize topology recorder\n");
+    }
+
+    // Wire into context
+    ctx.diagnostics.buf_stress = d.d_stress;
+    ctx.diagnostics.buf_stress_async = d.d_stress_async;
+    ctx.diagnostics.buf_kr_sin_sum = d.d_kr_sin_sum;
+    ctx.diagnostics.buf_kr_cos_sum = d.d_kr_cos_sum;
+    ctx.diagnostics.buf_kr_count = d.d_kr_count;
+    ctx.diagnostics.buf_phase_hist = d.d_phase_hist;
+    ctx.diagnostics.buf_phase_omega_sum = d.d_phase_omega_sum;
+    ctx.diagnostics.buf_phase_omega_sq = d.d_phase_omega_sq;
+    ctx.diagnostics.buf_spawn_idx = d.d_spawn_idx;
+    ctx.diagnostics.buf_spawn_success = d.d_spawn_success;
+    ctx.diagnostics.buf_sample_indices = d.d_sample_indices;
+    ctx.diagnostics.buf_sample_metrics[0] = d.d_sample_metrics[0];
+    ctx.diagnostics.buf_sample_metrics[1] = d.d_sample_metrics[1];
+    ctx.diagnostics.kr_max_blocks = d.kr_max_blocks;
+    ctx.async.sample_stream = &d.sample_stream;
+    ctx.async.stats_stream = &d.stats_stream;
+    ctx.async.stats_ready_event = &d.stats_ready;
+    ctx.async.spawn_stream = &d.spawn_stream;
+    ctx.async.spawn_ready_event = &d.spawn_ready;
+    ctx.async.pinned_sample_metrics = d.h_sample_metrics;
+    ctx.async.pinned_spawn_count = d.h_spawn_pinned;
+
+    return d;
 }

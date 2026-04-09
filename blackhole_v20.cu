@@ -566,104 +566,46 @@ int main(int argc, char** argv) {
     int N = num_particles;
     GPUDisk* d_disk = initParticles(ctx, N, g_rng_seed);
 
-    StressCounters* d_stress;
-    cudaMalloc(&d_stress, sizeof(StressCounters));
+    // Initialize diagnostics, sampling, async streams, topology recorder
+    DiagnosticLocals diag = initDiagnostics(ctx, N);
 
-    // === KURAMOTO ORDER PARAMETER BUFFERS ===
-    // Pre-allocate for the largest expected particle count so we don't
-    // reallocate if N_current grows via spawning.
-    const int KR_THREADS = 256;
-    int kr_max_blocks = (RUNTIME_PARTICLE_CAP + KR_THREADS - 1) / KR_THREADS;
-    float* d_kr_sin_sum;
-    float* d_kr_cos_sum;
-    int* d_kr_count;
-    cudaMalloc(&d_kr_sin_sum, kr_max_blocks * sizeof(float));
-    cudaMalloc(&d_kr_cos_sum, kr_max_blocks * sizeof(float));
-    cudaMalloc(&d_kr_count, kr_max_blocks * sizeof(int));
-    // Host buffers for the block partial sums (small — one float per block)
+    // Unpack locals still referenced by the main loop
+    StressCounters* d_stress = diag.d_stress;
+    StressCounters* d_stress_async = diag.d_stress_async;
+    float* d_kr_sin_sum = diag.d_kr_sin_sum;
+    float* d_kr_cos_sum = diag.d_kr_cos_sum;
+    int* d_kr_count = diag.d_kr_count;
+    int kr_max_blocks = diag.kr_max_blocks;
+    int* d_phase_hist = diag.d_phase_hist;
+    float* d_phase_omega_sum = diag.d_phase_omega_sum;
+    float* d_phase_omega_sq = diag.d_phase_omega_sq;
+    unsigned int* d_spawn_idx = diag.d_spawn_idx;
+    unsigned int* d_spawn_success = diag.d_spawn_success;
+    int* d_sample_indices = diag.d_sample_indices;
+    SampleMetrics* d_sample_metrics[2] = { diag.d_sample_metrics[0], diag.d_sample_metrics[1] };
+    SampleMetrics* h_sample_metrics = diag.h_sample_metrics;
+    StressCounters h_stats_cache = diag.h_stats_cache;
+    cudaStream_t sample_stream = diag.sample_stream;
+    cudaStream_t stats_stream = diag.stats_stream;
+    cudaEvent_t stats_ready = diag.stats_ready;
+    cudaStream_t spawn_stream = diag.spawn_stream;
+    cudaEvent_t spawn_ready = diag.spawn_ready;
+    unsigned int* h_spawn_pinned = diag.h_spawn_pinned;
+    bool stats_pending = false;
+    bool spawn_pending = false;
+    int current_buffer = 0;
+    int N_current = N;
+    float R_global_cached = 0.0f;
+
+    const int KR_THREADS = 256;  // Block size for Kuramoto reduction
+
+    // Host readback vectors (small, needed every stats frame)
     std::vector<float> h_kr_sin_sum(kr_max_blocks);
     std::vector<float> h_kr_cos_sum(kr_max_blocks);
     std::vector<int> h_kr_count(kr_max_blocks);
-    float R_global_cached = 0.0f;  // Last computed order parameter
-
-    // Phase histogram (for multi-domain clustering confirmation) and
-    // per-bin ω statistics (for velocity filter / sieve verification)
-    int* d_phase_hist;
-    float* d_phase_omega_sum;
-    float* d_phase_omega_sq;
-    cudaMalloc(&d_phase_hist, PHASE_HIST_BINS * sizeof(int));
-    cudaMalloc(&d_phase_omega_sum, PHASE_HIST_BINS * sizeof(float));
-    cudaMalloc(&d_phase_omega_sq, PHASE_HIST_BINS * sizeof(float));
     std::vector<int> h_phase_hist(PHASE_HIST_BINS);
     std::vector<float> h_phase_omega_sum(PHASE_HIST_BINS);
     std::vector<float> h_phase_omega_sq(PHASE_HIST_BINS);
-
-    // === NATURAL GROWTH: Spawn counter for atomic allocation ===
-    // V8-style: separate counter for attempted slots vs successful spawns
-    unsigned int* d_spawn_idx;      // Atomic slot allocation (may exceed capacity)
-    unsigned int* d_spawn_success;  // Only counts SUCCESSFUL spawns (V8 pattern)
-    cudaMalloc(&d_spawn_idx, sizeof(unsigned int));
-    cudaMalloc(&d_spawn_success, sizeof(unsigned int));
-    cudaMemset(d_spawn_idx, 0, sizeof(unsigned int));
-    cudaMemset(d_spawn_success, 0, sizeof(unsigned int));
-    int N_current = N;  // Track current particle count (grows over time)
-
-    // === STRATIFIED SAMPLING SETUP ===
-    // Generate sample indices evenly spaced across the particle array.
-    // (Host position vectors are no longer in scope after initParticles extraction.)
-    std::vector<int> h_sample_indices(SAMPLE_COUNT);
-    for (int i = 0; i < SAMPLE_COUNT; i++)
-        h_sample_indices[i] = (i * N) / SAMPLE_COUNT;
-
-    // Upload sample indices to GPU
-    int* d_sample_indices;
-    cudaMalloc(&d_sample_indices, SAMPLE_COUNT * sizeof(int));
-    cudaMemcpy(d_sample_indices, h_sample_indices.data(), SAMPLE_COUNT * sizeof(int), cudaMemcpyHostToDevice);
-
-    // === ASYNC DOUBLE-BUFFERING SETUP ===
-    // Two buffers for async transfer - read from one while writing to the other
-    SampleMetrics* d_sample_metrics[2];
-    cudaMalloc(&d_sample_metrics[0], sizeof(SampleMetrics));
-    cudaMalloc(&d_sample_metrics[1], sizeof(SampleMetrics));
-
-    // Host-side pinned memory for async transfer (faster than pageable)
-    SampleMetrics* h_sample_metrics;
-    cudaMallocHost(&h_sample_metrics, sizeof(SampleMetrics));
-    h_sample_metrics->avg_scale = 1.0f;
-    h_sample_metrics->avg_residual = 0.0f;
-    h_sample_metrics->total_work = 0.0f;
-
-    // CUDA stream for async operations
-    cudaStream_t sample_stream;
-    cudaStreamCreate(&sample_stream);
-
-    // Async stats stream - reduction runs without blocking main loop
-    cudaStream_t stats_stream;
-    cudaStreamCreate(&stats_stream);
-    cudaEvent_t stats_ready;
-    cudaEventCreate(&stats_ready);
-    StressCounters* d_stress_async = nullptr;  // Async buffer (separate from d_stress)
-    cudaMalloc(&d_stress_async, sizeof(StressCounters));
-    StressCounters h_stats_cache = {};  // Cached results from last completed reduction
-    bool stats_pending = false;  // True if async reduction is in flight
-
-    // Async spawn count stream - read previous frame's spawns without blocking
-    cudaStream_t spawn_stream;
-    cudaStreamCreate(&spawn_stream);
-    cudaEvent_t spawn_ready;
-    cudaEventCreate(&spawn_ready);
-    unsigned int* h_spawn_pinned = nullptr;  // Pinned memory for async copy
-    cudaMallocHost(&h_spawn_pinned, sizeof(unsigned int));
-    *h_spawn_pinned = 0;
-    bool spawn_pending = false;  // True if spawn count copy is in flight
-
-    int current_buffer = 0;  // Double-buffer index
-
-    // === TOPOLOGY RING BUFFER INITIALIZATION ===
-    // Records downsampled m-field (64³) every frame for crystal detection
-    if (!topology_recorder_init()) {
-        fprintf(stderr, "[topo] WARNING: Failed to initialize topology recorder\n");
-    }
 
     // === OCTREE ALLOCATIONS ===
     // Morton-sorted spatial tree for unified physics/rendering
