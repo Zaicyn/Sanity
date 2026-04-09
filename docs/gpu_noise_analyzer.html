@@ -1,0 +1,1006 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GPU Noise Topology — 27/16 Phase Mapper</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Bebas+Neue&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #020408;
+    --panel: #060d14;
+    --border: #0a2030;
+    --accent: #00c8ff;
+    --hot: #ff4a1a;
+    --cold: #0066aa;
+    --text: #7abcd4;
+    --dim: #2a4a5a;
+    --glow: 0 0 12px rgba(0,200,255,0.4);
+  }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Share Tech Mono', monospace;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  #app {
+    display: grid;
+    grid-template-columns: 1fr 300px;
+    grid-template-rows: 40px 1fr 180px;
+    height: 100vh;
+    gap: 1px;
+    background: var(--border);
+  }
+
+  #header {
+    grid-column: 1 / -1;
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    gap: 24px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  #header h1 {
+    font-family: 'Bebas Neue', sans-serif;
+    font-size: 18px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-shadow: var(--glow);
+  }
+
+  .tag {
+    font-size: 9px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    text-transform: uppercase;
+  }
+
+  #status-bar {
+    margin-left: auto;
+    display: flex;
+    gap: 20px;
+    font-size: 10px;
+    color: var(--dim);
+  }
+
+  #status-bar span { color: var(--accent); }
+
+  /* MAIN SHADER CANVAS */
+  #canvas-wrap {
+    background: #000;
+    position: relative;
+    overflow: hidden;
+  }
+
+  #glcanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  /* Scanline overlay */
+  #canvas-wrap::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.06) 2px,
+      rgba(0,0,0,0.06) 4px
+    );
+    pointer-events: none;
+  }
+
+  /* Crosshair overlay */
+  #crosshair {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    opacity: 0.2;
+  }
+  #crosshair::before, #crosshair::after {
+    content: '';
+    position: absolute;
+    background: var(--accent);
+  }
+  #crosshair::before { width: 1px; height: 40px; top: -20px; left: 0; }
+  #crosshair::after  { width: 40px; height: 1px; left: -20px; top: 0; }
+
+  /* SIDEBAR */
+  #sidebar {
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    overflow: hidden;
+  }
+
+  .panel-block {
+    border-bottom: 1px solid var(--border);
+    padding: 10px 12px;
+  }
+
+  .panel-label {
+    font-size: 8px;
+    letter-spacing: 2px;
+    color: var(--dim);
+    margin-bottom: 8px;
+    text-transform: uppercase;
+  }
+
+  /* KURAMOTO NETWORK SVG */
+  #network-svg {
+    width: 100%;
+    height: 140px;
+  }
+
+  /* CONTROLS */
+  .ctrl-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+    font-size: 10px;
+  }
+
+  .ctrl-row label { color: var(--dim); font-size: 9px; letter-spacing: 1px; }
+
+  input[type=range] {
+    -webkit-appearance: none;
+    width: 110px;
+    height: 2px;
+    background: var(--border);
+    outline: none;
+    cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    box-shadow: 0 0 6px var(--accent);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 10px; height: 10px;
+    background: var(--accent);
+    border-radius: 50%;
+    border: none;
+  }
+
+  .val-display {
+    color: var(--accent);
+    font-size: 10px;
+    width: 36px;
+    text-align: right;
+  }
+
+  /* MODE BUTTONS */
+  .btn-row { display: flex; gap: 4px; flex-wrap: wrap; }
+  .mode-btn {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 8px;
+    letter-spacing: 1px;
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--dim);
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: all 0.15s;
+  }
+  .mode-btn:hover, .mode-btn.active {
+    border-color: var(--accent);
+    color: var(--accent);
+    background: rgba(0,200,255,0.05);
+    box-shadow: 0 0 8px rgba(0,200,255,0.2);
+  }
+
+  /* METRICS */
+  .metric {
+    display: flex;
+    justify-content: space-between;
+    font-size: 9px;
+    margin-bottom: 5px;
+  }
+  .metric-label { color: var(--dim); }
+  .metric-val { color: var(--accent); }
+  .metric-val.hot { color: var(--hot); }
+
+  /* BAR GRAPHS */
+  .bar-wrap { margin-bottom: 6px; }
+  .bar-label { font-size: 8px; color: var(--dim); margin-bottom: 2px; letter-spacing: 1px; }
+  .bar-track {
+    height: 4px;
+    background: var(--border);
+    position: relative;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 0.1s;
+    position: relative;
+  }
+  .bar-fill.hot { background: var(--hot); }
+  .bar-fill::after {
+    content: '';
+    position: absolute;
+    right: 0; top: 0; bottom: 0;
+    width: 2px;
+    background: white;
+    box-shadow: 0 0 4px white;
+  }
+
+  /* BOTTOM OSCILLOSCOPE */
+  #scope-wrap {
+    grid-column: 1 / -1;
+    background: var(--panel);
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    border-top: 1px solid var(--border);
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  .scope-label-col {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-around;
+    overflow: hidden;
+  }
+
+  .scope-chan {
+    font-size: 8px;
+    letter-spacing: 1px;
+    color: var(--dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .scope-chan::before {
+    content: '';
+    display: inline-block;
+    width: 8px;
+    height: 2px;
+  }
+  .scope-chan.ch-r::before { background: #ff3030; }
+  .scope-chan.ch-g::before { background: #30ff60; }
+  .scope-chan.ch-b::before { background: #3090ff; }
+  .scope-chan.ch-coh::before { background: var(--accent); }
+
+  #scope-main {
+    display: block;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  /* Pulse indicator */
+  #pulse {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 1s infinite;
+  }
+  @keyframes pulse {
+    0%,100% { opacity: 1; }
+    50%      { opacity: 0.2; }
+  }
+
+  #inject-btn {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px;
+    padding: 5px 10px;
+    border: 1px solid var(--hot);
+    background: transparent;
+    color: var(--hot);
+    cursor: pointer;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    width: 100%;
+    margin-top: 4px;
+    transition: all 0.15s;
+  }
+  #inject-btn:hover {
+    background: rgba(255,74,26,0.1);
+    box-shadow: 0 0 10px rgba(255,74,26,0.3);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- HEADER -->
+  <div id="header">
+    <div id="pulse"></div>
+    <h1>GPU NOISE TOPOLOGY MAPPER</h1>
+    <span class="tag">27/16 · Kuramoto Lattice · Hardware Fingerprint</span>
+    <div id="status-bar">
+      <div>COHERENCE <span id="hdr-coherence">0.000</span></div>
+      <div>FRAME <span id="hdr-frame">0</span></div>
+      <div>NOISE <span id="hdr-noise">0.00</span></div>
+      <div>FPS <span id="hdr-fps">0</span></div>
+    </div>
+  </div>
+
+  <!-- MAIN SHADER -->
+  <div id="canvas-wrap">
+    <canvas id="glcanvas"></canvas>
+    <div id="crosshair"></div>
+  </div>
+
+  <!-- SIDEBAR -->
+  <div id="sidebar">
+
+    <div class="panel-block">
+      <div class="panel-label">Kuramoto Network · 10 Nodes</div>
+      <svg id="network-svg" viewBox="-110 -110 220 220"></svg>
+    </div>
+
+    <div class="panel-block">
+      <div class="panel-label">Shader Mode</div>
+      <div class="btn-row">
+        <button class="mode-btn active" data-mode="0">Lattice</button>
+        <button class="mode-btn" data-mode="1">Float32 Cliff</button>
+        <button class="mode-btn" data-mode="2">Mantissa</button>
+        <button class="mode-btn" data-mode="3">ULPs Diff</button>
+        <button class="mode-btn" data-mode="4">Moiré Res</button>
+      </div>
+      <div id="mode-desc" style="font-size:8px;color:#2a4a5a;margin-top:6px;line-height:1.5;letter-spacing:0.5px;">
+        Reference lattice — 27/16 against pixel grid.
+      </div>
+    </div>
+
+    <div class="panel-block">
+      <div class="panel-label">Parameters</div>
+      <div class="ctrl-row">
+        <label>STRESS EXP</label>
+        <input type="range" id="sl-stress" min="1" max="16" step="0.1" value="4">
+        <span class="val-display" id="vl-stress">4.0</span>
+      </div>
+      <div class="ctrl-row">
+        <label>MASTER FREQ</label>
+        <input type="range" id="sl-freq" min="1.0" max="2.5" step="0.001" value="1.6875">
+        <span class="val-display" id="vl-freq">1.688</span>
+      </div>
+      <div class="ctrl-row">
+        <label>LATTICE SCALE</label>
+        <input type="range" id="sl-scale" min="1" max="80" step="0.5" value="15">
+        <span class="val-display" id="vl-scale">15.0</span>
+      </div>
+      <div class="ctrl-row">
+        <label>OOBLECK THR</label>
+        <input type="range" id="sl-thresh" min="0.5" max="1.2" step="0.01" value="0.95">
+        <span class="val-display" id="vl-thresh">0.95</span>
+      </div>
+      <div class="ctrl-row">
+        <label>COUPLING K</label>
+        <input type="range" id="sl-coupling" min="0" max="2" step="0.01" value="0.5">
+        <span class="val-display" id="vl-coupling">0.50</span>
+      </div>
+      <div class="ctrl-row">
+        <label>NOISE INJECT</label>
+        <input type="range" id="sl-noise" min="0" max="1" step="0.01" value="0.15">
+        <span class="val-display" id="vl-noise">0.15</span>
+      </div>
+    </div>
+
+    <div class="panel-block">
+      <div class="panel-label">Network State</div>
+      <div class="bar-wrap">
+        <div class="bar-label">COHERENCE R</div>
+        <div class="bar-track"><div class="bar-fill" id="bar-coh" style="width:0%"></div></div>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar-label">MEAN NOISE</div>
+        <div class="bar-track"><div class="bar-fill hot" id="bar-noise" style="width:0%"></div></div>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar-label">PHASE SPREAD</div>
+        <div class="bar-track"><div class="bar-fill" id="bar-spread" style="width:0%"></div></div>
+      </div>
+      <div class="metric">
+        <span class="metric-label">MEAN PHASE</span>
+        <span class="metric-val" id="met-phase">0.000</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">ORDER PARAM</span>
+        <span class="metric-val" id="met-order">0.000</span>
+      </div>
+      <div class="metric">
+        <span class="metric-label">BEAT FREQ</span>
+        <span class="metric-val hot" id="met-beat">0.000</span>
+      </div>
+      <button id="inject-btn">⚡ INJECT PHASE SHOCK</button>
+    </div>
+
+  </div>
+
+  <!-- BOTTOM OSCILLOSCOPE -->
+  <div id="scope-wrap">
+    <div class="scope-label-col">
+      <div class="scope-chan ch-r">RED CHAN</div>
+      <div class="scope-chan ch-g">GRN CHAN</div>
+      <div class="scope-chan ch-b">BLU CHAN</div>
+      <div class="scope-chan ch-coh">COHERENCE</div>
+    </div>
+    <canvas id="scope-main"></canvas>
+  </div>
+
+</div>
+
+<script>
+// ============================================================
+// WEBGL SHADER
+// ============================================================
+const canvas = document.getElementById('glcanvas');
+const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+
+const vsSource = `
+  attribute vec2 a_position;
+  void main() {
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+
+const fsSource = `
+precision highp float;
+
+uniform vec2  u_resolution;
+uniform float u_time;
+uniform float u_masterFreq;
+uniform float u_latticeScale;
+uniform float u_oobleckThresh;
+uniform float u_meanPhase;
+uniform float u_meanNoise;
+uniform float u_coherence;
+uniform float u_stressExp;
+uniform int   u_mode;
+
+// ---- SAFE RANGE hash (original - well behaved, boring) ----
+float gpuHash(vec2 p) {
+  return fract(sin(dot(p, vec2(12.9898, 78.2331))) * 43758.5453123);
+}
+
+// ---- MODE 0: Lattice (reference / baseline) ----
+vec3 latticeModeColor(vec2 uv, float t) {
+  float lx = sin(uv.x * u_latticeScale + t + u_meanPhase);
+  float ly = cos(uv.y * u_latticeScale - t * u_masterFreq * 0.7 - u_meanPhase);
+  float lattice = lx * ly;
+  float dither = gpuHash(uv + vec2(t * 0.01)) * 0.1;
+  float sig = lattice + dither * 0.75;
+  float plasma = smoothstep(u_oobleckThresh - 0.05, u_oobleckThresh + 0.05 + u_meanNoise * 0.3, sig);
+  vec3 base = mix(vec3(0.02, 0.08, 0.25), vec3(0.0, 0.7, 1.0), sig * 0.5 + 0.5);
+  base = mix(base, vec3(1.0, 0.9, 0.8), plasma);
+  return clamp(pow(base, vec3(0.9)), 0.0, 1.0);
+}
+
+// ---- MODE 1: FLOAT32 PRECISION CLIFF ----
+// Deliberately scales argument into the regime where sin() loses
+// mantissa bits. As stressExp increases, you cross discrete
+// quantization boundaries — the pattern "snaps" into new topology.
+// Each snap is a hardware-specific precision limit.
+vec3 precisionCliffColor(vec2 uv, float t) {
+  // Scale into high-argument regime — sin(x) for large x loses precision
+  // at GPU-specific rates. 2^stressExp pushes into dangerous territory.
+  float scale = pow(2.0, u_stressExp);          // 1 → 65536+
+  vec2 p = uv * scale;
+
+  // Raw sin at extreme argument — artifacts appear as banding/tiling
+  float raw_x = sin(p.x + t * u_masterFreq);
+  float raw_y = sin(p.y + t);
+  float raw_xy = sin(p.x + p.y + t * u_masterFreq);
+
+  // The "difference signal" is where quantization shows up cleanest:
+  // when two nearly-identical floats round differently, you get sharp edges
+  float diff = abs(raw_x - raw_y);
+  float cross = raw_x * raw_y;
+
+  // Beat against 27/16 reference — shows WHERE the precision breaks
+  float ref_x = sin(uv.x * u_latticeScale * u_masterFreq + t * u_masterFreq);
+  float beat = abs(raw_x - ref_x);  // should be smooth; artifacts = precision loss
+
+  // False-color map: dark = smooth float space, bright = quantization edge
+  float artifact = clamp(beat * 4.0, 0.0, 1.0);
+  float structure = cross * 0.5 + 0.5;
+  float edge = clamp(diff * 3.0, 0.0, 1.0);
+
+  vec3 col = mix(vec3(0.0, 0.02, 0.1), vec3(0.0, 0.5, 0.9), structure);
+  col = mix(col, vec3(0.8, 1.0, 0.2), artifact);   // yellow = precision artifact
+  col = mix(col, vec3(1.0, 0.1, 0.0), edge * 0.6); // red = quantization edge
+  return clamp(col, 0.0, 1.0);
+}
+
+// ---- MODE 2: MANTISSA STRIPE DETECTOR ----
+// Maps fract() of large-argument sin to expose the discrete
+// mantissa grid. At low stress = smooth. At high stress = visible
+// stripe topology from float rounding. Stripe spacing is GPU-specific.
+vec3 mantissaStripeColor(vec2 uv, float t) {
+  float scale = pow(2.0, u_stressExp);
+  vec2 p = uv * scale;
+
+  // fract of sin at large argument reveals the mantissa grid directly
+  float fx = fract(sin(p.x + t * u_masterFreq) * scale);
+  float fy = fract(sin(p.y + t) * scale);
+  float fxy = fract(sin(p.x * u_masterFreq + p.y) * scale * 0.5);
+
+  // Stripe interference — beats between X and Y mantissa grids
+  float stripe_h = abs(sin(fx * 3.14159 * u_latticeScale));
+  float stripe_v = abs(sin(fy * 3.14159 * u_latticeScale));
+  float interference = stripe_h * stripe_v;
+
+  // 27/16 modulation layer
+  float mod_27_16 = sin(uv.x * u_masterFreq * 20.0 + t) *
+                    cos(uv.y * 20.0 - t * u_masterFreq);
+  float signal = interference + mod_27_16 * 0.3 * u_meanNoise;
+
+  // Coherence-modulated color: high coherence = ordered stripes, low = chaos
+  vec3 cold = mix(vec3(0.0, 0.0, 0.2), vec3(0.0, 0.3, 0.7), stripe_h);
+  vec3 hot  = mix(vec3(0.1, 0.5, 0.0), vec3(1.0, 1.0, 0.0), stripe_v);
+  vec3 col  = mix(cold, hot, clamp(signal, 0.0, 1.0));
+  col = mix(col, vec3(1.0, 0.0, 0.5), clamp(fxy * interference - 0.7, 0.0, 1.0));
+  return clamp(col, 0.0, 1.0);
+}
+
+// ---- MODE 3: ULPS DIFFERENCE MAP ----
+// Unit in the Last Place: computes nearly-identical expressions
+// and shows WHERE they diverge. On different GPUs, the divergence
+// boundaries fall in different spatial locations — hardware fingerprint.
+vec3 ulpsDifferenceColor(vec2 uv, float t) {
+  float scale = pow(2.0, u_stressExp * 0.7);
+
+  // Two expressions that SHOULD be mathematically equal
+  // but float32 rounding makes them diverge at hardware-specific boundaries
+  float expr_a = sin(uv.x * scale + uv.y * scale * u_masterFreq + t);
+  float expr_b = sin(uv.x * scale) * cos(uv.y * scale * u_masterFreq + t)
+               + cos(uv.x * scale) * sin(uv.y * scale * u_masterFreq + t);
+  // Mathematically: sin(A+B) = sinA*cosB + cosA*sinB — should be identical
+  // In float32: they diverge. The divergence map IS the hardware fingerprint.
+  float ulp_diff = abs(expr_a - expr_b);
+
+  // Amplify to visible range — GPU-specific coefficient
+  float amplified = clamp(ulp_diff * pow(2.0, u_stressExp * 0.5), 0.0, 1.0);
+
+  // Show where divergence concentrates spatially
+  float envelope = abs(sin(uv.x * u_latticeScale + t * u_masterFreq)) *
+                   abs(cos(uv.y * u_latticeScale + t));
+
+  float signal = amplified + envelope * 0.2;
+
+  // Color: dark navy = float agreement, cyan = small divergence,
+  //        green = medium, white = large (hardware-specific boundary)
+  vec3 col;
+  if (signal < 0.1) {
+    col = mix(vec3(0.0, 0.02, 0.15), vec3(0.0, 0.4, 0.7), signal * 10.0);
+  } else if (signal < 0.4) {
+    col = mix(vec3(0.0, 0.4, 0.7), vec3(0.2, 0.9, 0.4), (signal - 0.1) / 0.3);
+  } else {
+    col = mix(vec3(0.2, 0.9, 0.4), vec3(1.0, 1.0, 1.0), (signal - 0.4) / 0.6);
+  }
+  return clamp(col, 0.0, 1.0);
+}
+
+// ---- MODE 4: MOIRÉ RESONANCE SCANNER ----
+// Sweeps spatial frequency ratios near 27/16 to find where
+// the beat wavelength lands on integer pixel multiples.
+// Those resonances are where your GPU WILL show structure.
+vec3 moireResonanceColor(vec2 uv, float t) {
+  // Two spatial frequencies — ratio sweeps through u_masterFreq
+  float f1 = u_latticeScale;
+  float f2 = u_latticeScale * u_masterFreq;
+
+  // Primary lattice
+  float l1 = sin(uv.x * f1 + t) * sin(uv.y * f1 - t * 0.7);
+  // Secondary at 27/16 offset
+  float l2 = sin(uv.x * f2 + t * u_masterFreq + u_meanPhase) *
+             sin(uv.y * f2 * 0.8 - t + u_meanPhase);
+
+  // Moiré envelope = beat between them
+  float moire = l1 * l2;
+  float envelope = abs(l1 - l2);   // difference signal — shows beat nodes
+
+  // Sub-harmonic: where does the beat wavelength resonate with the grid?
+  float beat_wavelength = abs(f1 - f2);
+  float resonance = sin(uv.x * beat_wavelength + t * 0.1) *
+                    cos(uv.y * beat_wavelength + t * 0.1);
+
+  float signal = moire * 0.5 + resonance * 0.3 + envelope * 0.2;
+  signal = signal * 0.5 + 0.5;
+
+  // Oobleck threshold — where resonance "freezes"
+  float plasma = smoothstep(u_oobleckThresh - 0.1, u_oobleckThresh, signal);
+  float coherence_mod = u_coherence * 0.3;
+
+  vec3 base = mix(vec3(0.0, 0.05, 0.2), vec3(0.0, 0.6, 1.0), signal);
+  base = mix(base, vec3(0.0, 1.0, 0.5), resonance * 0.5 + 0.5) * 0.4 + base * 0.6;
+  base = mix(base, vec3(1.0, 0.8, 0.0), plasma);
+  base = mix(base, vec3(1.0, 0.2, 0.8), clamp(envelope - 0.8, 0.0, 1.0));
+  return clamp(base, 0.0, 1.0);
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / u_resolution;
+  float t = u_time * u_masterFreq;
+
+  vec3 color;
+  if      (u_mode == 0) color = latticeModeColor(uv, t);
+  else if (u_mode == 1) color = precisionCliffColor(uv, t);
+  else if (u_mode == 2) color = mantissaStripeColor(uv, t);
+  else if (u_mode == 3) color = ulpsDifferenceColor(uv, t);
+  else                  color = moireResonanceColor(uv, t);
+
+  gl_FragColor = vec4(color, 1.0);
+}
+`;
+
+function compileShader(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    return null;
+  }
+  return s;
+}
+
+const vs = compileShader(gl, gl.VERTEX_SHADER, vsSource);
+const fs = compileShader(gl, gl.FRAGMENT_SHADER, fsSource);
+const prog = gl.createProgram();
+gl.attachShader(prog, vs);
+gl.attachShader(prog, fs);
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+// Full-screen quad
+const quadBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+const aPosLoc = gl.getAttribLocation(prog, 'a_position');
+gl.enableVertexAttribArray(aPosLoc);
+gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+// Uniform locations
+const uLocs = {
+  resolution: gl.getUniformLocation(prog, 'u_resolution'),
+  time:       gl.getUniformLocation(prog, 'u_time'),
+  masterFreq: gl.getUniformLocation(prog, 'u_masterFreq'),
+  latticeScale:gl.getUniformLocation(prog,'u_latticeScale'),
+  oobleckThresh:gl.getUniformLocation(prog,'u_oobleckThresh'),
+  meanPhase:  gl.getUniformLocation(prog, 'u_meanPhase'),
+  meanNoise:  gl.getUniformLocation(prog, 'u_meanNoise'),
+  coherence:  gl.getUniformLocation(prog, 'u_coherence'),
+  stressExp:  gl.getUniformLocation(prog, 'u_stressExp'),
+  mode:       gl.getUniformLocation(prog, 'u_mode'),
+};
+
+// Readback pixel buffer for scope
+const readPx = new Uint8Array(4 * 256);
+
+// ============================================================
+// KURAMOTO NETWORK
+// ============================================================
+const N = 10;
+const BASE_FREQ = 27 / 16;
+let phases = new Float64Array(N).map(() => Math.random() * Math.PI * 2);
+const natFreqs = new Float64Array(N).map(() => BASE_FREQ + (Math.random() - 0.5) * 0.4);
+let noiseAmp = new Float64Array(N).map(() => 0.05 + Math.random() * 0.25);
+let coupling = new Float64Array(N * N);
+for (let i = 0; i < N; i++)
+  for (let j = 0; j < N; j++)
+    if (i !== j) { const v = Math.random(); coupling[i * N + j] = v; coupling[j * N + i] = v; }
+
+// Normalize coupling
+const maxK = Math.max(...coupling);
+for (let i = 0; i < coupling.length; i++) coupling[i] /= maxK;
+
+let couplingStrength = 0.5;
+let globalNoise = 0.15;
+
+function stepNetwork(dt) {
+  const newPhases = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    let interaction = 0;
+    for (let j = 0; j < N; j++) {
+      if (i !== j) interaction += coupling[i * N + j] * Math.sin(phases[j] - phases[i]);
+    }
+    const noise = (Math.random() - 0.5) * 2 * noiseAmp[i] * (1 + globalNoise);
+    newPhases[i] = phases[i] + dt * (natFreqs[i] + couplingStrength * interaction + noise);
+  }
+  phases = newPhases.map(p => ((p % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2));
+}
+
+function getNetworkState() {
+  // Order parameter (Kuramoto coherence R)
+  let re = 0, im = 0;
+  for (let i = 0; i < N; i++) { re += Math.cos(phases[i]); im += Math.sin(phases[i]); }
+  re /= N; im /= N;
+  const R = Math.sqrt(re * re + im * im);
+  const meanPhase = Math.atan2(im, re);
+  const meanNoise = globalNoise;
+  // Phase spread
+  const phaseVar = phases.reduce((acc, p) => {
+    const diff = p - meanPhase;
+    return acc + diff * diff;
+  }, 0) / N;
+  return { R, meanPhase: ((meanPhase % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2), meanNoise, phaseSpread: Math.sqrt(phaseVar) };
+}
+
+// ============================================================
+// NETWORK SVG RENDERER
+// ============================================================
+const svg = document.getElementById('network-svg');
+const nodeAngles = Array.from({length: N}, (_, i) => (i / N) * Math.PI * 2 - Math.PI / 2);
+const nodeR = 85;
+const nodePositions = nodeAngles.map(a => ({ x: Math.cos(a) * nodeR, y: Math.sin(a) * nodeR }));
+
+// Draw edges (top 30%)
+const edgeSVGs = [];
+const sorted = [];
+for (let i = 0; i < N; i++)
+  for (let j = i + 1; j < N; j++)
+    sorted.push({ i, j, w: coupling[i * N + j] });
+sorted.sort((a, b) => b.w - a.w);
+const topEdges = sorted.slice(0, Math.floor(sorted.length * 0.3));
+
+for (const e of topEdges) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  el.setAttribute('x1', nodePositions[e.i].x);
+  el.setAttribute('y1', nodePositions[e.i].y);
+  el.setAttribute('x2', nodePositions[e.j].x);
+  el.setAttribute('y2', nodePositions[e.j].y);
+  el.setAttribute('stroke', '#0a2030');
+  el.setAttribute('stroke-width', (e.w * 2).toFixed(1));
+  svg.appendChild(el);
+  edgeSVGs.push(el);
+}
+
+// Draw nodes
+const nodeSVGs = nodePositions.map((pos, i) => {
+  const c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+  c.setAttribute('cx', pos.x);
+  c.setAttribute('cy', pos.y);
+  c.setAttribute('r', '7');
+  c.setAttribute('fill', '#00c8ff');
+  c.setAttribute('stroke', '#020408');
+  c.setAttribute('stroke-width', '1');
+  svg.appendChild(c);
+  return c;
+});
+
+function updateNetworkSVG() {
+  for (let i = 0; i < N; i++) {
+    const hue = (phases[i] / (Math.PI * 2)) * 360;
+    nodeSVGs[i].setAttribute('fill', `hsl(${hue}, 90%, 60%)`);
+  }
+}
+
+// ============================================================
+// OSCILLOSCOPE — single canvas, 3 channels stacked
+// ============================================================
+const scopeMain = document.getElementById('scope-main');
+const scopeCtx = scopeMain.getContext('2d');
+
+const SCOPE_LEN = 300;
+const scopeDataR = new Float32Array(SCOPE_LEN);
+const scopeDataG = new Float32Array(SCOPE_LEN);
+const scopeDataB = new Float32Array(SCOPE_LEN);
+const scopeDataCoh = new Float32Array(SCOPE_LEN);
+let scopeIdx = 0;
+
+function pushScope(r, g, b, coh) {
+  scopeDataR[scopeIdx]   = r;
+  scopeDataG[scopeIdx]   = g;
+  scopeDataB[scopeIdx]   = b;
+  scopeDataCoh[scopeIdx] = coh;
+  scopeIdx = (scopeIdx + 1) % SCOPE_LEN;
+}
+
+function drawAllScopes() {
+  const W = scopeMain.width, H = scopeMain.height;
+  const lanes = [
+    { data: scopeDataR,   color: '#ff3030' },
+    { data: scopeDataG,   color: '#30ff60' },
+    { data: scopeDataB,   color: '#3090ff' },
+    { data: scopeDataCoh, color: '#00c8ff' },
+  ];
+  const laneH = H / lanes.length;
+
+  scopeCtx.fillStyle = '#060d14';
+  scopeCtx.fillRect(0, 0, W, H);
+
+  // Dividers
+  scopeCtx.strokeStyle = '#0a2030';
+  scopeCtx.lineWidth = 1;
+  for (let i = 1; i < lanes.length; i++) {
+    scopeCtx.beginPath();
+    scopeCtx.moveTo(0, i * laneH);
+    scopeCtx.lineTo(W, i * laneH);
+    scopeCtx.stroke();
+  }
+
+  for (let li = 0; li < lanes.length; li++) {
+    const { data, color } = lanes[li];
+    const baseY = li * laneH + laneH / 2;
+
+    // Center line
+    scopeCtx.strokeStyle = '#0a2030';
+    scopeCtx.lineWidth = 1;
+    scopeCtx.beginPath();
+    scopeCtx.moveTo(0, baseY);
+    scopeCtx.lineTo(W, baseY);
+    scopeCtx.stroke();
+
+    // Signal
+    scopeCtx.strokeStyle = color;
+    scopeCtx.lineWidth = 1.5;
+    scopeCtx.beginPath();
+    for (let i = 0; i < SCOPE_LEN; i++) {
+      const si = (scopeIdx + i) % SCOPE_LEN;
+      const x = (i / SCOPE_LEN) * W;
+      const y = baseY - data[si] * laneH * 0.42;
+      if (i === 0) scopeCtx.moveTo(x, y); else scopeCtx.lineTo(x, y);
+    }
+    scopeCtx.stroke();
+  }
+}
+
+// ============================================================
+// CONTROLS
+// ============================================================
+let shaderMode = 0;
+let masterFreq = 27 / 16;
+let latticeScale = 15;
+let oobleckThresh = 0.95;
+
+const modeDescs = [
+  'Reference lattice — 27/16 against pixel grid. Baseline.',
+  'Float32 Cliff — sin() at 2^STRESS argument. Yellow = precision artifact boundary. Hardware-specific.',
+  'Mantissa Stripes — fract(sin(x)*scale) reveals mantissa grid. Stripe spacing is GPU-specific.',
+  'ULPs Diff — sin(A+B) vs sinA·cosB+cosA·sinB. Should be identical. Divergence map = hardware fingerprint.',
+  'Moiré Resonance — beat envelope between f and f·(27/16). Resonance nodes show where beat lands on integer pixels.',
+];
+
+document.querySelectorAll('.mode-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    shaderMode = parseInt(btn.dataset.mode);
+    document.getElementById('mode-desc').textContent = modeDescs[shaderMode];
+  });
+});
+
+function bindSlider(id, valId, setter, fmt) {
+  const sl = document.getElementById(id);
+  const vl = document.getElementById(valId);
+  sl.addEventListener('input', () => {
+    const v = parseFloat(sl.value);
+    setter(v);
+    vl.textContent = fmt(v);
+  });
+}
+
+let stressExp = 4.0;
+bindSlider('sl-stress', 'vl-stress', v => stressExp = v, v => v.toFixed(1));
+bindSlider('sl-scale', 'vl-scale', v => latticeScale = v, v => v.toFixed(1));
+bindSlider('sl-thresh', 'vl-thresh', v => oobleckThresh = v, v => v.toFixed(2));
+bindSlider('sl-coupling', 'vl-coupling', v => couplingStrength = v, v => v.toFixed(2));
+bindSlider('sl-noise', 'vl-noise', v => globalNoise = v, v => v.toFixed(2));
+
+document.getElementById('inject-btn').addEventListener('click', () => {
+  // Inject phase shock — randomize one node
+  const target = Math.floor(Math.random() * N);
+  phases[target] = Math.random() * Math.PI * 2;
+  noiseAmp[target] = Math.min(noiseAmp[target] * 2, 1.0);
+  setTimeout(() => { noiseAmp[target] /= 2; }, 2000);
+});
+
+// ============================================================
+// RESIZE
+// ============================================================
+function resize() {
+  const wrap = document.getElementById('canvas-wrap');
+  canvas.width  = wrap.clientWidth  * window.devicePixelRatio;
+  canvas.height = wrap.clientHeight * window.devicePixelRatio;
+  canvas.style.width  = wrap.clientWidth  + 'px';
+  canvas.style.height = wrap.clientHeight + 'px';
+
+  scopeMain.width  = scopeMain.clientWidth  * window.devicePixelRatio;
+  scopeMain.height = scopeMain.clientHeight * window.devicePixelRatio;
+
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+let frame = 0;
+let lastTime = performance.now();
+let fps = 0;
+const fpsAlpha = 0.05;
+const DT = 0.02;
+const NET_STEPS = 3;
+const startTime = performance.now();
+
+function loop(now) {
+  const dt = (now - lastTime) / 1000;
+  lastTime = now;
+  fps = fps * (1 - fpsAlpha) + (1 / Math.max(dt, 0.001)) * fpsAlpha;
+  frame++;
+
+  // Step network
+  for (let s = 0; s < NET_STEPS; s++) stepNetwork(DT / NET_STEPS);
+  const { R, meanPhase, meanNoise, phaseSpread } = getNetworkState();
+
+  // === RENDER SHADER ===
+  const t = (now - startTime) / 1000;
+  gl.uniform2f(uLocs.resolution, canvas.width, canvas.height);
+  gl.uniform1f(uLocs.time, t);
+  gl.uniform1f(uLocs.masterFreq, masterFreq);
+  gl.uniform1f(uLocs.latticeScale, latticeScale);
+  gl.uniform1f(uLocs.oobleckThresh, oobleckThresh);
+  gl.uniform1f(uLocs.meanPhase, meanPhase);
+  gl.uniform1f(uLocs.meanNoise, meanNoise + R * 0.1);
+  gl.uniform1f(uLocs.coherence, R);
+  gl.uniform1f(uLocs.stressExp, stressExp);
+  gl.uniform1i(uLocs.mode, shaderMode);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // === READ BACK PIXELS (center row for scope) ===
+  if (frame % 2 === 0) {
+    const cx = Math.floor(canvas.width / 2);
+    const cy = Math.floor(canvas.height / 2);
+    gl.readPixels(cx - 128, cy, 256, 1, gl.RGBA, gl.UNSIGNED_BYTE, readPx);
+    let sumR = 0, sumG = 0, sumB = 0;
+    for (let i = 0; i < 256; i++) {
+      sumR += readPx[i * 4]     / 255;
+      sumG += readPx[i * 4 + 1] / 255;
+      sumB += readPx[i * 4 + 2] / 255;
+    }
+    pushScope(sumR / 256 * 2 - 1, sumG / 256 * 2 - 1, sumB / 256 * 2 - 1, R * 2 - 1);
+  }
+
+  // === UPDATE NETWORK SVG ===
+  updateNetworkSVG();
+
+  // === UPDATE SCOPE ===
+  drawAllScopes();
+
+  // === UPDATE UI ===
+  document.getElementById('hdr-coherence').textContent = R.toFixed(3);
+  document.getElementById('hdr-frame').textContent = frame;
+  document.getElementById('hdr-noise').textContent = meanNoise.toFixed(2);
+  document.getElementById('hdr-fps').textContent = fps.toFixed(0);
+
+  document.getElementById('bar-coh').style.width   = (R * 100).toFixed(1) + '%';
+  document.getElementById('bar-noise').style.width = (Math.min(meanNoise + globalNoise, 1) * 100).toFixed(1) + '%';
+  document.getElementById('bar-spread').style.width = (Math.min(phaseSpread / Math.PI, 1) * 100).toFixed(1) + '%';
+
+  document.getElementById('met-phase').textContent = meanPhase.toFixed(3);
+  document.getElementById('met-order').textContent = R.toFixed(4);
+  const beatFreq = Math.abs(masterFreq - 1.0); // beat against 1Hz baseline
+  document.getElementById('met-beat').textContent = beatFreq.toFixed(4);
+
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

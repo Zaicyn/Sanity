@@ -129,20 +129,19 @@ __global__ void fillVulkanParticleBuffer(
         // Ghost renders the "anti-now" component as faint blue.
         if (ghostProjection) {
             float w = disk->w_component[i];
-            if (w > 0.05f) {
-                // Scale 3D projection: s = sqrt(1 - w²)
+            if (w > 0.01f) {
                 float s = sqrtf(1.0f - w * w);
 
-                // Normal appearance is scaled by s (fades as w grows)
+                // Scale normal appearance by s (fades as w grows)
                 output[i].pump_scale *= s;
                 output[i].elongation *= s;
 
-                // Ghost overlay: the w-portion rendered as cool blue
-                // Blend between normal color and ghost blue based on w
-                float ghost_alpha = w * 0.015f;  // faint per-particle
-                output[i].temp = output[i].temp * s + 18.0f * w;  // blend toward blue
-                output[i].elongation = fmaxf(output[i].elongation, ghost_alpha);
-                output[i].pump_residual *= s;  // suppress stress glow in ghost state
+                // Ghost overlay: blue, 10% alpha scaled by w
+                float ghost_alpha = w * 0.10f;
+                output[i].temp = 18.0f;                    // force blue
+                output[i].pump_scale = 0.05f + w * 0.5f;   // visible point size
+                output[i].elongation = ghost_alpha;          // 10% alpha at w=1
+                output[i].pump_residual = 0.0f;              // no stress glow
             }
         }
     } else {
