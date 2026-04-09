@@ -33,15 +33,14 @@
 // happens to be relative to predefined radii.
 
 __device__ __forceinline__ float compute_coupling_strength(
-    float r3d, float L_disk_align, float py)
+    float r3d, float circularity, float py)
 {
-    // Velocity coherence: |L_disk_align| measures how circular the orbit is.
-    // 1.0 = perfectly circular (strong coupling), 0.0 = radial (no coupling).
-    // This is the only physically meaningful coupling criterion — the pump
-    // should couple to coherent orbits regardless of radius.
-    float coherence_factor = fabsf(L_disk_align);
-
-    return coherence_factor;
+    // circularity = |L| / (r × |v|)
+    //   1.0 = perfectly circular orbit (any plane) → full pump coupling
+    //   0.0 = purely radial motion → no coupling
+    // This works for orbits in ANY orbital plane, unlike the old Lz/|L|
+    // which was zero for XZ-plane orbits.
+    return circularity;
 }
 
 // ============================================================================

@@ -134,7 +134,8 @@ __global__ void computeInActiveRegionMask(
                      || (r_cyl < PASSIVE_R_MIN)
                      || (r_cyl > PASSIVE_R_MAX)
                      || particle_ejected(disk, i)
-                     || (disk->pump_history[i] < 0.7f);
+                     || (disk->pump_history[i] < 0.7f)
+                     || (disk->pump_state[i] <= 1);  // IDLE or PRIMED — pump hasn't cycled yet
 
     uint8_t new_val = force_active ? 1 : 0;
     uint8_t old_val = in_active_region[i];  // previous frame's classification

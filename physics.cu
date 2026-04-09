@@ -217,9 +217,16 @@ __global__ void siphonDiskKernel(
     // ========================================================================
     // Math.md: Coupling K determines synchronization threshold
 
-    float coupling = compute_coupling_strength(r3d, L_disk_align, py);
+    // Orbital circularity: |L| / (r × |v|) = 1 for circular, 0 for radial.
+    // Works for orbits in ANY plane, unlike L_disk_align which only measures Lz.
+    float L_actual = 1.0f / (inv_L_mag + 1e-8f);  // |L| from pre-computed inv_L_mag
+    float v_mag = sqrtf(vx*vx + vy*vy + vz*vz + 1e-8f);
+    float circularity = L_actual / (r3d * v_mag + 1e-8f);
+    circularity = fminf(circularity, 1.0f);
+    float coupling = compute_coupling_strength(r3d, circularity, py);
     uint8_t seam_bits = select_seam_bits(coupling, r3d);
     disk->pump_seam[i] = seam_bits;
+
 
     // Pressure from pump
     float pressure = compute_pressure(scale);
