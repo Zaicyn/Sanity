@@ -82,7 +82,21 @@ Complete GLSL implementation of the cuboctahedral primitive, ready to paste into
 | **LOW** | Network serialization | sq_serialize_compact | Distributed/checkpoint feature |
 | **LOW** | Reverse index for Q queries | sq_index_t pattern | Diagnostic tooling |
 
-## Key files
+## V21 Integration Status (completed April 2026)
+
+All items extracted into `Sanity/V21/core/v21_geometry.h`:
+
+| Item | Priority | V21 Status |
+|------|----------|------------|
+| SIMD CPU kernels (SSE/NEON) | HIGH | ✅ Both in v21_geometry.h |
+| Scatter LUT | MEDIUM | ✅ V21_SCATTER_LUT[32] in v21_geometry.h |
+| Quaternion rotation table | MEDIUM | ✅ V21_CLOSURE[16] in v21_geometry.h |
+| Network serialization | LOW | ✅ Full + compact in v21_geometry.h |
+| Reverse index for Q queries | LOW | ✅ v21_index_t in v21_geometry.h |
+| GLSL shader version | LOW | ✅ 8 compute shaders in V21/kernels/ |
+| Use scatter LUT in kernels | MEDIUM | ⏳ Pending (scatter.comp uses raw atomicAdd) |
+
+## Key files (original reference)
 
 | File | Lines | What it provides |
 |------|-------|-----------------|

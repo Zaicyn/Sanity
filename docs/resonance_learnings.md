@@ -53,9 +53,21 @@ Resonance uses quaternary encoding and 13-stride shadows to prevent pathological
 4. Replace all cudaMalloc calls in sim_init.cuh with `backend.alloc()`
 5. Consider V16 slab for small-buffer arena if profiling shows allocation overhead
 
-**Don't integrate until then** — premature abstraction adds complexity without benefit while we're still CUDA-only.
+## V21 Integration Status (completed April 2026)
 
-## Key files in Resonance for reference
+All items extracted into `Sanity/V21/core/`:
+
+| Item | V21 File | Status |
+|------|----------|--------|
+| Backend allocator interface | `v21_backend.h` | ✅ Done |
+| CPU allocator (V9) | `v21_alloc_cpu.h` (410 lines) | ✅ Extracted + tested |
+| GPU slab (V16) | `v21_alloc_gpu.h` (238 lines) | ✅ Extracted |
+| Beta dual-strand | `v21_alloc_gpu.h` (extension) | ✅ Extracted |
+| Warp contention reduction | `v21_alloc_gpu.h` (capped exclusive) | ✅ Extracted |
+| Period-4 phase protection | `v21_types.h` + `v21_alloc_cpu.h` | ✅ Extracted |
+| Rewire sim_init.cuh cudaMalloc | — | ⏳ Pending (mechanical) |
+
+## Key files in Resonance (original reference)
 
 | File | Lines | What it teaches |
 |------|-------|-----------------|
