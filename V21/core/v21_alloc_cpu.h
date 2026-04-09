@@ -27,6 +27,26 @@
 #include <stdio.h>
 #include <math.h>
 
+/* CPU allocator always uses host-side atomics, even when compiled by CUDA.
+ * Override the V21_ATOMIC macros that would otherwise resolve to __device__ atomics. */
+#ifdef __CUDACC__
+  #undef V21_ATOMIC_ADD
+  #undef V21_ATOMIC_AND
+  #undef V21_ATOMIC_OR
+  #undef V21_ATOMIC_XOR
+  #undef V21_ATOMIC_CAS
+  #undef V21_ATOMIC_LOAD
+  #undef V21_ATOMIC_STORE
+  /* Use GCC builtins on host side (nvcc compiles host code with GCC/Clang) */
+  #define V21_ATOMIC_ADD(p, v)       __sync_fetch_and_add((p), (v))
+  #define V21_ATOMIC_AND(p, v)       __sync_fetch_and_and((p), (v))
+  #define V21_ATOMIC_OR(p, v)        __sync_fetch_and_or((p), (v))
+  #define V21_ATOMIC_XOR(p, v)       __sync_fetch_and_xor((p), (v))
+  #define V21_ATOMIC_CAS(p, cmp, v)  __sync_val_compare_and_swap((p), (cmp), (v))
+  #define V21_ATOMIC_LOAD(p)         __sync_val_compare_and_swap((p), 0, 0)
+  #define V21_ATOMIC_STORE(p, v)     __sync_lock_test_and_set((p), (v))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -59,7 +79,11 @@ static const size_t V21_BIN_SIZES[V21_BIN_COUNT] = {
  * TYPES
  * ======================================================================== */
 
+/* v21_vec3_t defined in v21_types.h or v21_geometry.h — avoid duplicate */
+#ifndef V21_VEC3_DEFINED
+#define V21_VEC3_DEFINED
 typedef struct { float x, y, z; } v21_vec3_t;
+#endif
 
 typedef struct {
     uint64_t primary;
