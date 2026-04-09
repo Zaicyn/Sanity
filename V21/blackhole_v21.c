@@ -462,11 +462,13 @@ int main(int argc, char** argv) {
         }
 
         if (render_interval > 0 && frame % render_interval == 0) {
+            static int render_count = 0;
             char filename[256];
-            snprintf(filename, sizeof(filename), "frames/frame_%05d.ppm", frame);
+            snprintf(filename, sizeof(filename), "frames/frame_%05d.ppm", render_count);
             render_frame_ppm(filename, &particles, cam_dist, yaw, cam_pitch);
-            if (frame % (render_interval * 10) == 0)
-                printf("[render] Wrote %s\n", filename);
+            if (render_count % 50 == 0)
+                printf("[render] Wrote %s (sim frame %d)\n", filename, frame);
+            render_count++;
         }
     }
 
