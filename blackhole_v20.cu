@@ -607,116 +607,43 @@ int main(int argc, char** argv) {
     std::vector<float> h_phase_omega_sum(PHASE_HIST_BINS);
     std::vector<float> h_phase_omega_sq(PHASE_HIST_BINS);
 
-    // === OCTREE ALLOCATIONS ===
-    // Morton-sorted spatial tree for unified physics/rendering
-    uint64_t* d_morton_keys = nullptr;
-    uint32_t* d_xor_corners = nullptr;
-    uint32_t* d_particle_ids = nullptr;
-    OctreeNode* d_octree_nodes = nullptr;
-    uint32_t* d_node_count = nullptr;
-    uint32_t* d_leaf_counts = nullptr;       // Particle counts for level-13 nodes (pristine)
-    uint32_t* d_leaf_counts_culled = nullptr; // Working copy for frustum culling
-    uint32_t* d_leaf_offsets = nullptr;      // Exclusive scan of counts (output positions)
-    uint32_t* d_leaf_node_indices = nullptr; // Original node indices for level-13 nodes
-    uint32_t* d_leaf_node_count = nullptr;   // Number of level-13 nodes
-    extern bool g_octree_rebuild;
-    extern bool g_octree_render;
-    // Octree subsystem is lazy-allocated: only built if either the rebuild
-    // path or the render traversal is opted into via CLI flag. With neither
-    // flag set (the default), the entire octree block at line ~4570 is
-    // skipped and ~320 MB of morton/xor/ids buffers plus ~88 MB of
-    // node/leaf/hash buffers stay unallocated. Downstream guards at
-    // g_octree_rebuild && octreeEnabled and h_leaf_node_count > 0 ensure
-    // no kernel tries to read null pointers.
-    const bool octreeEnabled = (g_octree_rebuild || g_octree_render);
-    bool useOctreeTraversal = g_octree_render;  // Toggle to use octree-based compaction
-    uint32_t h_analytic_node_count = 0;
-    uint32_t h_total_node_count = 0;  // Updated after each stochastic rebuild
-    uint32_t h_leaf_node_count = 0;   // Number of level-13 nodes
-    uint32_t h_cached_total_particles = 0;  // Sum of particle_counts in all leaves (no culling)
-    uint32_t h_culled_total_particles = 0;  // Sum after frustum culling
-    uint32_t h_num_active = 0;              // Active particle count (for physics kernel)
-    extern bool g_octree_physics;
-    bool useOctreePhysics = g_octree_physics;  // Enable octree-based neighbor physics
-    float pressure_k = 0.03f;                  // Pressure coefficient for F = -k∇ρ
-    float vorticity_k = 0.01f;                 // Vorticity coefficient for F = k(ω × v)
-    float substrate_k = 0.05f;                 // Keplerian substrate coupling (competes with Kuramoto)
-    float phase_coupling_k = 0.05f;            // Phase coupling coefficient (Kuramoto K)
-    // Leaf velocity buffers for vorticity computation
-    float* d_leaf_vel_x = nullptr;
-    float* d_leaf_vel_y = nullptr;
-    float* d_leaf_vel_z = nullptr;
-    // S3: Phase state buffers for temporal coherence
-    float* d_leaf_phase = nullptr;             // θ ∈ [0, 2π] - oscillation phase
-    float* d_leaf_frequency = nullptr;         // ω - local oscillation frequency
-    float* d_leaf_coherence = nullptr;         // Pre-computed phase coherence
-    // Leaf hash table for O(1) neighbor lookup (replaces binary search)
-    uint64_t* d_leaf_hash_keys = nullptr;      // Morton keys in hash table
-    uint32_t* d_leaf_hash_values = nullptr;    // Leaf indices in hash table
-    uint32_t  h_leaf_hash_size = 0;            // Hash table size (power of 2)
+    // Initialize octree (conditional — only if --octree-rebuild or --octree-render)
+    OctreeLocals octree = initOctree(ctx);
 
-    // Octree buffers sized to g_octree_particle_cap (VRAM-aware, not N*2)
-    // The octree is the crystallization: 24 = LAMBDA_OCTREE (finished stone layer)
-    // Morton buffers scale with particle cap, fixed buffers use OCTREE_MAX_NODES
-    int morton_capacity = g_octree_particle_cap;
-    if (morton_capacity > MAX_DISK_PTS) morton_capacity = MAX_DISK_PTS;
-
-    if (octreeEnabled) {
-        // Per-particle buffers: sized to octree cap (VRAM-aware)
-        // NOTE: Morton sort removed — keys used only for active counting
-        cudaMalloc(&d_morton_keys, morton_capacity * sizeof(uint64_t));
-        cudaMalloc(&d_xor_corners, morton_capacity * sizeof(uint32_t));
-        cudaMalloc(&d_particle_ids, morton_capacity * sizeof(uint32_t));
-        // Fixed buffers: always OCTREE_MAX_NODES
-        cudaMalloc(&d_octree_nodes, OCTREE_MAX_NODES * sizeof(OctreeNode));  // 48 MB
-        cudaMalloc(&d_node_count, sizeof(uint32_t));
-        cudaMemset(d_node_count, 0, sizeof(uint32_t));
-        // Prefix scan buffers for atomic-free traversal
-        cudaMalloc(&d_leaf_counts, OCTREE_MAX_NODES * sizeof(uint32_t));        // 4 MB
-        cudaMalloc(&d_leaf_counts_culled, OCTREE_MAX_NODES * sizeof(uint32_t)); // 4 MB (working copy)
-        cudaMalloc(&d_leaf_offsets, OCTREE_MAX_NODES * sizeof(uint32_t));       // 4 MB
-        cudaMalloc(&d_leaf_node_indices, OCTREE_MAX_NODES * sizeof(uint32_t));  // 4 MB
-        cudaMalloc(&d_leaf_node_count, sizeof(uint32_t));
-        // Leaf velocity buffers for vorticity computation (~192 KB each for 16k leaves)
-        cudaMalloc(&d_leaf_vel_x, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&d_leaf_vel_y, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&d_leaf_vel_z, OCTREE_MAX_NODES * sizeof(float));
-        // S3: Phase state buffers (~64 KB each for 16k leaves)
-        cudaMalloc(&d_leaf_phase, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&d_leaf_frequency, OCTREE_MAX_NODES * sizeof(float));
-        cudaMalloc(&d_leaf_coherence, OCTREE_MAX_NODES * sizeof(float));
-        // Initialize phase to zero (will be seeded from position on first use)
-        cudaMemset(d_leaf_phase, 0, OCTREE_MAX_NODES * sizeof(float));
-        cudaMemset(d_leaf_frequency, 0, OCTREE_MAX_NODES * sizeof(float));
-        cudaMemset(d_leaf_coherence, 0, OCTREE_MAX_NODES * sizeof(float));
-        // Leaf hash table: Fixed L2-resident size
-        // 256K entries = 3MB (uses full RTX 2060 L2 cache)
-        // Supports up to 128K leaves at 50% load factor
-        h_leaf_hash_size = 262144;
-        cudaMalloc(&d_leaf_hash_keys, h_leaf_hash_size * sizeof(uint64_t));
-        cudaMalloc(&d_leaf_hash_values, h_leaf_hash_size * sizeof(uint32_t));
-        // Initialize keys to UINT64_MAX (empty marker)
-        cudaMemset(d_leaf_hash_keys, 0xFF, h_leaf_hash_size * sizeof(uint64_t));
-
-        printf("[octree] Allocated: morton cap=%d (%.1f MB), nodes=%zuMB\n",
-               morton_capacity, morton_capacity * 16 / 1e6,
-               OCTREE_MAX_NODES * sizeof(OctreeNode) / (1024 * 1024));
-        printf("[octree] Hash: %u entries (%.1f MB) — L2 resident, max %u leaves\n",
-               h_leaf_hash_size, h_leaf_hash_size * 12 / 1e6, h_leaf_hash_size / 2);
-
-        // Build frozen analytic tree once at init
-        float boxSize = 500.0f;  // Covers DISK_OUTER_R * 2
-        int maxNodesAtLevel5 = 1 << (ANALYTIC_MAX_LEVEL * 3);  // 32768
-        int analyticBlocks = (maxNodesAtLevel5 + 255) / 256;
-        buildAnalyticTree<<<analyticBlocks, 256>>>(
-            d_octree_nodes, d_node_count, boxSize, 0.0f, ANALYTIC_MAX_LEVEL
-        );
-        cudaDeviceSynchronize();
-
-        cudaMemcpy(&h_analytic_node_count, d_node_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-        printf("[octree] Frozen analytic tree: %u nodes (levels 0-%d)\n",
-               h_analytic_node_count, ANALYTIC_MAX_LEVEL);
-    }
+    // Unpack locals still referenced by the main loop
+    uint64_t* d_morton_keys = octree.d_morton_keys;
+    uint32_t* d_xor_corners = octree.d_xor_corners;
+    uint32_t* d_particle_ids = octree.d_particle_ids;
+    OctreeNode* d_octree_nodes = octree.d_octree_nodes;
+    uint32_t* d_node_count = octree.d_node_count;
+    uint32_t* d_leaf_counts = octree.d_leaf_counts;
+    uint32_t* d_leaf_counts_culled = octree.d_leaf_counts_culled;
+    uint32_t* d_leaf_offsets = octree.d_leaf_offsets;
+    uint32_t* d_leaf_node_indices = octree.d_leaf_node_indices;
+    uint32_t* d_leaf_node_count = octree.d_leaf_node_count;
+    const bool octreeEnabled = octree.octreeEnabled;
+    bool useOctreeTraversal = octree.useOctreeTraversal;
+    bool useOctreePhysics = octree.useOctreePhysics;
+    uint32_t h_analytic_node_count = octree.h_analytic_node_count;
+    uint32_t h_total_node_count = octree.h_total_node_count;
+    uint32_t h_leaf_node_count = octree.h_leaf_node_count;
+    uint32_t h_cached_total_particles = octree.h_cached_total_particles;
+    uint32_t h_culled_total_particles = octree.h_culled_total_particles;
+    uint32_t h_num_active = octree.h_num_active;
+    float* d_leaf_vel_x = octree.d_leaf_vel_x;
+    float* d_leaf_vel_y = octree.d_leaf_vel_y;
+    float* d_leaf_vel_z = octree.d_leaf_vel_z;
+    float* d_leaf_phase = octree.d_leaf_phase;
+    float* d_leaf_frequency = octree.d_leaf_frequency;
+    float* d_leaf_coherence = octree.d_leaf_coherence;
+    uint64_t* d_leaf_hash_keys = octree.d_leaf_hash_keys;
+    uint32_t* d_leaf_hash_values = octree.d_leaf_hash_values;
+    uint32_t h_leaf_hash_size = octree.h_leaf_hash_size;
+    int morton_capacity = octree.morton_capacity;
+    float pressure_k = octree.pressure_k;
+    float vorticity_k = octree.vorticity_k;
+    float substrate_k = octree.substrate_k;
+    float phase_coupling_k = octree.phase_coupling_k;
 
     // === CELL GRID ALLOCATION (DNA/RNA Streaming Architecture) ===
     // Fixed-topology grid for forward-only physics passes

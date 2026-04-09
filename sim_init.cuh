@@ -290,3 +290,138 @@ inline DiagnosticLocals initDiagnostics(SimulationContext& ctx, int N) {
 
     return d;
 }
+
+// ============================================================================
+// initOctree — Morton-sorted spatial tree (conditionally allocated)
+// ============================================================================
+// Only allocates if --octree-rebuild or --octree-render was passed.
+// Builds frozen analytic tree at init. Returns locals needed by main loop.
+
+struct OctreeLocals {
+    uint64_t* d_morton_keys;
+    uint32_t* d_xor_corners;
+    uint32_t* d_particle_ids;
+    OctreeNode* d_octree_nodes;
+    uint32_t* d_node_count;
+    uint32_t* d_leaf_counts;
+    uint32_t* d_leaf_counts_culled;
+    uint32_t* d_leaf_offsets;
+    uint32_t* d_leaf_node_indices;
+    uint32_t* d_leaf_node_count;
+    float* d_leaf_vel_x;
+    float* d_leaf_vel_y;
+    float* d_leaf_vel_z;
+    float* d_leaf_phase;
+    float* d_leaf_frequency;
+    float* d_leaf_coherence;
+    uint64_t* d_leaf_hash_keys;
+    uint32_t* d_leaf_hash_values;
+    bool octreeEnabled;
+    bool useOctreeTraversal;
+    bool useOctreePhysics;
+    int morton_capacity;
+    uint32_t h_leaf_hash_size;
+    uint32_t h_analytic_node_count;
+    uint32_t h_total_node_count;
+    uint32_t h_leaf_node_count;
+    uint32_t h_cached_total_particles;
+    uint32_t h_culled_total_particles;
+    uint32_t h_num_active;
+    float pressure_k;
+    float vorticity_k;
+    float substrate_k;
+    float phase_coupling_k;
+};
+
+inline OctreeLocals initOctree(SimulationContext& ctx) {
+    OctreeLocals o = {};
+
+    extern bool g_octree_rebuild;
+    extern bool g_octree_render;
+    extern bool g_octree_physics;
+
+    o.octreeEnabled = (g_octree_rebuild || g_octree_render);
+    o.useOctreeTraversal = g_octree_render;
+    o.useOctreePhysics = g_octree_physics;
+    o.pressure_k = 0.03f;
+    o.vorticity_k = 0.01f;
+    o.substrate_k = 0.05f;
+    o.phase_coupling_k = 0.05f;
+
+    o.morton_capacity = g_octree_particle_cap;
+    if (o.morton_capacity > MAX_DISK_PTS) o.morton_capacity = MAX_DISK_PTS;
+
+    if (o.octreeEnabled) {
+        cudaMalloc(&o.d_morton_keys, o.morton_capacity * sizeof(uint64_t));
+        cudaMalloc(&o.d_xor_corners, o.morton_capacity * sizeof(uint32_t));
+        cudaMalloc(&o.d_particle_ids, o.morton_capacity * sizeof(uint32_t));
+        cudaMalloc(&o.d_octree_nodes, OCTREE_MAX_NODES * sizeof(OctreeNode));
+        cudaMalloc(&o.d_node_count, sizeof(uint32_t));
+        cudaMemset(o.d_node_count, 0, sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_counts, OCTREE_MAX_NODES * sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_counts_culled, OCTREE_MAX_NODES * sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_offsets, OCTREE_MAX_NODES * sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_node_indices, OCTREE_MAX_NODES * sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_node_count, sizeof(uint32_t));
+        cudaMalloc(&o.d_leaf_vel_x, OCTREE_MAX_NODES * sizeof(float));
+        cudaMalloc(&o.d_leaf_vel_y, OCTREE_MAX_NODES * sizeof(float));
+        cudaMalloc(&o.d_leaf_vel_z, OCTREE_MAX_NODES * sizeof(float));
+        cudaMalloc(&o.d_leaf_phase, OCTREE_MAX_NODES * sizeof(float));
+        cudaMalloc(&o.d_leaf_frequency, OCTREE_MAX_NODES * sizeof(float));
+        cudaMalloc(&o.d_leaf_coherence, OCTREE_MAX_NODES * sizeof(float));
+        cudaMemset(o.d_leaf_phase, 0, OCTREE_MAX_NODES * sizeof(float));
+        cudaMemset(o.d_leaf_frequency, 0, OCTREE_MAX_NODES * sizeof(float));
+        cudaMemset(o.d_leaf_coherence, 0, OCTREE_MAX_NODES * sizeof(float));
+
+        o.h_leaf_hash_size = 262144;
+        cudaMalloc(&o.d_leaf_hash_keys, o.h_leaf_hash_size * sizeof(uint64_t));
+        cudaMalloc(&o.d_leaf_hash_values, o.h_leaf_hash_size * sizeof(uint32_t));
+        cudaMemset(o.d_leaf_hash_keys, 0xFF, o.h_leaf_hash_size * sizeof(uint64_t));
+
+        printf("[octree] Allocated: morton cap=%d (%.1f MB), nodes=%zuMB\n",
+               o.morton_capacity, o.morton_capacity * 16 / 1e6,
+               OCTREE_MAX_NODES * sizeof(OctreeNode) / (1024 * 1024));
+        printf("[octree] Hash: %u entries (%.1f MB) — L2 resident, max %u leaves\n",
+               o.h_leaf_hash_size, o.h_leaf_hash_size * 12 / 1e6, o.h_leaf_hash_size / 2);
+
+        // Build frozen analytic tree
+        float boxSize = 500.0f;
+        int maxNodesAtLevel5 = 1 << (ANALYTIC_MAX_LEVEL * 3);
+        int analyticBlocks = (maxNodesAtLevel5 + 255) / 256;
+        buildAnalyticTree<<<analyticBlocks, 256>>>(
+            o.d_octree_nodes, o.d_node_count, boxSize, 0.0f, ANALYTIC_MAX_LEVEL
+        );
+        cudaDeviceSynchronize();
+        cudaMemcpy(&o.h_analytic_node_count, o.d_node_count, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+        printf("[octree] Frozen analytic tree: %u nodes (levels 0-%d)\n",
+               o.h_analytic_node_count, ANALYTIC_MAX_LEVEL);
+    }
+
+    // Wire into context
+    ctx.octree.buf_morton_keys = o.d_morton_keys;
+    ctx.octree.buf_xor_corners = o.d_xor_corners;
+    ctx.octree.buf_particle_ids = o.d_particle_ids;
+    ctx.octree.buf_octree_nodes = o.d_octree_nodes;
+    ctx.octree.buf_node_count = o.d_node_count;
+    ctx.octree.buf_leaf_counts = o.d_leaf_counts;
+    ctx.octree.buf_leaf_counts_culled = o.d_leaf_counts_culled;
+    ctx.octree.buf_leaf_offsets = o.d_leaf_offsets;
+    ctx.octree.buf_leaf_node_indices = o.d_leaf_node_indices;
+    ctx.octree.buf_leaf_node_count = o.d_leaf_node_count;
+    ctx.octree.buf_leaf_vel_x = o.d_leaf_vel_x;
+    ctx.octree.buf_leaf_vel_y = o.d_leaf_vel_y;
+    ctx.octree.buf_leaf_vel_z = o.d_leaf_vel_z;
+    ctx.octree.buf_leaf_phase = o.d_leaf_phase;
+    ctx.octree.buf_leaf_frequency = o.d_leaf_frequency;
+    ctx.octree.buf_leaf_coherence = o.d_leaf_coherence;
+    ctx.octree.buf_leaf_hash_keys = o.d_leaf_hash_keys;
+    ctx.octree.buf_leaf_hash_values = o.d_leaf_hash_values;
+    ctx.octree.enabled = o.octreeEnabled;
+    ctx.octree.use_traversal = o.useOctreeTraversal;
+    ctx.octree.use_physics = o.useOctreePhysics;
+    ctx.octree.morton_capacity = o.morton_capacity;
+    ctx.octree.h_leaf_hash_size = o.h_leaf_hash_size;
+    ctx.octree.h_analytic_node_count = o.h_analytic_node_count;
+
+    return o;
+}
