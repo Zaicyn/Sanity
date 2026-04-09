@@ -394,6 +394,7 @@ __global__ void hopfionEnforceKernel(
     const int* __restrict__ cell_topo_s,   // 4 × GRID_CELLS axis sums (nullptr before H5)
     const int* __restrict__ cell_topo_cnt, // particle count per cell (nullptr before H5)
     int* __restrict__ d_Q_sum,
+    int* __restrict__ d_Q_delta_sum,     // Writer monad: tracks per-particle Q changes for conservation
     int* __restrict__ d_operator_counts,  // [0]=flips, [1]=freezes, [2]=fusions, [3]=tensions, [4]=vents
     float sim_time,
     float flip_rate_scale  // host-side recycling equilibrium multiplier
@@ -408,6 +409,7 @@ __global__ void hopfionEnforceKernel(
     if (!in_active_region[i]) return;
 
     uint8_t state = disk->topo_state[i];
+    int Q_before = (state == TOPO_FROZEN) ? 0 : topo_Q_fast(state);  // Writer monad: capture Q before ops
 
     // Simple LCG RNG seeded from thread index + time
     unsigned int rng = (unsigned int)(i * 2654435761u + __float_as_uint(sim_time));
@@ -515,10 +517,19 @@ __global__ void hopfionEnforceKernel(
     disk->topo_state[i] = state;
 
 reduce:
+    // Writer monad: accumulate Q delta (conservation audit)
+    int Q_after = (state == TOPO_FROZEN) ? 0 : topo_Q_fast(state);
+    int Q_delta = Q_after - Q_before;
+
     // Warp-level Q reduction
-    int q = (state == TOPO_FROZEN) ? 0 : topo_Q_fast(state);
-    for (int offset = 16; offset > 0; offset >>= 1)
+    int q = Q_after;
+    int dq = Q_delta;
+    for (int offset = 16; offset > 0; offset >>= 1) {
         q += __shfl_down_sync(0xFFFFFFFF, q, offset);
-    if ((threadIdx.x & 31) == 0)
+        dq += __shfl_down_sync(0xFFFFFFFF, dq, offset);
+    }
+    if ((threadIdx.x & 31) == 0) {
         atomicAdd(d_Q_sum, q);
+        if (d_Q_delta_sum) atomicAdd(d_Q_delta_sum, dq);
+    }
 }
