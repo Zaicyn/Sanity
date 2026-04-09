@@ -68,6 +68,19 @@ target_include_directories(v21_core INTERFACE
 add_dependencies(v21_core v21_shaders)
 
 # ==============================================================================
+# BLACKHOLE V21 — Vendor-independent galaxy simulator
+# ==============================================================================
+
+add_executable(blackhole_v21
+    ${CMAKE_CURRENT_SOURCE_DIR}/blackhole_v21.c
+)
+target_include_directories(blackhole_v21 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+)
+target_link_libraries(blackhole_v21 PRIVATE v21_core m)
+
+# ==============================================================================
 # V21 TEST — CPU allocator smoke test
 # ==============================================================================
 
