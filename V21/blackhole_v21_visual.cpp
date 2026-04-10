@@ -54,6 +54,53 @@ namespace vk {
 #include "../vulkan/vk_attractor.h"
 AttractorPipeline g_attractor = {};
 
+/* ========================================================================
+ * Mouse-based camera controls
+ * ======================================================================== */
+struct CameraDrag {
+    bool  left_down = false;
+    double last_x = 0.0;
+    double last_y = 0.0;
+};
+static CameraDrag g_cam_drag;
+
+static void mouse_button_cb(GLFWwindow* w, int button, int action, int /*mods*/) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    if (action == GLFW_PRESS) {
+        g_cam_drag.left_down = true;
+        glfwGetCursorPos(w, &g_cam_drag.last_x, &g_cam_drag.last_y);
+    } else if (action == GLFW_RELEASE) {
+        g_cam_drag.left_down = false;
+    }
+}
+
+static void cursor_pos_cb(GLFWwindow* w, double x, double y) {
+    if (!g_cam_drag.left_down) return;
+    VulkanContext* ctx = (VulkanContext*)glfwGetWindowUserPointer(w);
+    if (!ctx) return;
+    double dx = x - g_cam_drag.last_x;
+    double dy = y - g_cam_drag.last_y;
+    g_cam_drag.last_x = x;
+    g_cam_drag.last_y = y;
+    const float sens = 0.005f;
+    ctx->cameraYaw   += (float)dx * sens;
+    ctx->cameraPitch += (float)dy * sens;
+    /* Clamp pitch to avoid flipping over the poles */
+    const float lim = 1.55f; /* ~89° */
+    if (ctx->cameraPitch >  lim) ctx->cameraPitch =  lim;
+    if (ctx->cameraPitch < -lim) ctx->cameraPitch = -lim;
+}
+
+static void scroll_cb(GLFWwindow* w, double /*xoff*/, double yoff) {
+    VulkanContext* ctx = (VulkanContext*)glfwGetWindowUserPointer(w);
+    if (!ctx) return;
+    /* Exponential zoom — 10% per click. Positive = in, negative = out. */
+    float factor = (yoff > 0.0) ? 0.9f : 1.1f;
+    ctx->cameraRadius *= factor;
+    if (ctx->cameraRadius < 10.0f)   ctx->cameraRadius = 10.0f;
+    if (ctx->cameraRadius > 10000.0f) ctx->cameraRadius = 10000.0f;
+}
+
 /* V21 core (C headers) */
 extern "C" {
 #include "core/v21_types.h"
@@ -68,7 +115,7 @@ extern "C" {
 
 #define DEFAULT_PARTICLES    10000
 #define DEFAULT_DT           (1.0f / 60.0f)
-#define BH_MASS              100.0f
+#define BH_MASS              1.0f
 #define ISCO_R               6.0f
 #define DISK_OUTER_R         120.0f
 
@@ -142,30 +189,46 @@ static void physics_step(ParticleState& ps, float dt) {
         float inv_r = 1.0f/(r3d+1e-8f);
         float r_safe = fmaxf(r3d, 1.0f);
 
-        /* Viviani field */
+        /* Viviani field — asymmetric, curve-attracting */
         float theta_pos = atan2f(pz, px);
         float c1=cosf(theta_pos), s1=sinf(theta_pos);
         float c3=cosf(3*theta_pos), s3=sinf(3*theta_pos);
+        /* Curve position (asymmetric Viviani) */
+        float cxp = s1 - 0.5f*s3;
+        float cyp = -c1 + 0.5f*c3;
+        float czp = c1*c3;
+        /* Curve tangent (asymmetric field direction) */
         float fx=c1-1.5f*c3, fy=s1-1.5f*s3, fz=-s1*c3-3*c1*s3;
         float inv_f=1.0f/sqrtf(fx*fx+fy*fy+fz*fz+1e-8f);
         fx*=inv_f; fy*=inv_f; fz*=inv_f;
-        float weight = 1.0f/(1.0f+r_safe*r_safe/100.0f);
+        float weight = 0.01f/(1.0f+r_safe*r_safe/100.0f);
         float rx=px*inv_r, ry=py*inv_r, rz=pz*inv_r;
         float fdr = fx*rx+fy*ry+fz*rz;
         float tx=fx-fdr*rx, ty=fy-fdr*ry, tz=fz-fdr*rz;
-        float ax=-rx*weight + tx*weight*0.5f;
-        float ay=-ry*weight + ty*weight*0.5f;
-        float az=-rz*weight + tz*weight*0.5f;
+        /* Curve-attracting centripetal — pull toward nearest point on the
+         * Viviani curve at the particle's current orbital angle. Bakes
+         * the asymmetry into the radial binding itself. */
+        float dxv = cxp - px;
+        float dyv = cyp - py;
+        float dzv = czp - pz;
+        float distv = sqrtf(dxv*dxv + dyv*dyv + dzv*dzv);
+        float cw = weight / (distv + 0.1f);
+        float ax = dxv*cw + tx*weight*2.0f;
+        float ay = dyv*cw + ty*weight*2.0f;
+        float az = dzv*cw + tz*weight*2.0f;
 
-        /* Orbital damping */
+        /* Orbital-plane damping — damp velocity parallel to L̂ with flat γ.
+         * Uses angular momentum direction (not radial) so in-plane motion
+         * is preserved while out-of-plane velocity is removed. */
         float Lx=py*vz-pz*vy, Ly=pz*vx-px*vz, Lz=px*vy-py*vx;
         float iL=1.0f/sqrtf(Lx*Lx+Ly*Ly+Lz*Lz+1e-8f);
         float lx=Lx*iL, ly=Ly*iL, lz=Lz*iL;
         if (vx*vx+vy*vy+vz*vz > 0.001f) {
-            float vn=vx*lx+vy*ly+vz*lz;
-            float r3=r3d*r3d*r3d;
-            float damp=fminf(2.0f*sqrtf(BH_MASS/fmaxf(r3,1.0f)), 0.5f);
-            vx-=damp*vn*lx; vy-=damp*vn*ly; vz-=damp*vn*lz;
+            float v_parallel = vx*lx+vy*ly+vz*lz;
+            const float COHERENCE_GAMMA = 0.02f;
+            vx -= COHERENCE_GAMMA * v_parallel * lx;
+            vy -= COHERENCE_GAMMA * v_parallel * ly;
+            vz -= COHERENCE_GAMMA * v_parallel * lz;
         }
 
         vx+=ax*dt; vy+=ay*dt; vz+=az*dt;
@@ -284,6 +347,13 @@ int main(int argc, char** argv) {
     VulkanContext vkCtx;
     vkCtx.window = window;
     vkCtx.particleCount = num_particles;
+
+    /* Mouse-based camera: drag to rotate, scroll to zoom */
+    glfwSetWindowUserPointer(window, &vkCtx);
+    glfwSetMouseButtonCallback(window, mouse_button_cb);
+    glfwSetCursorPosCallback(window, cursor_pos_cb);
+    glfwSetScrollCallback(window, scroll_cb);
+
     vk::createInstance(vkCtx);
     vk::setupDebugMessenger(vkCtx);
     glfwCreateWindowSurface(vkCtx.instance, window, nullptr, &vkCtx.surface);
@@ -439,8 +509,7 @@ int main(int argc, char** argv) {
          * The proper fix is a GPU repack shader; for now, the visual is
          * static but the physics is validated. */
 
-        /* Update camera */
-        vkCtx.cameraYaw += 0.002f;
+        /* Camera is static — no auto-rotate (use mouse/IDE controls if any) */
         vkCtx.particleCount = particles.N;
 
         /* Draw: acquire → record → submit → present */

@@ -1,10 +1,19 @@
-// siphon.comp — Core Viviani field physics kernel
-// =================================================
-// GLSL compute shader equivalent of siphonDiskKernel (CUDA).
-// Applies the Viviani field force, orbital-plane damping, coherence
-// filter, and pump state machine to active particles.
-//
-// This is the PRIMARY physics kernel — everything emerges from here.
+// siphon.comp — Core Viviani field physics kernel (FULL)
+// =========================================================
+// GLSL compute shader equivalent of siphonDiskKernel (CUDA physics.cu).
+// Complete port of the force stack:
+//   1. Viviani field force (curve-attracting centripetal + tangent push)
+//   2. Orbital-plane damping (damp v·L̂, out-of-plane)
+//   3. Velocity/position integration
+//   4. Heartbeat / rate modulation / phase stress
+//   5. Local orbital frame (r̂, t̂, L̂)
+//   6. Coupling strength + seam bit selection
+//   7. Pressure + tidal forces
+//   8. Pump state machine (8 states, 1110 heartbeat, coherence filter)
+//   9. Scale regulation (soft decay, hard cap)
+//  10. Ejection check + Hopf fiber ejection kick
+//  11. Anisotropic damping (damp v·r̂, radial)
+//  12. Write-back + pump_history smoothing
 //
 // Dispatch: ceil(N / 256) workgroups of 256 threads
 
@@ -50,22 +59,45 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 // ============================================================================
-// Constants
+// Constants (match disk.cuh / siphon_pump.h canonical values)
 // ============================================================================
 
-const float TWO_PI = 6.28318530718;
-const float SCHW_R = 2.0;
-const uint  PFLAG_ACTIVE  = 0x01u;
-const uint  PFLAG_EJECTED = 0x02u;
+const float PI               = 3.14159265358979;
+const float TWO_PI           = 6.28318530718;
+const float SCHW_R           = 2.0;
+const float ISCO_R           = 6.0;
+const float PHI              = 1.6180339887498948;
+const float PHI_EXCESS       = 0.09017;
+const float BIAS             = 0.75;
+const float COHERENCE_LAMBDA = 0.1;
+const float COHERENCE_GAMMA  = 0.02;
+const float JET_SPEED        = 4.0;
+const float PUMP_EJECT_THRESHOLD = 0.88;
+const int   PUMP_COHERENT_MAX    = 3;
+
+// Pump states (match siphon_pump.h siphon_state_t)
+const int PUMP_IDLE               = 0;
+const int PUMP_PRIMED             = 1;
+const int PUMP_UPSTROKE_COHERENT  = 2;
+const int PUMP_UPSTROKE_HOP       = 3;
+const int PUMP_EXPAND             = 4;
+const int PUMP_DOWNSTROKE         = 5;
+const int PUMP_VALVE_OPEN         = 6;
+const int PUMP_RECIRCULATE        = 7;
+
+// Seam bits
+const uint SEAM_CLOSED   = 0x00u;
+const uint SEAM_UP_ONLY  = 0x01u;
+const uint SEAM_DOWN_ONLY= 0x02u;
+const uint SEAM_FULL     = 0x03u;
+
+// Flags
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
 
 // ============================================================================
-// Viviani field force — the one primitive
+// Viviani field force — asymmetric curve-attracting + tangent push
 // ============================================================================
-//   x(θ) = sin(θ) - ½·sin(3θ)
-//   y(θ) = -cos(θ) + ½·cos(3θ)
-//   z(θ) = cos(θ)·cos(3θ)
-//
-// Tangent = dx/dθ, dy/dθ, dz/dθ
 
 void apply_viviani_field(
     float px, float py, float pz,
@@ -75,15 +107,21 @@ void apply_viviani_field(
     float r_safe = max(r3d, SCHW_R * 0.5);
     float inv_r = (r3d >= SCHW_R * 0.5) ? inv_r3d : (1.0 / r_safe);
 
-    // Orbital phase
     float theta_pos = atan(pz, px);
-
-    // Viviani curve tangent at this phase
     float s1 = sin(theta_pos);
     float c1 = cos(theta_pos);
     float s3 = sin(3.0 * theta_pos);
     float c3 = cos(3.0 * theta_pos);
 
+    // Asymmetric Viviani curve position
+    //   x(θ) = sin θ − ½ sin 3θ
+    //   y(θ) = −cos θ + ½ cos 3θ
+    //   z(θ) = cos θ · cos 3θ
+    float cx = s1 - 0.5 * s3;
+    float cy = -c1 + 0.5 * c3;
+    float cz = c1 * c3;
+
+    // Viviani curve tangent (derivative)
     float fx = c1 - 1.5 * c3;
     float fy = s1 - 1.5 * s3;
     float fz = -s1 * c3 - 3.0 * c1 * s3;
@@ -93,37 +131,258 @@ void apply_viviani_field(
     fy *= inv_f;
     fz *= inv_f;
 
-    // Weight = field_strength / (1 + r²/falloff)
     float weight = pc.FIELD_STRENGTH / (1.0 + r_safe * r_safe / pc.FIELD_FALLOFF);
 
-    // Radial unit vector
     float rx = px * inv_r;
     float ry = py * inv_r;
     float rz = pz * inv_r;
 
-    // Tangential: field direction projected ⊥ to radial
     float f_dot_r = fx * rx + fy * ry + fz * rz;
     float tx = fx - f_dot_r * rx;
     float ty = fy - f_dot_r * ry;
     float tz = fz - f_dot_r * rz;
 
-    // Centripetal (radial inward)
-    ax += -rx * weight;
-    ay += -ry * weight;
-    az += -rz * weight;
+    // Curve-attracting centripetal (asymmetric binding)
+    float dx = cx - px;
+    float dy = cy - py;
+    float dz = cz - pz;
+    float dist = sqrt(dx*dx + dy*dy + dz*dz);
+    float curve_weight = weight / (dist + 0.1);
+    ax += dx * curve_weight;
+    ay += dy * curve_weight;
+    az += dz * curve_weight;
 
-    // Tangential (rotation)
+    // Tangential (rotation-driving, asymmetric)
     ax += tx * weight * pc.TANGENT_SCALE;
     ay += ty * weight * pc.TANGENT_SCALE;
     az += tz * weight * pc.TANGENT_SCALE;
 }
 
 // ============================================================================
-// Main — simplified siphon step (Viviani field + integration)
+// Heartbeat = cos(θ)·cos(3θ)  (the Z-axis mixer, Math.md Step 7)
 // ============================================================================
-// NOTE: This is the CORE physics only (field + damping + integration).
-// The full pump state machine (8 states, coherence filter, ejection)
-// will be added incrementally as separate compute passes or extended here.
+
+float compute_heartbeat(float th) {
+    return cos(th) * cos(3.0 * th);
+}
+
+// Rate modulation (k = 0.1, gentle bias)
+float compute_rate_mod(float hb) {
+    return 1.0 + 0.1 * hb;
+}
+
+// ============================================================================
+// Phase stress: max(cos²φ, sin²φ)  — interface polarization
+// ============================================================================
+
+float compute_phase_stress(float phi) {
+    float s = sin(phi);
+    float c = cos(phi);
+    return max(c*c, s*s);
+}
+
+// ============================================================================
+// Coherence filter: v := v − λ m⊥   (orthogonal-component removal)
+// ============================================================================
+
+void apply_coherence_filter(inout float vx, inout float vy, inout float vz,
+                             float nx, float ny, float nz, float lambda)
+{
+    float dot_mn = vx*nx + vy*ny + vz*nz;
+    float ox = vx - dot_mn * nx;
+    float oy = vy - dot_mn * ny;
+    float oz = vz - dot_mn * nz;
+    vx -= lambda * ox;
+    vy -= lambda * oy;
+    vz -= lambda * oz;
+}
+
+// ============================================================================
+// Anisotropic damping: v := v − γ (v·n̂) n̂   (parallel-component removal)
+// ============================================================================
+
+void apply_anisotropic_damping(inout float vx, inout float vy, inout float vz,
+                                float nx, float ny, float nz, float gamma)
+{
+    float dot_vn = vx*nx + vy*ny + vz*nz;
+    vx -= gamma * dot_vn * nx;
+    vy -= gamma * dot_vn * ny;
+    vz -= gamma * dot_vn * nz;
+}
+
+// ============================================================================
+// Coherence scale: 1 + |v·n|/|v| · phi_factor
+// ============================================================================
+
+float compute_coherence_scale(float vx, float vy, float vz,
+                               float nx, float ny, float nz, float phi_factor)
+{
+    float dot_mn = vx*nx + vy*ny + vz*nz;
+    float vmag = sqrt(vx*vx + vy*vy + vz*vz) + 0.001;
+    return 1.0 + abs(dot_mn) / vmag * phi_factor;
+}
+
+// ============================================================================
+// Coupling + seam selection
+// ============================================================================
+
+uint select_seam_bits(float coupling) {
+    if (coupling > 0.5) return SEAM_FULL;
+    if (coupling > 0.2) return SEAM_UP_ONLY;
+    return SEAM_CLOSED;
+}
+
+// ============================================================================
+// Pressure + tidal forces
+// ============================================================================
+
+float compute_pressure(float scale) {
+    return PHI_EXCESS * sqrt(scale);
+}
+
+void compute_tidal_forces(float r_cyl, float r3d, float scale, float L_disk_align,
+                          out float shear_out, out float tidal_radial_out)
+{
+    float shear = 0.0;
+    float tidal_radial = 0.0;
+
+    if (r3d > SCHW_R * 1.5) {
+        float r5 = r3d * r3d * r3d * r3d * r3d;
+        shear = 1.5 * sqrt(pc.BH_MASS / r5);
+        shear *= sqrt(scale);
+        shear *= max(0.0, abs(L_disk_align));
+    }
+
+    if (r3d > SCHW_R * 1.2) {
+        float r3 = r3d * r3d * r3d;
+        tidal_radial = pc.BH_MASS / r3;
+        tidal_radial *= sqrt(scale);
+    }
+
+    shear_out = shear;
+    tidal_radial_out = tidal_radial;
+}
+
+// ============================================================================
+// Pump state machine (states other than UPSTROKE_COHERENT / UPSTROKE_HOP,
+// which need velocity access and are handled inline in main())
+// ============================================================================
+
+void siphon_state_step(inout int state, inout float scale, inout int coh_count,
+                       inout float residual, inout float work,
+                       uint seam_bits, float pressure, float global_bias,
+                       float tidal_stress, float history)
+{
+    if (state == PUMP_IDLE) {
+        if (seam_bits != 0u) state = PUMP_PRIMED;
+        residual = 0.0;
+    }
+    else if (state == PUMP_PRIMED) {
+        residual = 0.0;
+        if (seam_bits == SEAM_FULL) {
+            state = (coh_count < PUMP_COHERENT_MAX)
+                ? PUMP_UPSTROKE_COHERENT
+                : PUMP_UPSTROKE_HOP;
+        }
+    }
+    else if (state == PUMP_EXPAND) {
+        state = PUMP_DOWNSTROKE;
+    }
+    else if (state == PUMP_DOWNSTROKE) {
+        state = PUMP_VALVE_OPEN;
+    }
+    else if (state == PUMP_VALVE_OPEN) {
+        float effective_bias = global_bias;
+        if (scale > 10.0) {
+            effective_bias *= 1.0 / (1.0 + 0.1 * log2(scale / 10.0));
+        }
+        effective_bias = min(effective_bias, 1.0);
+        residual = pressure * (1.0 - effective_bias);
+        float tidal_coupling = tidal_stress * history * 0.1;
+        residual += tidal_coupling;
+        work += pressure * residual;
+        state = PUMP_RECIRCULATE;
+    }
+    else if (state == PUMP_RECIRCULATE) {
+        state = PUMP_PRIMED;
+    }
+}
+
+// ============================================================================
+// Scale regulation (soft decay at 30, hard cap at 100)
+// ============================================================================
+
+void regulate_scale(inout float scale, inout int coh_count) {
+    const float SCALE_SOFT_CAP = 30.0;
+    const float SCALE_HARD_CAP = 100.0;
+    const float DECAY_RATE     = 0.05;
+
+    if (scale > SCALE_SOFT_CAP) {
+        float overshoot = (scale - SCALE_SOFT_CAP) / (SCALE_HARD_CAP - SCALE_SOFT_CAP);
+        overshoot = min(overshoot, 1.0);
+        scale *= (1.0 - DECAY_RATE * overshoot * overshoot * overshoot);
+        if (overshoot > 0.3 && coh_count > 0) coh_count--;
+    }
+
+    if (scale > SCALE_HARD_CAP) {
+        scale = SCALE_SOFT_CAP * 0.8;
+        coh_count = 0;
+    }
+}
+
+// ============================================================================
+// Ejection check
+// ============================================================================
+
+bool check_ejection(float phase_stress, float r3d, float r_cyl, float residual) {
+    bool close_enough = (r3d < ISCO_R * 2.5) || (r_cyl < ISCO_R * 2.0);
+    bool phase_polarized = (phase_stress > 0.95);
+    return phase_polarized && close_enough
+        && (abs(residual) > PUMP_EJECT_THRESHOLD * 0.5);
+}
+
+// ============================================================================
+// Hopf fiber ejection kick
+// ============================================================================
+
+void apply_ejection_kick(float px, float py, float pz,
+                         inout float vx, inout float vy, inout float vz,
+                         float residual, float history,
+                         float ftx, float fty, float ftz,
+                         float flx, float fly, float flz)
+{
+    float pos_along_L = px*flx + py*fly + pz*flz;
+    float jet_sign = (pos_along_L >= 0.0) ? 1.0 : -1.0;
+    if (abs(pos_along_L) < 0.5) {
+        jet_sign = (flz >= 0.0) ? 1.0 : -1.0;  // fall-back on L̂'s z
+    }
+
+    float r3d = sqrt(px*px + py*py + pz*pz);
+    float r3d_safe = max(r3d, 0.01);
+
+    float collimation = clamp(1.0 - (r3d_safe - SCHW_R) / (ISCO_R * 2.0), 0.0, 1.0);
+    float pitch = (PI * 0.5) * (1.0 - collimation);
+    float cp = cos(pitch);
+    float sp = sin(pitch);
+
+    float kx = cp * ftx + sp * flx * jet_sign;
+    float ky = cp * fty + sp * fly * jet_sign;
+    float kz = cp * ftz + sp * flz * jet_sign;
+
+    float inv_k = inversesqrt(kx*kx + ky*ky + kz*kz + 1e-8);
+    kx *= inv_k;
+    ky *= inv_k;
+    kz *= inv_k;
+
+    float muzzle = residual * (1.0 + history * 0.5) * JET_SPEED;
+    vx += muzzle * kx;
+    vy += muzzle * ky;
+    vz += muzzle * kz;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
 
 void main() {
     int i = int(gl_GlobalInvocationID.x);
@@ -135,7 +394,7 @@ void main() {
     if ((f & PFLAG_EJECTED) != 0u) return;
     if (in_active_region[i] == 0u) return;
 
-    // Load state
+    // ----- Load particle state -----
     float px = pos_x[i];
     float py = pos_y[i];
     float pz = pos_z[i];
@@ -143,51 +402,160 @@ void main() {
     float vy = vel_y[i];
     float vz = vel_z[i];
 
-    // Distances
+    int   state     = pump_state[i];
+    float scale     = pump_scale[i];
+    int   coh_count = pump_coherent[i];
+    float residual  = pump_residual[i];
+    float work     = pump_work[i];
+    float history  = pump_history[i];
+
+    // ----- Distances and angular momentum -----
     float r3d_sq = px*px + py*py + pz*pz;
     float inv_r3d = inversesqrt(r3d_sq + 1e-8);
     float r3d = r3d_sq * inv_r3d;
 
-    // Viviani field force
+    float r_cyl_sq = px*px + pz*pz;
+    float inv_r_cyl = inversesqrt(r_cyl_sq + 1e-8);
+    float r_cyl = r_cyl_sq * inv_r_cyl;
+
+    // L = r × v
+    float Lx = py*vz - pz*vy;
+    float Ly = pz*vx - px*vz;
+    float Lz = px*vy - py*vx;
+    float inv_L = inversesqrt(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8);
+    float L_disk_align = Lz * inv_L;
+
+    // Local orbital frame
+    float frx = px * inv_r3d;
+    float fry = py * inv_r3d;
+    float frz = pz * inv_r3d;
+    float flx = Lx * inv_L;
+    float fly = Ly * inv_L;
+    float flz = Lz * inv_L;
+    // Tangential = L̂ × r̂
+    float ftx = fly * frz - flz * fry;
+    float fty = flz * frx - flx * frz;
+    float ftz = flx * fry - fly * frx;
+    float inv_t = inversesqrt(ftx*ftx + fty*fty + ftz*ftz + 1e-8);
+    ftx *= inv_t;  fty *= inv_t;  ftz *= inv_t;
+
+    // ----- STEP 3: Viviani field force -----
     float ax = 0.0, ay = 0.0, az = 0.0;
     apply_viviani_field(px, py, pz, r3d, inv_r3d, ax, ay, az);
 
-    // Orbital-plane damping
-    float Lx = py * vz - pz * vy;
-    float Ly = pz * vx - px * vz;
-    float Lz = px * vy - py * vx;
-    float inv_L = inversesqrt(Lx*Lx + Ly*Ly + Lz*Lz + 1e-8);
-    float lx = Lx * inv_L;
-    float ly = Ly * inv_L;
-    float lz = Lz * inv_L;
-
+    // ----- STEP 4: Orbital-plane damping (v·L̂) -----
     float v_sq = vx*vx + vy*vy + vz*vz;
-    if (v_sq > 0.001) {
-        float v_normal = vx * lx + vy * ly + vz * lz;
-        // Critically damped: γ(r) = 2·ω_z(r) = 2·√(BH_MASS/r³)
+    if (v_sq > 0.001 && r3d > SCHW_R * 2.0 && r3d < 250.0) {
+        float v_normal = vx*flx + vy*fly + vz*flz;
         float r3 = r3d * r3d * r3d;
         float omega_z = sqrt(pc.BH_MASS / max(r3, 1.0));
         float damping = min(2.0 * omega_z, 0.50);
-        vx -= damping * v_normal * lx;
-        vy -= damping * v_normal * ly;
-        vz -= damping * v_normal * lz;
+        vx -= damping * v_normal * flx;
+        vy -= damping * v_normal * fly;
+        vz -= damping * v_normal * flz;
     }
 
-    // Integrate velocity + position
+    // ----- STEP 5: First integration -----
     vx += ax * pc.dt;
     vy += ay * pc.dt;
     vz += az * pc.dt;
 
-    // NaN guard (monadic short-circuit)
-    if (!isinf(vx) && !isnan(vx) &&
-        !isinf(vy) && !isnan(vy) &&
-        !isinf(vz) && !isnan(vz)) {
-        px += vx * pc.dt;
-        py += vy * pc.dt;
-        pz += vz * pc.dt;
+    // NaN guard
+    if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz)) {
+        // Write unchanged state and bail
+        return;
     }
 
-    // Write back
+    px += vx * pc.dt;
+    py += vy * pc.dt;
+    pz += vz * pc.dt;
+
+    // Recompute distances after integration
+    r3d_sq = px*px + py*py + pz*pz;
+    inv_r3d = inversesqrt(r3d_sq + 1e-8);
+    r3d = r3d_sq * inv_r3d;
+    r_cyl_sq = px*px + pz*pz;
+    inv_r_cyl = inversesqrt(r_cyl_sq + 1e-8);
+    r_cyl = r_cyl_sq * inv_r_cyl;
+
+    // ----- STEP 6: Harmonic terms (heartbeat, phase stress) -----
+    float orb_phi   = atan(pz, px);
+    float heartbeat = compute_heartbeat(orb_phi);
+    float rate_mod  = compute_rate_mod(heartbeat);
+    float phase_stress = compute_phase_stress(orb_phi);
+
+    // ----- STEP 7: Coupling + seam bits -----
+    float L_actual   = 1.0 / (inv_L + 1e-8);
+    float v_mag      = sqrt(vx*vx + vy*vy + vz*vz + 1e-8);
+    float circularity = L_actual / (r3d * v_mag + 1e-8);
+    circularity = min(circularity, 1.0);
+    float coupling   = circularity;
+    uint seam_bits = select_seam_bits(coupling);
+
+    // Pressure from pump
+    float pressure = compute_pressure(scale);
+
+    // ----- STEP 8: Tidal forces -----
+    float shear, tidal_radial;
+    compute_tidal_forces(r_cyl, r3d, scale, L_disk_align, shear, tidal_radial);
+    float tidal_stress = max(shear, tidal_radial);
+
+    // ----- STEP 10: Siphon pump state machine -----
+    if (state == PUMP_UPSTROKE_COHERENT) {
+        // Coherence direction from heartbeat mode cycling
+        float nx, ny, nz;
+        if (heartbeat > 0.5) {
+            nx = frx; ny = fry; nz = frz;
+        } else if (heartbeat > -0.5) {
+            nx = ftx; ny = fty; nz = ftz;
+        } else {
+            nx = flx; ny = fly; nz = flz;
+        }
+        float lambda = COHERENCE_LAMBDA * rate_mod;
+        apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
+
+        if (!isinf(vx) && !isnan(vx) && !isinf(vy) && !isnan(vy) && !isinf(vz) && !isnan(vz)) {
+            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, 1.0);
+            coh_count++;
+            state = PUMP_EXPAND;
+        }
+    }
+    else if (state == PUMP_UPSTROKE_HOP) {
+        // Hop always uses radial direction × φ factor
+        float nx = frx;
+        float ny = fry;
+        float nz = frz;
+        float lambda = COHERENCE_LAMBDA * PHI * rate_mod;
+        apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
+
+        if (!isinf(vx) && !isnan(vx) && !isinf(vy) && !isnan(vy) && !isinf(vz) && !isnan(vz)) {
+            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, PHI);
+            coh_count = 0;
+            state = PUMP_EXPAND;
+        }
+    }
+    else {
+        siphon_state_step(state, scale, coh_count, residual, work,
+                          seam_bits, pressure, pc.bias, tidal_stress, history);
+    }
+
+    regulate_scale(scale, coh_count);
+
+    // ----- STEP 11: Ejection check -----
+    bool was_ejected = false;  // we early-return on PFLAG_EJECTED above
+    bool eject = check_ejection(phase_stress, r3d, r_cyl, residual);
+
+    if (eject && !was_ejected) {
+        apply_ejection_kick(px, py, pz, vx, vy, vz,
+                            residual, history,
+                            ftx, fty, ftz,
+                            flx, fly, flz);
+    }
+
+    // ----- STEP 14: Anisotropic dissipation (v·r̂, γ=0.02) -----
+    apply_anisotropic_damping(vx, vy, vz, frx, fry, frz, COHERENCE_GAMMA);
+
+    // ----- STEP 15: Write back -----
     pos_x[i] = px;
     pos_y[i] = py;
     pos_z[i] = pz;
@@ -195,8 +563,17 @@ void main() {
     vel_y[i] = vy;
     vel_z[i] = vz;
 
-    // Update pump history (exponential smoothing)
-    float scale = pump_scale[i];
-    float history = pump_history[i];
-    pump_history[i] = history * 0.98 + scale * 0.02;
+    pump_state[i]    = state;
+    pump_scale[i]    = scale;
+    pump_coherent[i] = coh_count;
+    pump_residual[i] = residual;
+    pump_work[i]     = work;
+
+    if (eject) {
+        flags[i] = f | PFLAG_EJECTED;
+    }
+
+    // Pump history (exponential smoothing)
+    const float HISTORY_SMOOTH = 0.02;
+    pump_history[i] = history * (1.0 - HISTORY_SMOOTH) + scale * HISTORY_SMOOTH;
 }

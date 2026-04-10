@@ -408,10 +408,10 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     push.N = phys.N;
     push.time = sim_time;
     push.dt = dt;
-    push.BH_MASS = 100.0f;
-    push.FIELD_STRENGTH = 1.0f;
+    push.BH_MASS = 1.0f;
+    push.FIELD_STRENGTH = 0.01f;
     push.FIELD_FALLOFF = 100.0f;
-    push.TANGENT_SCALE = 0.5f;
+    push.TANGENT_SCALE = 2.0f;
     push.seam_bits = 0x03;  /* SEAM_FULL */
     push.bias = 0.75f;
 
