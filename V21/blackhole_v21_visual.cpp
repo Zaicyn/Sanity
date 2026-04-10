@@ -339,6 +339,16 @@ int main(int argc, char** argv) {
         rb_vz = (float*)malloc(num_particles * sizeof(float));
     }
 
+    /* Pack initial frame so there's something to render immediately */
+    v21_pack_vertices(vertex_data,
+        particles.pos_x, particles.pos_y, particles.pos_z,
+        particles.vel_x, particles.vel_y, particles.vel_z,
+        particles.pump_scale, particles.pump_residual,
+        particles.flags, particles.topo_state,
+        particles.N);
+    memcpy(vertexBuf.mapped, vertex_data,
+           particles.N * sizeof(v21_packed_vertex_t));
+
     /* Main loop */
     float dt = DEFAULT_DT;
     float sim_time = 0.0f;
