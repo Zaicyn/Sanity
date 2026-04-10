@@ -33,6 +33,7 @@
 #include "core/v21_geometry.h"
 #include "core/v21_backend.h"
 #include "core/v21_spirv.h"
+#include "core/v21_accumulate.h"
 
 /* ========================================================================
  * SIMULATION PARAMETERS
@@ -295,74 +296,121 @@ static int topo_dim_simple(uint8_t state) {
 
 static void render_frame_ppm(const char* filename, ParticleState* ps,
                               float cam_dist, float cam_yaw, float cam_pitch) {
-    /* Framebuffer: RGB accumulation (uint16 to handle additive blending) */
-    uint16_t* fb_r = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
-    uint16_t* fb_g = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
-    uint16_t* fb_b = (uint16_t*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(uint16_t));
+    /* HDR framebuffer (float for proper Gaussian accumulation) */
+    float* fb_r = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
+    float* fb_g = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
+    float* fb_b = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
 
-    /* Simple orbital camera */
+    /* Step 1: Collapse particles into Gaussian splats */
+    int max_splats = 100000;
+    v21_splat_t* splats = (v21_splat_t*)malloc(max_splats * sizeof(v21_splat_t));
+    int num_splats = v21_accumulate(
+        ps->pos_x, ps->pos_y, ps->pos_z,
+        ps->vel_x, ps->vel_y, ps->vel_z,
+        ps->theta, ps->pump_scale,
+        ps->flags, ps->topo_state, ps->N,
+        32, 250.0f,   /* 32³ grid, ±250 extent */
+        2.0f, 0.1f,   /* min density=2, min coherence=0.1 */
+        splats, max_splats);
+
+    /* Camera rotation */
     float cy = cosf(cam_yaw), sy = sinf(cam_yaw);
     float cp = cosf(cam_pitch), sp = sinf(cam_pitch);
+    float proj_scale = (float)RENDER_WIDTH / (cam_dist * 2.0f);
 
-    float scale = (float)RENDER_WIDTH / (cam_dist * 2.0f);
+    /* Step 2+3: Project splats and evaluate Gaussians */
+    for (int s = 0; s < num_splats; s++) {
+        float px = splats[s].x, py = splats[s].y, pz = splats[s].z;
 
-    for (int i = 0; i < ps->N; i++) {
-        if (!(ps->flags[i] & 0x01)) continue;
-
-        float px = ps->pos_x[i], py = ps->pos_y[i], pz = ps->pos_z[i];
-
-        /* Rotate by camera yaw (around Y) */
+        /* Camera rotation */
         float rx = px * cy + pz * sy;
         float rz = -px * sy + pz * cy;
         float ry = py;
-
-        /* Rotate by camera pitch (around X) */
         float ry2 = ry * cp - rz * sp;
         float rz2 = ry * sp + rz * cp;
 
-        /* Orthographic projection */
-        int sx = (int)(rx * scale + RENDER_WIDTH / 2);
-        int sy2 = (int)(-ry2 * scale + RENDER_HEIGHT / 2);
+        /* Screen position */
+        float sx_f = rx * proj_scale + RENDER_WIDTH * 0.5f;
+        float sy_f = -ry2 * proj_scale + RENDER_HEIGHT * 0.5f;
 
-        if (sx < 0 || sx >= RENDER_WIDTH || sy2 < 0 || sy2 >= RENDER_HEIGHT) continue;
+        /* Distance to camera (for 1/D sigma scaling) */
+        float D = fmaxf(fabsf(rz2) + 10.0f, 1.0f);
+
+        /* σ = k × √ρ / D — the 1/D clumping */
+        float sigma_world = 2.0f * sqrtf(splats[s].density);
+        float sigma_px = sigma_world * proj_scale / (D * 0.05f);
+        sigma_px = fmaxf(sigma_px, 1.0f);      /* At least 1 pixel */
+        sigma_px = fminf(sigma_px, 100.0f);     /* Cap for sanity */
+
+        /* Amplitude: R × √ρ × pump_scale */
+        float A = splats[s].amplitude;
 
         /* Color from topo_dim */
-        uint8_t r, g, b;
-        dim_to_rgb(topo_dim_simple(ps->topo_state[i]), &r, &g, &b);
+        uint8_t cr, cg, cb;
+        dim_to_rgb(splats[s].topo_dim, &cr, &cg, &cb);
+        float fr = cr / 255.0f, fg = cg / 255.0f, fb = cb / 255.0f;
 
-        /* Velocity brightness boost */
-        float vel = sqrtf(ps->vel_x[i]*ps->vel_x[i] + ps->vel_y[i]*ps->vel_y[i] + ps->vel_z[i]*ps->vel_z[i]);
-        float brightness = fminf(vel * 0.5f + 0.5f, 2.0f);
+        /* Rasterize Gaussian splat (3σ radius) */
+        int rad = (int)(sigma_px * 3.0f) + 1;
+        int x0 = (int)sx_f - rad, x1 = (int)sx_f + rad;
+        int y0 = (int)sy_f - rad, y1 = (int)sy_f + rad;
+        if (x0 < 0) x0 = 0; if (x1 >= RENDER_WIDTH) x1 = RENDER_WIDTH - 1;
+        if (y0 < 0) y0 = 0; if (y1 >= RENDER_HEIGHT) y1 = RENDER_HEIGHT - 1;
 
-        /* Additive blend (2x2 splat for visibility) */
-        for (int dy = 0; dy <= 1; dy++) {
-            for (int dx = 0; dx <= 1; dx++) {
-                int px2 = sx + dx, py2 = sy2 + dy;
-                if (px2 >= 0 && px2 < RENDER_WIDTH && py2 >= 0 && py2 < RENDER_HEIGHT) {
-                    int idx = py2 * RENDER_WIDTH + px2;
-                    fb_r[idx] += (uint16_t)(r * brightness);
-                    fb_g[idx] += (uint16_t)(g * brightness);
-                    fb_b[idx] += (uint16_t)(b * brightness);
-                }
+        float inv_2sigma2 = 1.0f / (2.0f * sigma_px * sigma_px);
+        float norm = A / (sigma_px * 2.507f);  /* Normalize by √(2π)σ */
+
+        for (int py2 = y0; py2 <= y1; py2++) {
+            float dy = py2 - sy_f;
+            float dy2 = dy * dy;
+            for (int px2 = x0; px2 <= x1; px2++) {
+                float dx = px2 - sx_f;
+                float r2 = dx * dx + dy2;
+                float weight = norm * expf(-r2 * inv_2sigma2);
+
+                int idx = py2 * RENDER_WIDTH + px2;
+                fb_r[idx] += weight * fr;
+                fb_g[idx] += weight * fg;
+                fb_b[idx] += weight * fb;
             }
         }
     }
 
-    /* Write PPM (P6 binary format) */
+    /* Step 4: Tonemap + write PPM */
+    /* Find peak for exposure */
+    float peak = 0.001f;
+    for (int i = 0; i < RENDER_WIDTH * RENDER_HEIGHT; i++) {
+        float lum = fb_r[i] * 0.299f + fb_g[i] * 0.587f + fb_b[i] * 0.114f;
+        if (lum > peak) peak = lum;
+    }
+    float exposure = 1.0f / (peak * 0.5f);  /* Expose for mid-tone at half peak */
+
     FILE* f = fopen(filename, "wb");
     if (f) {
         fprintf(f, "P6\n%d %d\n255\n", RENDER_WIDTH, RENDER_HEIGHT);
         for (int i = 0; i < RENDER_WIDTH * RENDER_HEIGHT; i++) {
+            /* Reinhard tonemap + gamma */
+            float r = fb_r[i] * exposure;
+            float g = fb_g[i] * exposure;
+            float b = fb_b[i] * exposure;
+            r = r / (1.0f + r);  /* Reinhard */
+            g = g / (1.0f + g);
+            b = b / (1.0f + b);
+            r = powf(r, 1.0f/2.2f);  /* Gamma */
+            g = powf(g, 1.0f/2.2f);
+            b = powf(b, 1.0f/2.2f);
+
             uint8_t pixel[3];
-            pixel[0] = (uint8_t)fminf(fb_r[i], 255);
-            pixel[1] = (uint8_t)fminf(fb_g[i], 255);
-            pixel[2] = (uint8_t)fminf(fb_b[i], 255);
+            pixel[0] = (uint8_t)(fminf(r, 1.0f) * 255);
+            pixel[1] = (uint8_t)(fminf(g, 1.0f) * 255);
+            pixel[2] = (uint8_t)(fminf(b, 1.0f) * 255);
             fwrite(pixel, 3, 1, f);
         }
         fclose(f);
     }
 
     free(fb_r); free(fb_g); free(fb_b);
+    free(splats);
 }
 
 /* ========================================================================
