@@ -296,137 +296,98 @@ static int topo_dim_simple(uint8_t state) {
 
 static void render_frame_ppm(const char* filename, ParticleState* ps,
                               float cam_dist, float cam_yaw, float cam_pitch) {
-    /* HDR framebuffer (float for proper Gaussian accumulation) */
+    /* HDR framebuffer */
     float* fb_r = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
     float* fb_g = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
     float* fb_b = (float*)calloc(RENDER_WIDTH * RENDER_HEIGHT, sizeof(float));
 
-    /* Step 1: Collapse particles into Gaussian splats */
-    int max_splats = 100000;
-    v21_splat_t* splats = (v21_splat_t*)malloc(max_splats * sizeof(v21_splat_t));
-    int num_splats = v21_accumulate(
-        ps->pos_x, ps->pos_y, ps->pos_z,
-        ps->vel_x, ps->vel_y, ps->vel_z,
-        ps->theta, ps->pump_scale,
-        ps->flags, ps->topo_state, ps->N,
-        16, 250.0f,   /* 16³ grid, ±250 extent — coarser = smoother blending */
-        3.0f, 0.05f,  /* min density=3, min coherence=0.05 */
-        splats, max_splats);
-
-    /* Camera rotation */
     float cy = cosf(cam_yaw), sy = sinf(cam_yaw);
     float cp = cosf(cam_pitch), sp = sinf(cam_pitch);
     float proj_scale = (float)RENDER_WIDTH / (cam_dist * 2.0f);
 
-    /* Viewer resonance parameters */
-    float omega_viewer = 0.1f;      /* Viewer's detection frequency */
-    float bandwidth = 0.5f;         /* How selective (smaller = sharper) */
+    /* Single pass: one small Gaussian per particle. Additive blend.
+     * No grid. No accumulator. No resonance gate. No multi-pass.
+     * The wave cancellations happen through superposition (addition). */
+    for (int i = 0; i < ps->N; i++) {
+        if (!(ps->flags[i] & 0x01)) continue;
 
-    /* Grid cell size in world units (for sigma minimum) */
-    float cell_size = (250.0f * 2.0f) / 16.0f;  /* ~31.25 units */
+        float px = ps->pos_x[i], py = ps->pos_y[i], pz = ps->pos_z[i];
 
-    /* Step 2+3: Project splats, apply resonance gate, evaluate Gaussians */
-    for (int s = 0; s < num_splats; s++) {
-        float px = splats[s].x, py = splats[s].y, pz = splats[s].z;
-
-        /* Resonance gate: W = exp(-Δω²/bandwidth²)
-         * Skip if weight is negligible — zero compute cost for non-resonant */
-        float dw = splats[s].frequency - omega_viewer;
-        float W = expf(-(dw * dw) / (bandwidth * bandwidth));
-        if (W < 0.01f) continue;  /* Fizzles — not resonant */
-
-        /* Camera rotation */
+        /* Camera transform */
         float rx = px * cy + pz * sy;
         float rz = -px * sy + pz * cy;
         float ry = py;
         float ry2 = ry * cp - rz * sp;
-        float rz2 = ry * sp + rz * cp;
 
         /* Screen position */
         float sx_f = rx * proj_scale + RENDER_WIDTH * 0.5f;
         float sy_f = -ry2 * proj_scale + RENDER_HEIGHT * 0.5f;
 
-        /* Distance to camera (for 1/D sigma scaling) */
-        float D = fmaxf(fabsf(rz2) + 50.0f, 10.0f);
-
-        /* σ in world space: must be at least cell_size to blend across boundaries
-         * σ_world = max(cell_size, k × √ρ) — ensures neighboring cell Gaussians overlap */
-        float sigma_world = fmaxf(cell_size * 0.8f, 3.0f * sqrtf(splats[s].density));
-
-        /* Project to screen pixels, with 1/D scaling */
-        float sigma_px = sigma_world * proj_scale * (cam_dist / D);
-        sigma_px = fmaxf(sigma_px, 2.0f);      /* At least 2 pixels */
-        sigma_px = fminf(sigma_px, 40.0f);      /* Cap: max 40px radius (perf guard) */
-
-        /* Amplitude: R × √ρ × pump_scale × resonance_weight */
-        float A = splats[s].amplitude * W;
-
-        /* Color from topo_dim */
+        /* Color from eigenstate */
         uint8_t cr, cg, cb;
-        dim_to_rgb(splats[s].topo_dim, &cr, &cg, &cb);
-        float fr = cr / 255.0f, fg = cg / 255.0f, fb = cb / 255.0f;
+        dim_to_rgb(topo_dim_simple(ps->topo_state[i]), &cr, &cg, &cb);
 
-        /* Rasterize Gaussian splat (3σ radius) */
-        int rad = (int)(sigma_px * 3.0f) + 1;
+        /* Brightness from pump_scale (activity) */
+        float brightness = ps->pump_scale[i] * 0.3f;
+
+        /* σ: small, fixed per particle. Dense regions brighten through
+         * additive overlap, not through larger Gaussians. */
+        float sigma = 3.0f;
+
+        float fr = (cr / 255.0f) * brightness;
+        float fg = (cg / 255.0f) * brightness;
+        float fb_val = (cb / 255.0f) * brightness;
+
+        /* Splat: 3σ radius */
+        int rad = (int)(sigma * 3.0f) + 1;
         int x0 = (int)sx_f - rad, x1 = (int)sx_f + rad;
         int y0 = (int)sy_f - rad, y1 = (int)sy_f + rad;
         if (x0 < 0) x0 = 0; if (x1 >= RENDER_WIDTH) x1 = RENDER_WIDTH - 1;
         if (y0 < 0) y0 = 0; if (y1 >= RENDER_HEIGHT) y1 = RENDER_HEIGHT - 1;
 
-        float inv_2sigma2 = 1.0f / (2.0f * sigma_px * sigma_px);
-        float norm = A / (sigma_px * 2.507f);
+        float inv_2s2 = 1.0f / (2.0f * sigma * sigma);
 
         for (int py2 = y0; py2 <= y1; py2++) {
             float dy = py2 - sy_f;
-            float dy2 = dy * dy;
             for (int px2 = x0; px2 <= x1; px2++) {
                 float dx = px2 - sx_f;
-                float r2 = dx * dx + dy2;
-                float weight = norm * expf(-r2 * inv_2sigma2);
-
+                float w = expf(-(dx*dx + dy*dy) * inv_2s2);
                 int idx = py2 * RENDER_WIDTH + px2;
-                fb_r[idx] += weight * fr;
-                fb_g[idx] += weight * fg;
-                fb_b[idx] += weight * fb;
+                fb_r[idx] += fr * w;
+                fb_g[idx] += fg * w;
+                fb_b[idx] += fb_val * w;
             }
         }
     }
 
-    /* Step 4: Tonemap + write PPM */
-    /* Find peak for exposure */
+    /* Tonemap + write PPM */
     float peak = 0.001f;
     for (int i = 0; i < RENDER_WIDTH * RENDER_HEIGHT; i++) {
         float lum = fb_r[i] * 0.299f + fb_g[i] * 0.587f + fb_b[i] * 0.114f;
         if (lum > peak) peak = lum;
     }
-    float exposure = 1.0f / (peak * 0.5f);  /* Expose for mid-tone at half peak */
+    float exposure = 1.0f / (peak * 0.5f);
 
     FILE* f = fopen(filename, "wb");
     if (f) {
         fprintf(f, "P6\n%d %d\n255\n", RENDER_WIDTH, RENDER_HEIGHT);
         for (int i = 0; i < RENDER_WIDTH * RENDER_HEIGHT; i++) {
-            /* Reinhard tonemap + gamma */
             float r = fb_r[i] * exposure;
             float g = fb_g[i] * exposure;
             float b = fb_b[i] * exposure;
-            r = r / (1.0f + r);  /* Reinhard */
-            g = g / (1.0f + g);
-            b = b / (1.0f + b);
-            r = powf(r, 1.0f/2.2f);  /* Gamma */
-            g = powf(g, 1.0f/2.2f);
-            b = powf(b, 1.0f/2.2f);
-
-            uint8_t pixel[3];
-            pixel[0] = (uint8_t)(fminf(r, 1.0f) * 255);
-            pixel[1] = (uint8_t)(fminf(g, 1.0f) * 255);
-            pixel[2] = (uint8_t)(fminf(b, 1.0f) * 255);
+            r = r / (1.0f + r);  g = g / (1.0f + g);  b = b / (1.0f + b);
+            r = powf(r, 1.0f/2.2f); g = powf(g, 1.0f/2.2f); b = powf(b, 1.0f/2.2f);
+            uint8_t pixel[3] = {
+                (uint8_t)(fminf(r, 1.0f) * 255),
+                (uint8_t)(fminf(g, 1.0f) * 255),
+                (uint8_t)(fminf(b, 1.0f) * 255)
+            };
             fwrite(pixel, 3, 1, f);
         }
         fclose(f);
     }
 
     free(fb_r); free(fb_g); free(fb_b);
-    free(splats);
 }
 
 /* ========================================================================
