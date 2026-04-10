@@ -81,6 +81,38 @@ target_include_directories(blackhole_v21 PRIVATE
 target_link_libraries(blackhole_v21 PRIVATE v21_core m)
 
 # ==============================================================================
+# BLACKHOLE V21 VISUAL — CPU physics + Vulkan rendering
+# ==============================================================================
+
+find_package(glfw3 QUIET)
+if(glfw3_FOUND)
+    set(VK_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_instance.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_device.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_swapchain.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_pipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_buffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_attractor.cpp
+    )
+
+    add_executable(blackhole_v21_visual
+        ${CMAKE_CURRENT_SOURCE_DIR}/blackhole_v21_visual.cpp
+        ${VK_SOURCES}
+    )
+    target_include_directories(blackhole_v21_visual PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/core
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+    )
+    target_link_libraries(blackhole_v21_visual PRIVATE
+        v21_core Vulkan::Vulkan glfw m
+    )
+    message(STATUS "Visual target ENABLED (GLFW found)")
+else()
+    message(STATUS "Visual target disabled (GLFW not found)")
+endif()
+
+# ==============================================================================
 # V21 TEST — CPU allocator smoke test
 # ==============================================================================
 
