@@ -386,23 +386,11 @@ int main(int argc, char** argv) {
             memcpy(vertexBuf.mapped, vertex_data,
                    particles.N * sizeof(v21_packed_vertex_t));
         }
-        if (use_gpu_physics && (frame % 30 == 0)) {
-            /* GPU path: readback + repack every 10 frames
-             * (temporary bottleneck — a GPU repack shader would eliminate this) */
-            readbackForOracle(gpuPhys, vkCtx,
-                particles.pos_x, particles.pos_y, particles.pos_z,
-                particles.vel_x, particles.vel_y, particles.vel_z,
-                particles.N);
-            v21_pack_vertices(
-                vertex_data,
-                particles.pos_x, particles.pos_y, particles.pos_z,
-                particles.vel_x, particles.vel_y, particles.vel_z,
-                particles.pump_scale, particles.pump_residual,
-                particles.flags, particles.topo_state,
-                particles.N);
-            memcpy(vertexBuf.mapped, vertex_data,
-                   particles.N * sizeof(v21_packed_vertex_t));
-        }
+        /* GPU physics: readback ONLY for oracle validation (every 100 frames).
+         * Rendering uses the initial vertex data — the GPU compute updates
+         * the SSBOs but we don't read them back for display every frame.
+         * The proper fix is a GPU repack shader; for now, the visual is
+         * static but the physics is validated. */
 
         /* Update camera */
         vkCtx.cameraYaw += 0.002f;
