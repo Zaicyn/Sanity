@@ -386,9 +386,9 @@ int main(int argc, char** argv) {
             memcpy(vertexBuf.mapped, vertex_data,
                    particles.N * sizeof(v21_packed_vertex_t));
         }
-        if (use_gpu_physics) {
-            /* GPU path: read back particle data for vertex packing
-             * (temporary — should be a GPU repack shader eventually) */
+        if (use_gpu_physics && (frame % 10 == 0)) {
+            /* GPU path: readback + repack every 10 frames
+             * (temporary bottleneck — a GPU repack shader would eliminate this) */
             readbackForOracle(gpuPhys, vkCtx,
                 particles.pos_x, particles.pos_y, particles.pos_z,
                 particles.vel_x, particles.vel_y, particles.vel_z,
