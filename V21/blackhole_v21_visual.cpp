@@ -386,7 +386,7 @@ int main(int argc, char** argv) {
             memcpy(vertexBuf.mapped, vertex_data,
                    particles.N * sizeof(v21_packed_vertex_t));
         }
-        if (use_gpu_physics && (frame % 10 == 0)) {
+        if (use_gpu_physics && (frame % 30 == 0)) {
             /* GPU path: readback + repack every 10 frames
              * (temporary bottleneck — a GPU repack shader would eliminate this) */
             readbackForOracle(gpuPhys, vkCtx,
@@ -515,8 +515,17 @@ int main(int argc, char** argv) {
         free(rb_vx); free(rb_vy); free(rb_vz);
     }
     v21_oracle_summary(&oracle);
-    vkDestroyBuffer(vkCtx.device, vertexBuf.buffer, nullptr);
-    vkFreeMemory(vkCtx.device, vertexBuf.memory, nullptr);
+
+    /* Destroy our vertex buffer before vk::cleanup touches the context */
+    if (vertexBuf.buffer != VK_NULL_HANDLE) {
+        vkUnmapMemory(vkCtx.device, vertexBuf.memory);
+        vkDestroyBuffer(vkCtx.device, vertexBuf.buffer, nullptr);
+        vkFreeMemory(vkCtx.device, vertexBuf.memory, nullptr);
+    }
+    /* Null out handles so V20's cleanup doesn't double-free */
+    vkCtx.particleBuffer = VK_NULL_HANDLE;
+    vkCtx.particleBufferMemory = VK_NULL_HANDLE;
+
     vk::cleanup(vkCtx);
     glfwDestroyWindow(window);
     glfwTerminate();
