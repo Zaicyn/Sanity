@@ -373,16 +373,9 @@ int main(int argc, char** argv) {
                 particles.theta, particles.pump_scale,
                 particles.flags, particles.topo_state,
                 particles.N, frame);
-        } else if (frame % 100 == 0 && frame > 0) {
-            /* GPU readback for oracle */
-            readbackForOracle(gpuPhys, vkCtx, rb_px, rb_py, rb_pz,
-                              rb_vx, rb_vy, rb_vz, particles.N);
-            v21_oracle_check(&oracle,
-                rb_px, rb_py, rb_pz, rb_vx, rb_vy, rb_vz,
-                particles.theta, particles.pump_scale,
-                particles.flags, particles.topo_state,
-                particles.N, frame);
         }
+        /* GPU oracle readback disabled in render loop — use headless mode
+         * for validation. The vkQueueWaitIdle in readback causes stalls. */
 
         if (!use_gpu_physics) {
             /* CPU path: pack SoA → AoS and upload */
