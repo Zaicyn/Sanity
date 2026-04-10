@@ -309,8 +309,8 @@ static void render_frame_ppm(const char* filename, ParticleState* ps,
         ps->vel_x, ps->vel_y, ps->vel_z,
         ps->theta, ps->pump_scale,
         ps->flags, ps->topo_state, ps->N,
-        32, 250.0f,   /* 32³ grid, ±250 extent */
-        2.0f, 0.1f,   /* min density=2, min coherence=0.1 */
+        16, 250.0f,   /* 16³ grid, ±250 extent — coarser = smoother blending */
+        3.0f, 0.05f,  /* min density=3, min coherence=0.05 */
         splats, max_splats);
 
     /* Camera rotation */
@@ -318,9 +318,22 @@ static void render_frame_ppm(const char* filename, ParticleState* ps,
     float cp = cosf(cam_pitch), sp = sinf(cam_pitch);
     float proj_scale = (float)RENDER_WIDTH / (cam_dist * 2.0f);
 
-    /* Step 2+3: Project splats and evaluate Gaussians */
+    /* Viewer resonance parameters */
+    float omega_viewer = 0.1f;      /* Viewer's detection frequency */
+    float bandwidth = 0.5f;         /* How selective (smaller = sharper) */
+
+    /* Grid cell size in world units (for sigma minimum) */
+    float cell_size = (250.0f * 2.0f) / 16.0f;  /* ~31.25 units */
+
+    /* Step 2+3: Project splats, apply resonance gate, evaluate Gaussians */
     for (int s = 0; s < num_splats; s++) {
         float px = splats[s].x, py = splats[s].y, pz = splats[s].z;
+
+        /* Resonance gate: W = exp(-Δω²/bandwidth²)
+         * Skip if weight is negligible — zero compute cost for non-resonant */
+        float dw = splats[s].frequency - omega_viewer;
+        float W = expf(-(dw * dw) / (bandwidth * bandwidth));
+        if (W < 0.01f) continue;  /* Fizzles — not resonant */
 
         /* Camera rotation */
         float rx = px * cy + pz * sy;
@@ -334,16 +347,19 @@ static void render_frame_ppm(const char* filename, ParticleState* ps,
         float sy_f = -ry2 * proj_scale + RENDER_HEIGHT * 0.5f;
 
         /* Distance to camera (for 1/D sigma scaling) */
-        float D = fmaxf(fabsf(rz2) + 10.0f, 1.0f);
+        float D = fmaxf(fabsf(rz2) + 50.0f, 10.0f);
 
-        /* σ = k × √ρ / D — the 1/D clumping */
-        float sigma_world = 2.0f * sqrtf(splats[s].density);
-        float sigma_px = sigma_world * proj_scale / (D * 0.05f);
-        sigma_px = fmaxf(sigma_px, 1.0f);      /* At least 1 pixel */
-        sigma_px = fminf(sigma_px, 100.0f);     /* Cap for sanity */
+        /* σ in world space: must be at least cell_size to blend across boundaries
+         * σ_world = max(cell_size, k × √ρ) — ensures neighboring cell Gaussians overlap */
+        float sigma_world = fmaxf(cell_size * 0.8f, 3.0f * sqrtf(splats[s].density));
 
-        /* Amplitude: R × √ρ × pump_scale */
-        float A = splats[s].amplitude;
+        /* Project to screen pixels, with 1/D scaling */
+        float sigma_px = sigma_world * proj_scale * (cam_dist / D);
+        sigma_px = fmaxf(sigma_px, 2.0f);      /* At least 2 pixels */
+        sigma_px = fminf(sigma_px, 40.0f);      /* Cap: max 40px radius (perf guard) */
+
+        /* Amplitude: R × √ρ × pump_scale × resonance_weight */
+        float A = splats[s].amplitude * W;
 
         /* Color from topo_dim */
         uint8_t cr, cg, cb;
@@ -358,7 +374,7 @@ static void render_frame_ppm(const char* filename, ParticleState* ps,
         if (y0 < 0) y0 = 0; if (y1 >= RENDER_HEIGHT) y1 = RENDER_HEIGHT - 1;
 
         float inv_2sigma2 = 1.0f / (2.0f * sigma_px * sigma_px);
-        float norm = A / (sigma_px * 2.507f);  /* Normalize by √(2π)σ */
+        float norm = A / (sigma_px * 2.507f);
 
         for (int py2 = y0; py2 <= y1; py2++) {
             float dy = py2 - sy_f;
