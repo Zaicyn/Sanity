@@ -499,12 +499,6 @@ int main(int argc, char** argv) {
         }
 
         frame++;
-        if (frame % 900 == 0) {  /* Print stats every 900 frames (~9 sec at 100fps) */
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - t0).count();
-            printf("[frame %d] %.1f fps, %d particles, t=%.1f\n",
-                   frame, frame / elapsed, particles.N, sim_time);
-        }
     }
 
     /* Cleanup */

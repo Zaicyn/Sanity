@@ -225,14 +225,14 @@ static inline void v21_oracle_check(
 
     int all_pass = pass_Q && pass_R && pass_vel && pass_dens && pass_topo;
 
-    /* Log */
-    if (do_sparse || !all_pass || frame % 90 == 0) {
-        printf("[ORACLE] frame=%d mode=%-6s n=%d Q=%.0f R=%.4f vel=%.4f | %s %s %s %s %s\n",
-               frame, mode, n_sampled, cur_Q, cur_R, cur_vel,
-               pass_Q ? "PASS" : "FAIL(Q)",
-               pass_R ? "PASS" : "FAIL(R)",
-               pass_vel ? "PASS" : "FAIL(vel)",
-               pass_dens ? "PASS" : "FAIL(dens)",
+    /* Log — only on failure (zero print overhead in normal operation) */
+    if (!all_pass) {
+        printf("[ORACLE] FAIL frame=%d mode=%-6s Q=%.0f R=%.4f vel=%.4f | %s %s %s %s %s\n",
+               frame, mode, cur_Q, cur_R, cur_vel,
+               pass_Q ? "ok" : "FAIL(Q)",
+               pass_R ? "ok" : "FAIL(R)",
+               pass_vel ? "ok" : "FAIL(vel)",
+               pass_dens ? "ok" : "FAIL(dens)",
                pass_topo ? "PASS" : "FAIL(topo)");
     }
 
