@@ -34,6 +34,7 @@
 #include "core/v21_backend.h"
 #include "core/v21_spirv.h"
 #include "core/v21_accumulate.h"
+#include "core/v21_oracle.h"
 
 /* ========================================================================
  * SIMULATION PARAMETERS
@@ -462,6 +463,10 @@ int main(int argc, char** argv) {
     ParticleState particles;
     init_particles(&particles, num_particles, seed);
 
+    /* Initialize validation oracle */
+    v21_oracle_t oracle;
+    v21_oracle_init(&oracle);
+
     /* Main simulation loop */
     float sim_time = 0.0f;
     clock_t start = clock();
@@ -478,6 +483,14 @@ int main(int argc, char** argv) {
     for (int frame = 0; frame < num_frames; frame++) {
         physics_step(&particles, dt * 2.0f, sim_time);
         sim_time += dt;
+
+        /* Oracle: validate physics metrics (dense core + sparse shells) */
+        v21_oracle_check(&oracle,
+            particles.pos_x, particles.pos_y, particles.pos_z,
+            particles.vel_x, particles.vel_y, particles.vel_z,
+            particles.theta, particles.pump_scale,
+            particles.flags, particles.topo_state,
+            particles.N, frame);
 
         /* Slowly rotate camera for visual interest */
         float yaw = cam_yaw + (float)frame * 0.001f;
@@ -506,6 +519,7 @@ int main(int argc, char** argv) {
     print_diagnostics(&particles, num_frames, sim_time);
 
     /* Cleanup */
+    v21_oracle_summary(&oracle);
     free_particles(&particles);
     printf("[shutdown] Complete.\n");
 

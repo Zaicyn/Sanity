@@ -58,6 +58,7 @@ AttractorPipeline g_attractor = {};
 extern "C" {
 #include "core/v21_types.h"
 #include "core/v21_vertex_pack.h"
+#include "core/v21_oracle.h"
 }
 
 /* ========================================================================
@@ -260,6 +261,10 @@ int main(int argc, char** argv) {
     ParticleState particles;
     init_particles(particles, num_particles, seed);
 
+    /* Init validation oracle */
+    v21_oracle_t oracle;
+    v21_oracle_init(&oracle);
+
     /* Allocate vertex pack buffer */
     v21_packed_vertex_t* vertex_data = (v21_packed_vertex_t*)malloc(
         num_particles * sizeof(v21_packed_vertex_t));
@@ -315,6 +320,14 @@ int main(int argc, char** argv) {
         /* CPU physics */
         physics_step(particles, dt * 2.0f);
         sim_time += dt;
+
+        /* Oracle: validate physics */
+        v21_oracle_check(&oracle,
+            particles.pos_x, particles.pos_y, particles.pos_z,
+            particles.vel_x, particles.vel_y, particles.vel_z,
+            particles.theta, particles.pump_scale,
+            particles.flags, particles.topo_state,
+            particles.N, frame);
 
         /* Pack SoA → AoS (one loop, the only bridge) */
         v21_pack_vertices(
