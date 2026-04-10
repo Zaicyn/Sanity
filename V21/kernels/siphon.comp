@@ -102,24 +102,25 @@ const uint PFLAG_EJECTED = 0x02u;
 void apply_viviani_field(
     float px, float py, float pz,
     float vx, float vy, float vz,
+    float theta_i,
     float r3d, float inv_r3d,
     inout float ax, inout float ay, inout float az)
 {
     float r_safe = max(r3d, SCHW_R * 0.5);
     float inv_r = (r3d >= SCHW_R * 0.5) ? inv_r3d : (1.0 / r_safe);
 
-    float theta_pos = atan(pz, px);
-    float s1 = sin(theta_pos);
-    float c1 = cos(theta_pos);
-    float s3 = sin(3.0 * theta_pos);
-    float c3 = cos(3.0 * theta_pos);
+    // Use the PER-PARTICLE phase theta_i (which advances at r-dependent
+    // omega_nat) to compute the Viviani curve point. This is GPT's
+    // phase-field solution: instead of all particles sharing a global
+    // theta_pos = atan2(pz,px), each particle carries its own phase.
+    // Inner particles (higher omega_nat) cycle the curve faster →
+    // natural shear between shells → layered galaxy rather than rigid sheet.
+    float s1 = sin(theta_i);
+    float c1 = cos(theta_i);
+    float s3 = sin(3.0 * theta_i);
+    float c3 = cos(3.0 * theta_i);
 
-    // Asymmetric Viviani curve position
-    //   x(θ) = sin θ − ½ sin 3θ
-    //   y(θ) = −cos θ + ½ cos 3θ
-    //   z(θ) = cos θ · cos 3θ
-    // Scaled to the particle's own radius so the curve forms a shell
-    // template at each r rather than a point attractor near the origin.
+    // Asymmetric Viviani curve position, scaled to particle's radius
     float cx = s1 - 0.5 * s3;
     float cy = -c1 + 0.5 * c3;
     float cz = c1 * c3;
@@ -128,25 +129,39 @@ void apply_viviani_field(
     cy = cy * inv_c * r3d;
     cz = cz * inv_c * r3d;
 
-    // Velocity steering (Gemini's projection-tracking prescription):
-    // Rotate v toward the topological template instead of pulling position
-    // toward a point on the curve. Computes the normalized projection
-    //    dot = (v · c) / (|v|_clamped · |c|)
-    // and drives it toward the target cos(θ).
+    // GPT's rotational transport: rotate v toward the plane perpendicular
+    // to the Viviani normal ĉ instead of doing amplitude correction.
     //
-    // v_mag is clamped at 0.5 (Gemini surgery step 1): prevents the
-    // steering from becoming explosively strong when particles slow
-    // down near the core, which would otherwise snap velocities to
-    // the Viviani normal and kill orbital motion.
-    float v_mag_raw = sqrt(vx*vx + vy*vy + vz*vz + 1e-8);
-    float v_mag = max(v_mag_raw, 0.5);
-    float dot_vc = (vx*cx + vy*cy + vz*cz) / (v_mag * r3d);
-    float target = cos(theta_pos);
-    float steering = pc.FIELD_STRENGTH * (dot_vc - target);
-    float inv_r_force = 1.0 / r3d;
-    ax -= steering * cx * inv_r_force;
-    ay -= steering * cy * inv_r_force;
-    az -= steering * cz * inv_r_force;
+    //     axis = n × v       (rotation axis, perpendicular to both)
+    //     dv   = γ (axis × v) (rotation of v around axis)
+    //
+    // This is a pure rotation — |v| is invariant by construction — which
+    // enforces the quadrature conservation cos²φ + sin²φ = const from the
+    // gravity formula. Replaces the old amplitude-forcing steering which
+    // was injecting energy and producing runaway velocity growth.
+    //
+    // The rotation is applied directly to (vx,vy,vz) below via output vars
+    // not through (ax,ay,az) — because it's a rotation, not a force.
+    //
+    // Note: cx,cy,cz here are the radius-scaled curve position. We use
+    // the unit Viviani normal by dividing out r3d.
+    float nhx = cx * inv_r3d;
+    float nhy = cy * inv_r3d;
+    float nhz = cz * inv_r3d;
+    // axis = n × v
+    float axisx = nhy * vz - nhz * vy;
+    float axisy = nhz * vx - nhx * vz;
+    float axisz = nhx * vy - nhy * vx;
+    // dv = axis × v
+    float dvx = axisy * vz - axisz * vy;
+    float dvy = axisz * vx - axisx * vz;
+    float dvz = axisx * vy - axisy * vx;
+    // Return the rotation dv via the ax/ay/az outputs (they will be added
+    // to velocity directly by the caller, bypassing the normal force*dt
+    // integration, because this is a velocity delta not an acceleration).
+    ax += pc.FIELD_STRENGTH * dvx;
+    ay += pc.FIELD_STRENGTH * dvy;
+    az += pc.FIELD_STRENGTH * dvz;
 
     // Gemini surgery step 2: DISABLED — tangent push was conflicting
     // with the velocity steering, bleeding orbital energy via torque.
@@ -429,6 +444,16 @@ void main() {
     float work     = pump_work[i];
     float history  = pump_history[i];
 
+    // Per-particle phase (GPT's phase-field fix for rigid rotation).
+    // Advance at r-dependent omega_nat; this per-particle phase is what
+    // the Viviani steering targets, so inner shells cycle faster than
+    // outer shells → differential rotation → layered spiral structure.
+    float theta_i    = theta[i];
+    float omega_i    = omega_nat[i];
+    theta_i += omega_i * pc.dt;
+    if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
+    if (theta_i < 0.0)            theta_i += 6.28318530718;
+
     // Gemini surgery step 3: BYPASS the pump state machine. Force IDLE so
     // the heartbeat→axis coherence filter can't snap velocities to radial,
     // and no state-driven transitions can affect dynamics. Only the Viviani
@@ -467,7 +492,7 @@ void main() {
 
     // ----- STEP 3: Viviani field force -----
     float ax = 0.0, ay = 0.0, az = 0.0;
-    apply_viviani_field(px, py, pz, vx, vy, vz, r3d, inv_r3d, ax, ay, az);
+    apply_viviani_field(px, py, pz, vx, vy, vz, theta_i, r3d, inv_r3d, ax, ay, az);
 
     // ----- STEP 4: Orbital-plane damping (v·L̂) -----
     float v_sq = vx*vx + vy*vy + vz*vz;
@@ -594,6 +619,7 @@ void main() {
     pump_coherent[i] = coh_count;
     pump_residual[i] = residual;
     pump_work[i]     = work;
+    theta[i]         = theta_i;  /* per-particle phase advanced */
 
     if (eject) {
         flags[i] = f | PFLAG_EJECTED;

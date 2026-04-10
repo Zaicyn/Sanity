@@ -169,7 +169,17 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed) {
         ps.pump_scale[i] = 1.0f;
         ps.flags[i] = 0x01;
         ps.theta[i] = (float)rand()/RAND_MAX * 6.28318f;
-        ps.omega_nat[i] = 0.1f + ((float)rand()/RAND_MAX - 0.5f) * 0.02f;
+        /* Per-particle phase rate — r-dependent so inner shells advance
+         * faster than outer shells. This is GPT's phase-field solution
+         * to the rigid-rotation problem: instead of all particles sharing
+         * a global cos(theta_pos) target, each particle carries its own
+         * phase that advances at a rate proportional to 1/r. Inner
+         * particles cycle the Viviani target 20× faster than outer
+         * particles, creating the shear that differentiates shells into
+         * a layered galaxy rather than a rigid sheet. */
+        float r3d_init = sqrtf(x*x + y*y + z*z);
+        float r_eff = fmaxf(r3d_init, ISCO_R);
+        ps.omega_nat[i] = 0.377f / r_eff;  /* ≈ 1 cycle / 100 frames at ISCO */
         int axis = rand()%4; int sign = (rand()%2)?1:-1;
         ps.topo_state[i] = (uint8_t)(((sign>0)?1:2) << (axis*2));
     }
