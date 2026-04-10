@@ -44,6 +44,12 @@ namespace vk {
     void cleanup(VulkanContext& ctx);
 }
 
+/* V20 rendering functions we need */
+namespace vk {
+    void updateUniformBuffer(VulkanContext& ctx, uint32_t currentImage);
+    void recreateSwapchain(VulkanContext& ctx);
+}
+
 /* V20 globals that the rendering code references */
 #include "../vulkan/vk_attractor.h"
 AttractorPipeline g_attractor = {};
@@ -294,6 +300,7 @@ int main(int argc, char** argv) {
     vkCtx.particleBuffer = vertexBuf.buffer;
     vkCtx.particleBufferMemory = vertexBuf.memory;
 
+    vkCtx.currentFrame = 0;
     printf("[v21-visual] %d particles, Vulkan ready\n", num_particles);
 
     /* Main loop */
@@ -322,15 +329,95 @@ int main(int argc, char** argv) {
         memcpy(vertexBuf.mapped, vertex_data,
                particles.N * sizeof(v21_packed_vertex_t));
 
-        /* Update camera uniforms */
-        vkCtx.cameraYaw += 0.002f;  /* Slow auto-rotate */
-
-        /* Render frame using V20's existing command buffers */
-        /* (V20's createCommandBuffers already records the draw commands
-         *  using vkCtx.particleBuffer and vkCtx.particleCount) */
+        /* Update camera */
+        vkCtx.cameraYaw += 0.002f;
         vkCtx.particleCount = particles.N;
 
-        /* Present */
+        /* Draw: acquire → record → submit → present */
+        {
+            vkWaitForFences(vkCtx.device, 1, &vkCtx.inFlightFences[vkCtx.currentFrame], VK_TRUE, UINT64_MAX);
+
+            uint32_t imageIndex;
+            VkResult res = vkAcquireNextImageKHR(vkCtx.device, vkCtx.swapchain, UINT64_MAX,
+                vkCtx.imageAvailableSemaphores[vkCtx.currentFrame], VK_NULL_HANDLE, &imageIndex);
+            if (res == VK_ERROR_OUT_OF_DATE_KHR) { vk::recreateSwapchain(vkCtx); continue; }
+
+            vkResetFences(vkCtx.device, 1, &vkCtx.inFlightFences[vkCtx.currentFrame]);
+
+            VkCommandBuffer cmd = vkCtx.commandBuffers[vkCtx.currentFrame];
+            vkResetCommandBuffer(cmd, 0);
+
+            VkCommandBufferBeginInfo beginInfo = {};
+            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            vkBeginCommandBuffer(cmd, &beginInfo);
+
+            /* Render pass */
+            VkRenderPassBeginInfo rpInfo = {};
+            rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpInfo.renderPass = vkCtx.renderPass;
+            rpInfo.framebuffer = vkCtx.framebuffers[imageIndex];
+            rpInfo.renderArea.offset = {0, 0};
+            rpInfo.renderArea.extent = vkCtx.swapchainExtent;
+            VkClearValue clearValues[2] = {};
+            clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+            clearValues[1].depthStencil = {1.0f, 0};
+            rpInfo.clearValueCount = 2;
+            rpInfo.pClearValues = clearValues;
+
+            vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+            /* Viewport + scissor */
+            VkViewport viewport = {};
+            viewport.width = (float)vkCtx.swapchainExtent.width;
+            viewport.height = (float)vkCtx.swapchainExtent.height;
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            VkRect2D scissor = {{0,0}, vkCtx.swapchainExtent};
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+            /* Bind particle pipeline + vertex buffer + draw */
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkCtx.graphicsPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                vkCtx.pipelineLayout, 0, 1, &vkCtx.descriptorSets[vkCtx.currentFrame], 0, nullptr);
+            VkBuffer vbufs[] = {vertexBuf.buffer};
+            VkDeviceSize offsets[] = {0};
+            vkCmdBindVertexBuffers(cmd, 0, 1, vbufs, offsets);
+            vkCmdDraw(cmd, 6, particles.N, 0, 0);  /* 6 verts (quad) × N instances */
+
+            vkCmdEndRenderPass(cmd);
+            vkEndCommandBuffer(cmd);
+
+            /* Update camera uniforms */
+            vk::updateUniformBuffer(vkCtx, vkCtx.currentFrame);
+
+            /* Submit */
+            VkSubmitInfo submitInfo = {};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            VkSemaphore waitSems[] = {vkCtx.imageAvailableSemaphores[vkCtx.currentFrame]};
+            VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = waitSems;
+            submitInfo.pWaitDstStageMask = waitStages;
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            VkSemaphore sigSems[] = {vkCtx.renderFinishedSemaphores[vkCtx.currentFrame]};
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = sigSems;
+            vkQueueSubmit(vkCtx.graphicsQueue, 1, &submitInfo, vkCtx.inFlightFences[vkCtx.currentFrame]);
+
+            /* Present */
+            VkPresentInfoKHR presentInfo = {};
+            presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            presentInfo.waitSemaphoreCount = 1;
+            presentInfo.pWaitSemaphores = sigSems;
+            presentInfo.swapchainCount = 1;
+            presentInfo.pSwapchains = &vkCtx.swapchain;
+            presentInfo.pImageIndices = &imageIndex;
+            vkQueuePresentKHR(vkCtx.presentQueue, &presentInfo);
+
+            vkCtx.currentFrame = (vkCtx.currentFrame + 1) % 2;
+        }
+
         frame++;
         if (frame % 90 == 0) {
             auto now = std::chrono::steady_clock::now();
