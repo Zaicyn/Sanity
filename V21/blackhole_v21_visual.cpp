@@ -189,33 +189,37 @@ static void physics_step(ParticleState& ps, float dt) {
         float inv_r = 1.0f/(r3d+1e-8f);
         float r_safe = fmaxf(r3d, 1.0f);
 
-        /* Viviani field — asymmetric, curve-attracting */
+        /* Viviani field — Gemini's velocity projection-steering prescription.
+         * Rotates velocity toward the topological template instead of pulling
+         * position toward a point. Replaces the old curve-attracting centripetal
+         * (which was a point-attractor producing the "dagger" collapse). */
         float theta_pos = atan2f(pz, px);
         float c1=cosf(theta_pos), s1=sinf(theta_pos);
         float c3=cosf(3*theta_pos), s3=sinf(3*theta_pos);
-        /* Curve position (asymmetric Viviani) */
+        /* Asymmetric Viviani curve position scaled to particle's radius */
         float cxp = s1 - 0.5f*s3;
         float cyp = -c1 + 0.5f*c3;
         float czp = c1*c3;
-        /* Curve tangent (asymmetric field direction) */
-        float fx=c1-1.5f*c3, fy=s1-1.5f*s3, fz=-s1*c3-3*c1*s3;
-        float inv_f=1.0f/sqrtf(fx*fx+fy*fy+fz*fz+1e-8f);
-        fx*=inv_f; fy*=inv_f; fz*=inv_f;
-        float weight = 0.01f/(1.0f+r_safe*r_safe/100.0f);
-        float rx=px*inv_r, ry=py*inv_r, rz=pz*inv_r;
-        float fdr = fx*rx+fy*ry+fz*rz;
-        float tx=fx-fdr*rx, ty=fy-fdr*ry, tz=fz-fdr*rz;
-        /* Curve-attracting centripetal — pull toward nearest point on the
-         * Viviani curve at the particle's current orbital angle. Bakes
-         * the asymmetry into the radial binding itself. */
-        float dxv = cxp - px;
-        float dyv = cyp - py;
-        float dzv = czp - pz;
-        float distv = sqrtf(dxv*dxv + dyv*dyv + dzv*dzv);
-        float cw = weight / (distv + 0.1f);
-        float ax = dxv*cw + tx*weight*2.0f;
-        float ay = dyv*cw + ty*weight*2.0f;
-        float az = dzv*cw + tz*weight*2.0f;
+        float inv_cp = 1.0f/sqrtf(cxp*cxp + cyp*cyp + czp*czp + 1e-8f);
+        cxp = cxp * inv_cp * r3d;
+        cyp = cyp * inv_cp * r3d;
+        czp = czp * inv_cp * r3d;
+
+        /* Velocity projection-steering: drive (v·ĉ) toward cos(θ)
+         * v_mag clamped at 0.5 (Gemini surgery step 1). */
+        float v_mag_raw = sqrtf(vx*vx + vy*vy + vz*vz + 1e-8f);
+        float v_mag = fmaxf(v_mag_raw, 0.5f);
+        float dot_vc = (vx*cxp + vy*cyp + vz*czp) / (v_mag * r3d);
+        float targetp = cosf(theta_pos);
+        float steering = 0.01f * (dot_vc - targetp);  /* FIELD_STRENGTH = 0.01 */
+        float inv_r_force = 1.0f / r3d;
+        float ax = -steering * cxp * inv_r_force;
+        float ay = -steering * cyp * inv_r_force;
+        float az = -steering * czp * inv_r_force;
+
+        /* Gemini surgery step 2: tangent push DISABLED during diagnostic */
+        (void)c1; (void)s1; (void)c3; (void)s3;  /* suppress unused warnings */
+        (void)r_safe; (void)inv_r;
 
         /* Orbital-plane damping — damp velocity parallel to L̂ with flat γ.
          * Uses angular momentum direction (not radial) so in-plane motion
@@ -409,6 +413,7 @@ int main(int argc, char** argv) {
     float *rb_vx = NULL, *rb_vy = NULL, *rb_vz = NULL;
     float *rb_theta = NULL, *rb_scale = NULL;
     uint8_t *rb_flags = NULL;
+    int *rb_pump_state = NULL;
     if (use_gpu_physics) {
         size_t bf = oracle_count * sizeof(float);
         rb_px    = (float*)malloc(bf);
@@ -420,6 +425,7 @@ int main(int argc, char** argv) {
         rb_theta = (float*)malloc(bf);
         rb_scale = (float*)malloc(bf);
         rb_flags = (uint8_t*)malloc(oracle_count * sizeof(uint8_t));
+        rb_pump_state = (int*)malloc(oracle_count * sizeof(int));
     }
 
     /* Pack initial frame so there's something to render immediately */
@@ -489,6 +495,48 @@ int main(int argc, char** argv) {
                    rb_px[0], rb_py[0], rb_pz[0],
                    rb_vx[0], rb_vy[0], rb_vz[0],
                    (unsigned)rb_flags[0]);
+
+            /* Diagnostic: pump-state histogram + pos/vel/scale distributions */
+            readbackPumpStateSample(gpuPhys, vkCtx, rb_pump_state, oracle_count);
+            int state_hist[8] = {0};
+            for (int i = 0; i < oracle_count; i++) {
+                int s = rb_pump_state[i];
+                if (s >= 0 && s < 8) state_hist[s]++;
+            }
+
+            double r_min = 1e30, r_max = 0.0, r_sum = 0.0;
+            double v_min = 1e30, v_max = 0.0, v_sum = 0.0;
+            double scale_sum = 0.0, scale_max = 0.0;
+            int ejected = 0;
+            for (int i = 0; i < oracle_count; i++) {
+                double r = sqrt((double)rb_px[i]*rb_px[i]
+                              + (double)rb_py[i]*rb_py[i]
+                              + (double)rb_pz[i]*rb_pz[i]);
+                double v = sqrt((double)rb_vx[i]*rb_vx[i]
+                              + (double)rb_vy[i]*rb_vy[i]
+                              + (double)rb_vz[i]*rb_vz[i]);
+                if (r < r_min) r_min = r;
+                if (r > r_max) r_max = r;
+                r_sum += r;
+                if (v < v_min) v_min = v;
+                if (v > v_max) v_max = v;
+                v_sum += v;
+                scale_sum += rb_scale[i];
+                if (rb_scale[i] > scale_max) scale_max = rb_scale[i];
+                if (rb_flags[i] & 0x02) ejected++;  /* PFLAG_EJECTED */
+            }
+            double inv_n = 1.0 / (double)oracle_count;
+            printf("[diag ] frame=%d  states: IDLE=%d PRIMED=%d UC=%d UH=%d EXP=%d DWN=%d VO=%d REC=%d\n",
+                   frame,
+                   state_hist[0], state_hist[1], state_hist[2], state_hist[3],
+                   state_hist[4], state_hist[5], state_hist[6], state_hist[7]);
+            printf("[diag ] frame=%d  |p|: min=%.2f mean=%.2f max=%.2f  |v|: min=%.3f mean=%.3f max=%.3f\n",
+                   frame,
+                   r_min, r_sum*inv_n, r_max,
+                   v_min, v_sum*inv_n, v_max);
+            printf("[diag ] frame=%d  scale: mean=%.3f max=%.3f  ejected=%d/%d (%.1f%%)\n",
+                   frame, scale_sum*inv_n, scale_max,
+                   ejected, oracle_count, 100.0 * ejected * inv_n);
         }
 
         if (!use_gpu_physics) {
@@ -651,7 +699,7 @@ int main(int argc, char** argv) {
         cleanupPhysicsCompute(gpuPhys, vkCtx.device);
         free(rb_px); free(rb_py); free(rb_pz);
         free(rb_vx); free(rb_vy); free(rb_vz);
-        free(rb_theta); free(rb_scale); free(rb_flags);
+        free(rb_theta); free(rb_scale); free(rb_flags); free(rb_pump_state);
     }
     v21_oracle_summary(&oracle);
 

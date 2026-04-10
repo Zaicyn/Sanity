@@ -1000,6 +1000,54 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 }
 
 /* ========================================================================
+ * DIAGNOSTIC — pump_state readback
+ * ======================================================================== */
+
+void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
+                             int* out_states, int count) {
+    if (count <= 0) return;
+    if (count > ORACLE_SUBSET_SIZE) count = ORACLE_SUBSET_SIZE;
+
+    size_t sz = (size_t)count * sizeof(int);
+
+    VkCommandBuffer cmd;
+    VkCommandBufferAllocateInfo cba = {};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = ctx.commandPool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    vkAllocateCommandBuffers(ctx.device, &cba, &cmd);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    /* Copy pump_state (binding 6) into the first `sz` bytes of staging */
+    VkBufferCopy region = {0, 0, sz};
+    vkCmdCopyBuffer(cmd, phys.soa_buffers[6], phys.staging, 1, &region);
+
+    vkEndCommandBuffer(cmd);
+
+    VkFence fence;
+    VkFenceCreateInfo fi = {};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(ctx.device, &fi, nullptr, &fence);
+
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &si, fence);
+    vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(ctx.device, fence, nullptr);
+
+    memcpy(out_states, phys.stagingMapped, sz);
+
+    vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
+}
+
+/* ========================================================================
  * CLEANUP
  * ======================================================================== */
 

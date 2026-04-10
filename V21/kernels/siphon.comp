@@ -101,6 +101,7 @@ const uint PFLAG_EJECTED = 0x02u;
 
 void apply_viviani_field(
     float px, float py, float pz,
+    float vx, float vy, float vz,
     float r3d, float inv_r3d,
     inout float ax, inout float ay, inout float az)
 {
@@ -117,11 +118,40 @@ void apply_viviani_field(
     //   x(θ) = sin θ − ½ sin 3θ
     //   y(θ) = −cos θ + ½ cos 3θ
     //   z(θ) = cos θ · cos 3θ
+    // Scaled to the particle's own radius so the curve forms a shell
+    // template at each r rather than a point attractor near the origin.
     float cx = s1 - 0.5 * s3;
     float cy = -c1 + 0.5 * c3;
     float cz = c1 * c3;
+    float inv_c = inversesqrt(cx*cx + cy*cy + cz*cz + 1e-8);
+    cx = cx * inv_c * r3d;
+    cy = cy * inv_c * r3d;
+    cz = cz * inv_c * r3d;
 
-    // Viviani curve tangent (derivative)
+    // Velocity steering (Gemini's projection-tracking prescription):
+    // Rotate v toward the topological template instead of pulling position
+    // toward a point on the curve. Computes the normalized projection
+    //    dot = (v · c) / (|v|_clamped · |c|)
+    // and drives it toward the target cos(θ).
+    //
+    // v_mag is clamped at 0.5 (Gemini surgery step 1): prevents the
+    // steering from becoming explosively strong when particles slow
+    // down near the core, which would otherwise snap velocities to
+    // the Viviani normal and kill orbital motion.
+    float v_mag_raw = sqrt(vx*vx + vy*vy + vz*vz + 1e-8);
+    float v_mag = max(v_mag_raw, 0.5);
+    float dot_vc = (vx*cx + vy*cy + vz*cz) / (v_mag * r3d);
+    float target = cos(theta_pos);
+    float steering = pc.FIELD_STRENGTH * (dot_vc - target);
+    float inv_r_force = 1.0 / r3d;
+    ax -= steering * cx * inv_r_force;
+    ay -= steering * cy * inv_r_force;
+    az -= steering * cz * inv_r_force;
+
+    // Gemini surgery step 2: DISABLED — tangent push was conflicting
+    // with the velocity steering, bleeding orbital energy via torque.
+    // Let the steering be the only rotation driver for this diagnostic.
+    /*
     float fx = c1 - 1.5 * c3;
     float fy = s1 - 1.5 * s3;
     float fz = -s1 * c3 - 3.0 * c1 * s3;
@@ -142,20 +172,10 @@ void apply_viviani_field(
     float ty = fy - f_dot_r * ry;
     float tz = fz - f_dot_r * rz;
 
-    // Curve-attracting centripetal (asymmetric binding)
-    float dx = cx - px;
-    float dy = cy - py;
-    float dz = cz - pz;
-    float dist = sqrt(dx*dx + dy*dy + dz*dz);
-    float curve_weight = weight / (dist + 0.1);
-    ax += dx * curve_weight;
-    ay += dy * curve_weight;
-    az += dz * curve_weight;
-
-    // Tangential (rotation-driving, asymmetric)
     ax += tx * weight * pc.TANGENT_SCALE;
     ay += ty * weight * pc.TANGENT_SCALE;
     az += tz * weight * pc.TANGENT_SCALE;
+    */
 }
 
 // ============================================================================
@@ -409,6 +429,12 @@ void main() {
     float work     = pump_work[i];
     float history  = pump_history[i];
 
+    // Gemini surgery step 3: BYPASS the pump state machine. Force IDLE so
+    // the heartbeat→axis coherence filter can't snap velocities to radial,
+    // and no state-driven transitions can affect dynamics. Only the Viviani
+    // field steering + orbital damping + anisotropic damping drive motion.
+    state = PUMP_IDLE;
+
     // ----- Distances and angular momentum -----
     float r3d_sq = px*px + py*py + pz*pz;
     float inv_r3d = inversesqrt(r3d_sq + 1e-8);
@@ -441,7 +467,7 @@ void main() {
 
     // ----- STEP 3: Viviani field force -----
     float ax = 0.0, ay = 0.0, az = 0.0;
-    apply_viviani_field(px, py, pz, r3d, inv_r3d, ax, ay, az);
+    apply_viviani_field(px, py, pz, vx, vy, vz, r3d, inv_r3d, ax, ay, az);
 
     // ----- STEP 4: Orbital-plane damping (v·L̂) -----
     float v_sq = vx*vx + vy*vy + vz*vz;

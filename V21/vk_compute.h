@@ -161,6 +161,12 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_project_ms,
                     double* out_tonemap_ms);
 
+/* Diagnostic: read back pump_state prefix (binding 6, int array).
+ * Used to inspect how particles are distributed across the 8 pump
+ * states. out_states must have at least `count` int slots. */
+void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
+                             int* out_states, int count);
+
 /* Cleanup */
 void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device);
 
