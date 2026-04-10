@@ -97,6 +97,7 @@ if(glfw3_FOUND)
 
     add_executable(blackhole_v21_visual
         ${CMAKE_CURRENT_SOURCE_DIR}/blackhole_v21_visual.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vk_compute.cpp
         ${VK_SOURCES}
     )
     target_include_directories(blackhole_v21_visual PRIVATE

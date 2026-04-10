@@ -60,6 +60,7 @@ extern "C" {
 #include "core/v21_vertex_pack.h"
 #include "core/v21_oracle.h"
 }
+#include "vk_compute.h"
 
 /* ========================================================================
  * SIMULATION PARAMETERS
@@ -239,14 +240,17 @@ static void createVertexBuffer(VkDevice device, VkPhysicalDevice physDev,
 int main(int argc, char** argv) {
     int num_particles = DEFAULT_PARTICLES;
     unsigned int seed = 42;
+    bool use_gpu_physics = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
             num_particles = atoi(argv[++i]);
         else if (strcmp(argv[i], "--rng-seed") == 0 && i+1 < argc)
             seed = (unsigned int)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gpu-physics") == 0)
+            use_gpu_physics = true;
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S]\n");
+            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] [--gpu-physics]\n");
             return 0;
         }
     }
@@ -306,7 +310,34 @@ int main(int argc, char** argv) {
     vkCtx.particleBufferMemory = vertexBuf.memory;
 
     vkCtx.currentFrame = 0;
-    printf("[v21-visual] %d particles, Vulkan ready\n", num_particles);
+
+    /* GPU physics compute (optional — use --gpu-physics flag) */
+    PhysicsCompute gpuPhys = {};
+    if (use_gpu_physics) {
+        initPhysicsCompute(gpuPhys, vkCtx,
+            particles.pos_x, particles.pos_y, particles.pos_z,
+            particles.vel_x, particles.vel_y, particles.vel_z,
+            particles.pump_scale, particles.pump_residual,
+            particles.pump_history, particles.pump_state,
+            particles.theta, particles.omega_nat,
+            particles.flags, particles.topo_state,
+            particles.N);
+    }
+
+    printf("[v21-visual] %d particles, Vulkan ready, physics=%s\n",
+           num_particles, use_gpu_physics ? "GPU" : "CPU");
+
+    /* Readback arrays for oracle (when using GPU physics) */
+    float *rb_px = NULL, *rb_py = NULL, *rb_pz = NULL;
+    float *rb_vx = NULL, *rb_vy = NULL, *rb_vz = NULL;
+    if (use_gpu_physics) {
+        rb_px = (float*)malloc(num_particles * sizeof(float));
+        rb_py = (float*)malloc(num_particles * sizeof(float));
+        rb_pz = (float*)malloc(num_particles * sizeof(float));
+        rb_vx = (float*)malloc(num_particles * sizeof(float));
+        rb_vy = (float*)malloc(num_particles * sizeof(float));
+        rb_vz = (float*)malloc(num_particles * sizeof(float));
+    }
 
     /* Main loop */
     float dt = DEFAULT_DT;
@@ -317,30 +348,61 @@ int main(int argc, char** argv) {
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        /* CPU physics */
-        physics_step(particles, dt * 2.0f);
+        if (!use_gpu_physics) {
+            /* CPU physics path */
+            physics_step(particles, dt * 2.0f);
+        }
+        /* GPU physics is dispatched inside the command buffer below */
         sim_time += dt;
 
-        /* Oracle: validate physics */
-        v21_oracle_check(&oracle,
-            particles.pos_x, particles.pos_y, particles.pos_z,
-            particles.vel_x, particles.vel_y, particles.vel_z,
-            particles.theta, particles.pump_scale,
-            particles.flags, particles.topo_state,
-            particles.N, frame);
+        /* Oracle validation (CPU physics: every frame, GPU: readback every 100) */
+        if (!use_gpu_physics) {
+            v21_oracle_check(&oracle,
+                particles.pos_x, particles.pos_y, particles.pos_z,
+                particles.vel_x, particles.vel_y, particles.vel_z,
+                particles.theta, particles.pump_scale,
+                particles.flags, particles.topo_state,
+                particles.N, frame);
+        } else if (frame % 100 == 0 && frame > 0) {
+            /* GPU readback for oracle */
+            readbackForOracle(gpuPhys, vkCtx, rb_px, rb_py, rb_pz,
+                              rb_vx, rb_vy, rb_vz, particles.N);
+            v21_oracle_check(&oracle,
+                rb_px, rb_py, rb_pz, rb_vx, rb_vy, rb_vz,
+                particles.theta, particles.pump_scale,
+                particles.flags, particles.topo_state,
+                particles.N, frame);
+        }
 
-        /* Pack SoA → AoS (one loop, the only bridge) */
-        v21_pack_vertices(
-            vertex_data,
-            particles.pos_x, particles.pos_y, particles.pos_z,
-            particles.vel_x, particles.vel_y, particles.vel_z,
-            particles.pump_scale, particles.pump_residual,
-            particles.flags, particles.topo_state,
-            particles.N);
-
-        /* Upload to GPU (CPU-mapped, no staging needed) */
-        memcpy(vertexBuf.mapped, vertex_data,
-               particles.N * sizeof(v21_packed_vertex_t));
+        if (!use_gpu_physics) {
+            /* CPU path: pack SoA → AoS and upload */
+            v21_pack_vertices(
+                vertex_data,
+                particles.pos_x, particles.pos_y, particles.pos_z,
+                particles.vel_x, particles.vel_y, particles.vel_z,
+                particles.pump_scale, particles.pump_residual,
+                particles.flags, particles.topo_state,
+                particles.N);
+            memcpy(vertexBuf.mapped, vertex_data,
+                   particles.N * sizeof(v21_packed_vertex_t));
+        }
+        if (use_gpu_physics) {
+            /* GPU path: read back particle data for vertex packing
+             * (temporary — should be a GPU repack shader eventually) */
+            readbackForOracle(gpuPhys, vkCtx,
+                particles.pos_x, particles.pos_y, particles.pos_z,
+                particles.vel_x, particles.vel_y, particles.vel_z,
+                particles.N);
+            v21_pack_vertices(
+                vertex_data,
+                particles.pos_x, particles.pos_y, particles.pos_z,
+                particles.vel_x, particles.vel_y, particles.vel_z,
+                particles.pump_scale, particles.pump_residual,
+                particles.flags, particles.topo_state,
+                particles.N);
+            memcpy(vertexBuf.mapped, vertex_data,
+                   particles.N * sizeof(v21_packed_vertex_t));
+        }
 
         /* Update camera */
         vkCtx.cameraYaw += 0.002f;
@@ -363,6 +425,11 @@ int main(int argc, char** argv) {
             VkCommandBufferBeginInfo beginInfo = {};
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             vkBeginCommandBuffer(cmd, &beginInfo);
+
+            /* GPU physics dispatch (before render pass) */
+            if (use_gpu_physics) {
+                dispatchPhysicsCompute(gpuPhys, cmd, frame, sim_time, dt * 2.0f);
+            }
 
             /* Render pass */
             VkRenderPassBeginInfo rpInfo = {};
@@ -442,6 +509,12 @@ int main(int argc, char** argv) {
 
     /* Cleanup */
     vkDeviceWaitIdle(vkCtx.device);
+    if (use_gpu_physics) {
+        cleanupPhysicsCompute(gpuPhys, vkCtx.device);
+        free(rb_px); free(rb_py); free(rb_pz);
+        free(rb_vx); free(rb_vy); free(rb_vz);
+    }
+    v21_oracle_summary(&oracle);
     vkDestroyBuffer(vkCtx.device, vertexBuf.buffer, nullptr);
     vkFreeMemory(vkCtx.device, vertexBuf.memory, nullptr);
     vk::cleanup(vkCtx);
