@@ -41,6 +41,7 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/spawn.comp
     ${KERNEL_DIR}/region.comp
     ${KERNEL_DIR}/accumulator.comp
+    ${KERNEL_DIR}/project.comp
 )
 
 set(SPV_OUTPUTS)

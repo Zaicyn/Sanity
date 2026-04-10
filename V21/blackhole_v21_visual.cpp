@@ -241,6 +241,7 @@ int main(int argc, char** argv) {
     int num_particles = DEFAULT_PARTICLES;
     unsigned int seed = 42;
     bool use_gpu_physics = false;
+    bool project_only = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -249,8 +250,10 @@ int main(int argc, char** argv) {
             seed = (unsigned int)atoi(argv[++i]);
         else if (strcmp(argv[i], "--gpu-physics") == 0)
             use_gpu_physics = true;
+        else if (strcmp(argv[i], "--project-only") == 0)
+            { use_gpu_physics = true; project_only = true; }
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] [--gpu-physics]\n");
+            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] [--gpu-physics] [--project-only]\n");
             return 0;
         }
     }
@@ -322,21 +325,31 @@ int main(int argc, char** argv) {
             particles.theta, particles.omega_nat,
             particles.flags, particles.topo_state,
             particles.N);
+        initDensityRender(gpuPhys, vkCtx);
     }
 
     printf("[v21-visual] %d particles, Vulkan ready, physics=%s\n",
            num_particles, use_gpu_physics ? "GPU" : "CPU");
 
-    /* Readback arrays for oracle (when using GPU physics) */
+    /* Readback arrays for oracle (when using GPU physics).
+     * Capped at ORACLE_SUBSET_SIZE regardless of total particle count. */
+    int oracle_count = num_particles < ORACLE_SUBSET_SIZE
+                     ? num_particles : ORACLE_SUBSET_SIZE;
     float *rb_px = NULL, *rb_py = NULL, *rb_pz = NULL;
     float *rb_vx = NULL, *rb_vy = NULL, *rb_vz = NULL;
+    float *rb_theta = NULL, *rb_scale = NULL;
+    uint8_t *rb_flags = NULL;
     if (use_gpu_physics) {
-        rb_px = (float*)malloc(num_particles * sizeof(float));
-        rb_py = (float*)malloc(num_particles * sizeof(float));
-        rb_pz = (float*)malloc(num_particles * sizeof(float));
-        rb_vx = (float*)malloc(num_particles * sizeof(float));
-        rb_vy = (float*)malloc(num_particles * sizeof(float));
-        rb_vz = (float*)malloc(num_particles * sizeof(float));
+        size_t bf = oracle_count * sizeof(float);
+        rb_px    = (float*)malloc(bf);
+        rb_py    = (float*)malloc(bf);
+        rb_pz    = (float*)malloc(bf);
+        rb_vx    = (float*)malloc(bf);
+        rb_vy    = (float*)malloc(bf);
+        rb_vz    = (float*)malloc(bf);
+        rb_theta = (float*)malloc(bf);
+        rb_scale = (float*)malloc(bf);
+        rb_flags = (uint8_t*)malloc(oracle_count * sizeof(uint8_t));
     }
 
     /* Pack initial frame so there's something to render immediately */
@@ -355,6 +368,10 @@ int main(int argc, char** argv) {
     int frame = 0;
     auto t0 = std::chrono::steady_clock::now();
 
+    /* GPU timestamp accumulators for profiling */
+    double gpu_siphon_sum = 0.0, gpu_project_sum = 0.0, gpu_tonemap_sum = 0.0;
+    int gpu_samples = 0;
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -365,7 +382,9 @@ int main(int argc, char** argv) {
         /* GPU physics is dispatched inside the command buffer below */
         sim_time += dt;
 
-        /* Oracle validation (CPU physics: every frame, GPU: readback every 100) */
+        /* Oracle validation.
+         * CPU physics: every frame on the full particle set.
+         * GPU physics: every 500 frames, ~100K-particle subset readback via fence. */
         if (!use_gpu_physics) {
             v21_oracle_check(&oracle,
                 particles.pos_x, particles.pos_y, particles.pos_z,
@@ -373,9 +392,34 @@ int main(int argc, char** argv) {
                 particles.theta, particles.pump_scale,
                 particles.flags, particles.topo_state,
                 particles.N, frame);
+        } else if (frame > 0 && frame % 500 == 0) {
+            auto rb_start = std::chrono::steady_clock::now();
+            readbackForOracle(gpuPhys, vkCtx,
+                rb_px, rb_py, rb_pz,
+                rb_vx, rb_vy, rb_vz,
+                rb_theta, rb_scale, rb_flags,
+                oracle_count);
+            auto rb_end = std::chrono::steady_clock::now();
+            double rb_ms = std::chrono::duration<double, std::milli>(rb_end - rb_start).count();
+
+            int prev_passes = oracle.total_passes;
+            int prev_fails = oracle.total_fails;
+            /* topo_state is CPU-side only (GPU siphon doesn't mutate it),
+             * so we pass the original array for the same prefix. */
+            v21_oracle_check(&oracle,
+                rb_px, rb_py, rb_pz,
+                rb_vx, rb_vy, rb_vz,
+                rb_theta, rb_scale,
+                rb_flags, particles.topo_state,
+                oracle_count, frame);
+            const char* result = (oracle.total_fails > prev_fails) ? "FAIL" :
+                                 (oracle.total_passes > prev_passes) ? "pass" : "skip";
+            printf("[oracle] frame=%d readback=%.2fms count=%d -> %s  p0=(%.3f,%.3f,%.3f) v0=(%.3f,%.3f,%.3f) flags0=0x%02x\n",
+                   frame, rb_ms, oracle_count, result,
+                   rb_px[0], rb_py[0], rb_pz[0],
+                   rb_vx[0], rb_vy[0], rb_vz[0],
+                   (unsigned)rb_flags[0]);
         }
-        /* GPU oracle readback disabled in render loop — use headless mode
-         * for validation. The vkQueueWaitIdle in readback causes stalls. */
 
         if (!use_gpu_physics) {
             /* CPU path: pack SoA → AoS and upload */
@@ -417,49 +461,53 @@ int main(int argc, char** argv) {
             beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
             vkBeginCommandBuffer(cmd, &beginInfo);
 
-            /* GPU physics dispatch (before render pass) */
+            /* Update camera uniforms (need viewProj before recording) */
+            vk::updateUniformBuffer(vkCtx, vkCtx.currentFrame);
+
             if (use_gpu_physics) {
-                dispatchPhysicsCompute(gpuPhys, cmd, frame, sim_time, dt * 2.0f);
+                /* GPU path: physics dispatch → compute projection → tone-map */
+                if (!project_only)
+                    dispatchPhysicsCompute(gpuPhys, cmd, frame, sim_time, dt * 2.0f);
+
+                /* Get viewProj from the mapped UBO */
+                GlobalUBO* ubo = (GlobalUBO*)vkCtx.uniformBuffersMapped[vkCtx.currentFrame];
+                recordDensityRender(gpuPhys, cmd, vkCtx, imageIndex, ubo->viewProj);
+            } else {
+                /* CPU path: rasterizer */
+                VkRenderPassBeginInfo rpInfo = {};
+                rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                rpInfo.renderPass = vkCtx.renderPass;
+                rpInfo.framebuffer = vkCtx.framebuffers[imageIndex];
+                rpInfo.renderArea.offset = {0, 0};
+                rpInfo.renderArea.extent = vkCtx.swapchainExtent;
+                VkClearValue clearValues[2] = {};
+                clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+                clearValues[1].depthStencil = {1.0f, 0};
+                rpInfo.clearValueCount = 2;
+                rpInfo.pClearValues = clearValues;
+
+                vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+                VkViewport viewport = {};
+                viewport.width = (float)vkCtx.swapchainExtent.width;
+                viewport.height = (float)vkCtx.swapchainExtent.height;
+                viewport.maxDepth = 1.0f;
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
+                VkRect2D scissor = {{0,0}, vkCtx.swapchainExtent};
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkCtx.graphicsPipeline);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    vkCtx.pipelineLayout, 0, 1, &vkCtx.descriptorSets[vkCtx.currentFrame], 0, nullptr);
+                VkBuffer vbufs[] = {vertexBuf.buffer};
+                VkDeviceSize offsets[] = {0};
+                vkCmdBindVertexBuffers(cmd, 0, 1, vbufs, offsets);
+                vkCmdDraw(cmd, 1, particles.N, 0, 0);
+
+                vkCmdEndRenderPass(cmd);
             }
 
-            /* Render pass */
-            VkRenderPassBeginInfo rpInfo = {};
-            rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            rpInfo.renderPass = vkCtx.renderPass;
-            rpInfo.framebuffer = vkCtx.framebuffers[imageIndex];
-            rpInfo.renderArea.offset = {0, 0};
-            rpInfo.renderArea.extent = vkCtx.swapchainExtent;
-            VkClearValue clearValues[2] = {};
-            clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-            clearValues[1].depthStencil = {1.0f, 0};
-            rpInfo.clearValueCount = 2;
-            rpInfo.pClearValues = clearValues;
-
-            vkCmdBeginRenderPass(cmd, &rpInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-            /* Viewport + scissor */
-            VkViewport viewport = {};
-            viewport.width = (float)vkCtx.swapchainExtent.width;
-            viewport.height = (float)vkCtx.swapchainExtent.height;
-            viewport.maxDepth = 1.0f;
-            vkCmdSetViewport(cmd, 0, 1, &viewport);
-            VkRect2D scissor = {{0,0}, vkCtx.swapchainExtent};
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-            /* Bind particle pipeline + vertex buffer + draw */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vkCtx.graphicsPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                vkCtx.pipelineLayout, 0, 1, &vkCtx.descriptorSets[vkCtx.currentFrame], 0, nullptr);
-            VkBuffer vbufs[] = {vertexBuf.buffer};
-            VkDeviceSize offsets[] = {0};
-            vkCmdBindVertexBuffers(cmd, 0, 1, vbufs, offsets);
-            vkCmdDraw(cmd, 6, particles.N, 0, 0);  /* 6 verts (quad) × N instances */
-
-            vkCmdEndRenderPass(cmd);
             vkEndCommandBuffer(cmd);
-
-            /* Update camera uniforms */
-            vk::updateUniformBuffer(vkCtx, vkCtx.currentFrame);
 
             /* Submit */
             VkSubmitInfo submitInfo = {};
@@ -490,6 +538,42 @@ int main(int argc, char** argv) {
         }
 
         frame++;
+
+        /* Sample GPU timestamps (non-blocking; silently skipped if not ready) */
+        if (use_gpu_physics) {
+            double s_ms = 0, p_ms = 0, t_ms = 0;
+            if (readTimestamps(gpuPhys, vkCtx.device, &s_ms, &p_ms, &t_ms)) {
+                gpu_siphon_sum  += s_ms;
+                gpu_project_sum += p_ms;
+                gpu_tonemap_sum += t_ms;
+                gpu_samples++;
+            }
+        }
+
+        /* FPS counter — print every 100 frames */
+        if (frame % 100 == 0) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            printf("[perf] frame=%d  %.1f fps  (%.1f ms/frame)\n",
+                   frame, frame / elapsed, elapsed / frame * 1000.0);
+        }
+
+        /* GPU breakdown — print every 500 frames */
+        if (use_gpu_physics && frame % 500 == 0 && gpu_samples > 0) {
+            double inv = 1.0 / (double)gpu_samples;
+            double s = gpu_siphon_sum * inv;
+            double p = gpu_project_sum * inv;
+            double t = gpu_tonemap_sum * inv;
+            double total = s + p + t;
+            printf("[gpu] siphon=%.3f ms (%4.1f%%)  project=%.3f ms (%4.1f%%)  "
+                   "tonemap=%.3f ms (%4.1f%%)  total=%.3f ms  (%d samples)\n",
+                   s, 100.0 * s / total,
+                   p, 100.0 * p / total,
+                   t, 100.0 * t / total,
+                   total, gpu_samples);
+            gpu_siphon_sum = gpu_project_sum = gpu_tonemap_sum = 0.0;
+            gpu_samples = 0;
+        }
     }
 
     /* Cleanup */
@@ -498,6 +582,7 @@ int main(int argc, char** argv) {
         cleanupPhysicsCompute(gpuPhys, vkCtx.device);
         free(rb_px); free(rb_py); free(rb_pz);
         free(rb_vx); free(rb_vy); free(rb_vz);
+        free(rb_theta); free(rb_scale); free(rb_flags);
     }
     v21_oracle_summary(&oracle);
 
