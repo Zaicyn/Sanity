@@ -3,6 +3,7 @@ project(Sanity_V21 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_BUILD_TYPE Release)  # Disables validation layers via NDEBUG
 
 # ==============================================================================
 # OPTIONS — vendors are extensions, not the core
