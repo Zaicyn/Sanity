@@ -18,9 +18,14 @@
  * ======================================================================== */
 
 static std::vector<char> readShaderFile(const std::string& filename) {
+    /* V21 kernels first — "shaders/compute/" is a legacy V20 path that
+     * may contain stale artifacts and must NOT take precedence. A stale
+     * build/shaders/compute/siphon.spv previously caused shader edits to
+     * be silently ignored at runtime; rooted out during the packing
+     * experiment, see memory: feedback_shader_search_order.md */
     std::vector<std::string> paths = {
-        "shaders/compute/", "kernels/", "../kernels/",
-        "../../V21/kernels/", "shaders/",
+        "kernels/", "../kernels/", "../../V21/kernels/",
+        "shaders/compute/", "shaders/",
         "../../vulkan/shaders/",   /* V20 tone-map SPVs */
         "../vulkan/shaders/"
     };
