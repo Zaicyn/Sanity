@@ -145,8 +145,39 @@ enum InitSortMode {
     INIT_SORT_VIVIANI = 2   /* sorted by Viviani curve parameter (atan2 in xz) */
 };
 
+/* Optional embedded rigid-body lattice for the constraint-solver experiment.
+ * When enabled, the last N_rigid SoA slots hold a structured lattice of
+ * particles bound by distance constraints, dropped into the galaxy to test
+ * whether GPU constraint work disturbs the Viviani sort's cache coherence. */
+enum RigidBodyMode {
+    RIGID_BODY_OFF      = 0,  /* no lattice (default) */
+    RIGID_BODY_CUBE1000 = 1   /* 10×10×10 cube, 2700 distance constraints */
+};
+
+/* Lattice data computed on the host side and uploaded to the GPU constraint
+ * solver. Empty when rigid_body_mode == RIGID_BODY_OFF. */
+struct ConstraintLattice {
+    std::vector<uint32_t> pairs;              /* flattened uvec2 (size = 2 * M) */
+    std::vector<float>    rest;               /* size = M */
+    std::vector<float>    inv_m;              /* size = N_rigid */
+    uint32_t              bucket_offsets[6];  /* start offset of each bucket in pairs[] */
+    uint32_t              bucket_counts[6];   /* count per (axis × parity) bucket */
+    uint32_t              base_index;         /* first lattice particle index */
+    uint32_t              rigid_count;        /* = N_rigid */
+};
+
+/* N          = total allocation size (galaxy + optional trailing lattice slots)
+ * n_generate = number of galaxy particles to generate into slots [0, n_generate).
+ *              When equal to N (the default), behavior matches the original
+ *              single-region init. When smaller, the trailing slots [n_generate, N)
+ *              are left calloc-zeroed for a caller (e.g. init_rigid_body_cube) to
+ *              fill — crucially, the Viviani sort applies only to the first
+ *              n_generate particles, so those slots are bit-identical to a run
+ *              with N == n_generate. */
 static void init_particles(ParticleState& ps, int N, unsigned int seed,
-                           InitSortMode sort_mode = INIT_SORT_NONE) {
+                           InitSortMode sort_mode = INIT_SORT_NONE,
+                           int n_generate = -1) {
+    if (n_generate < 0 || n_generate > N) n_generate = N;
     ps.N = N;
     ps.capacity = N;
     ps.pos_x = (float*)calloc(N, sizeof(float));
@@ -171,11 +202,11 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed,
         float theta, omega_nat;
         uint8_t topo_state;
     };
-    std::vector<Particle> tmp(N);
-    std::vector<uint64_t> sort_key(N);
+    std::vector<Particle> tmp(n_generate);
+    std::vector<uint64_t> sort_key(n_generate);
 
     srand(seed);
-    for (int i = 0; i < N; i++) {
+    for (int i = 0; i < n_generate; i++) {
         float x = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * DISK_OUTER_R;
         float y = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * DISK_OUTER_R * 0.3f;
         float z = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * DISK_OUTER_R;
@@ -229,15 +260,16 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed,
     }
 
     /* Build permutation indices and sort by key. */
-    std::vector<uint32_t> perm(N);
-    for (int i = 0; i < N; i++) perm[i] = i;
+    std::vector<uint32_t> perm(n_generate);
+    for (int i = 0; i < n_generate; i++) perm[i] = i;
     if (sort_mode != INIT_SORT_NONE) {
         std::stable_sort(perm.begin(), perm.end(),
             [&sort_key](uint32_t a, uint32_t b) { return sort_key[a] < sort_key[b]; });
     }
 
-    /* Scatter sorted AoS back into SoA arrays. */
-    for (int i = 0; i < N; i++) {
+    /* Scatter sorted AoS back into SoA arrays. Trailing slots [n_generate, N)
+     * remain calloc-zeroed for init_rigid_body_cube or similar to populate. */
+    for (int i = 0; i < n_generate; i++) {
         const Particle& p = tmp[perm[i]];
         ps.pos_x[i] = p.px; ps.pos_y[i] = p.py; ps.pos_z[i] = p.pz;
         ps.vel_x[i] = p.vx; ps.vel_y[i] = p.vy; ps.vel_z[i] = p.vz;
@@ -251,7 +283,125 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed,
     const char* sort_name =
         (sort_mode == INIT_SORT_CELL)    ? "cell"    :
         (sort_mode == INIT_SORT_VIVIANI) ? "viviani" : "none";
-    printf("[init] %d particles generated, sort=%s\n", N, sort_name);
+    if (n_generate == N) {
+        printf("[init] %d particles generated, sort=%s\n", N, sort_name);
+    } else {
+        printf("[init] %d galaxy particles generated (+%d reserved), sort=%s\n",
+               n_generate, N - n_generate, sort_name);
+    }
+}
+
+/* ========================================================================
+ * RIGID-BODY LATTICE (for constraint solver experiment)
+ * ======================================================================== */
+
+/* Fill SoA slots [n_galaxy, n_galaxy + 1000) with a 10×10×10 cube lattice
+ * centered at (50, 0, 0) — inside the hot gather region of the galaxy disk.
+ * Returns the constraint pair list bucketed into 6 vertex-disjoint groups
+ * by (axis, parity-of-starting-endpoint) so the GPU solver can do true
+ * Gauss-Seidel without atomics or graph coloring at runtime. */
+static ConstraintLattice init_rigid_body_cube(ParticleState& ps, int n_galaxy) {
+    const int   LX = 10, LY = 10, LZ = 10;
+    const int   N_LATTICE = LX * LY * LZ;   /* 1000 */
+    const float SPACING = 0.5f;
+    const float cx = 50.0f, cy = 0.0f, cz = 0.0f;
+
+    if (n_galaxy + N_LATTICE > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + lattice=%d\n",
+                ps.N, n_galaxy, N_LATTICE);
+        return ConstraintLattice{};
+    }
+
+    const uint32_t base = (uint32_t)n_galaxy;
+    auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+        return base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+    };
+
+    /* Lattice positions + circular orbit velocity + active flag.
+     * The Viviani field applies rotational transport only (|v| invariant by
+     * construction), so particles with zero velocity sit still — which means
+     * a zero-v lattice would never feel the galactic environment and the
+     * constraint solver would have nothing to push against. Give every
+     * lattice particle the same rigid-body circular-orbit velocity that a
+     * galaxy particle at the lattice CENTER would have. This makes the whole
+     * cube orbit as a rigid body, letting the Viviani field's differential
+     * rotation try to shear it apart while constraints pull it back. */
+    const float r_center = sqrtf(cx * cx + cy * cy + cz * cz);
+    const float v_orbit  = (r_center > 0.1f)
+                         ? sqrtf(BH_MASS / fmaxf(r_center, ISCO_R))
+                         : 0.0f;
+    /* Tangential direction in the xz plane: perpendicular to (cx,cz). */
+    const float r_xz   = sqrtf(cx * cx + cz * cz);
+    const float vx0    = (r_xz > 0.1f) ? -v_orbit * (cz / r_xz) : 0.0f;
+    const float vz0    = (r_xz > 0.1f) ?  v_orbit * (cx / r_xz) : 0.0f;
+
+    for (int iz = 0; iz < LZ; iz++)
+    for (int iy = 0; iy < LY; iy++)
+    for (int ix = 0; ix < LX; ix++) {
+        uint32_t p = idx_of(ix, iy, iz);
+        ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+        ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+        ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+        ps.vel_x[p] = vx0;
+        ps.vel_y[p] = 0.0f;
+        ps.vel_z[p] = vz0;
+        ps.theta[p] = 0.0f;
+        ps.omega_nat[p] = 0.1f;
+        ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
+        ps.pump_scale[p] = 1.0f;
+        ps.topo_state[p] = 0x01;        /* any non-zero topo state */
+    }
+
+    /* Build 6 vertex-disjoint buckets:
+     *   0 = X_even, 1 = X_odd, 2 = Y_even, 3 = Y_odd, 4 = Z_even, 5 = Z_odd
+     * Within one bucket no two edges share an endpoint, so the solver can
+     * write pos[i] and pos[j] without races. */
+    std::vector<std::pair<uint32_t, uint32_t>> b[6];
+    for (int iz = 0; iz < LZ; iz++)
+    for (int iy = 0; iy < LY; iy++)
+    for (int ix = 0; ix < LX; ix++) {
+        uint32_t a = idx_of(ix, iy, iz);
+        if (ix + 1 < LX) {
+            int bucket = 0 + (ix & 1);
+            b[bucket].push_back({a, idx_of(ix + 1, iy, iz)});
+        }
+        if (iy + 1 < LY) {
+            int bucket = 2 + (iy & 1);
+            b[bucket].push_back({a, idx_of(ix, iy + 1, iz)});
+        }
+        if (iz + 1 < LZ) {
+            int bucket = 4 + (iz & 1);
+            b[bucket].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+    }
+
+    ConstraintLattice L;
+    L.base_index  = base;
+    L.rigid_count = (uint32_t)N_LATTICE;
+    L.inv_m.assign(N_LATTICE, 1.0f);
+
+    uint32_t running = 0;
+    for (int k = 0; k < 6; k++) {
+        L.bucket_offsets[k] = running;
+        L.bucket_counts[k]  = (uint32_t)b[k].size();
+        running += L.bucket_counts[k];
+    }
+    L.pairs.reserve(2 * running);
+    L.rest.reserve(running);
+    for (int k = 0; k < 6; k++) {
+        for (auto& pr : b[k]) {
+            L.pairs.push_back(pr.first);
+            L.pairs.push_back(pr.second);
+            L.rest.push_back(SPACING);      /* regular grid → uniform rest length */
+        }
+    }
+
+    printf("[rigid] cube1000: %d particles @ (%.1f, %.1f, %.1f), %u constraints, "
+           "buckets=[%u %u %u %u %u %u], base=%u\n",
+           N_LATTICE, cx, cy, cz, running,
+           L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
+           L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5], base);
+    return L;
 }
 
 /* ========================================================================
@@ -390,6 +540,7 @@ int main(int argc, char** argv) {
     bool project_only = false;
     ScatterMode scatter_mode = SCATTER_MODE_BASELINE;
     InitSortMode init_sort = INIT_SORT_NONE;
+    RigidBodyMode rigid_body_mode = RIGID_BODY_OFF;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -422,10 +573,22 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rigid-body") == 0 && i+1 < argc) {
+            const char* m = argv[++i];
+            if      (strcmp(m, "off")      == 0) rigid_body_mode = RIGID_BODY_OFF;
+            else if (strcmp(m, "cube1000") == 0) rigid_body_mode = RIGID_BODY_CUBE1000;
+            else {
+                fprintf(stderr, "unknown --rigid-body '%s' "
+                                "(expected off or cube1000)\n", m);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
                    "[--gpu-physics] [--project-only] "
-                   "[--scatter-mode baseline|uniform|squaragon]\n");
+                   "[--scatter-mode baseline|uniform|squaragon] "
+                   "[--init-sort none|cell|viviani] "
+                   "[--rigid-body off|cube1000]\n");
             return 0;
         }
     }
@@ -436,9 +599,24 @@ int main(int argc, char** argv) {
     printf("  The framebuffer IS the harmonic accumulator.\n");
     printf("================================================================\n\n");
 
-    /* Init particles */
+    /* Split N into galaxy + optional rigid-body lattice. `-n` is always the
+     * galaxy count; the lattice (if enabled) is appended to the end of all
+     * SoA arrays so its indices are known and its presence does not perturb
+     * the Viviani sort ordering on the first n_galaxy particles. */
+    const int n_galaxy = num_particles;
+    const int n_rigid  = (rigid_body_mode == RIGID_BODY_CUBE1000) ? 1000 : 0;
+    num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
+
+    /* Init particles — only [0, n_galaxy) gets generated and sorted;
+     * [n_galaxy, n_galaxy + n_rigid) remains zeroed for init_rigid_body_cube. */
     ParticleState particles;
-    init_particles(particles, num_particles, seed, init_sort);
+    init_particles(particles, num_particles, seed, init_sort, n_galaxy);
+
+    /* Fill the trailing lattice slots (if enabled) before the GPU upload. */
+    ConstraintLattice lattice = {};
+    if (rigid_body_mode == RIGID_BODY_CUBE1000) {
+        lattice = init_rigid_body_cube(particles, n_galaxy);
+    }
 
     /* Init validation oracle */
     v21_oracle_t oracle;
@@ -504,6 +682,22 @@ int main(int argc, char** argv) {
             particles.theta, particles.omega_nat,
             particles.flags, particles.topo_state,
             particles.N, scatter_mode);
+
+        /* Rigid-body constraint solver (Pass 4) — only when --rigid-body != off.
+         * Uses the lattice built by init_rigid_body_cube above. Hardcoded to
+         * 4 PBD iterations per frame per the constraint_experiment plan. */
+        if (rigid_body_mode == RIGID_BODY_CUBE1000) {
+            initConstraintCompute(gpuPhys, vkCtx,
+                                  lattice.pairs.data(),
+                                  lattice.rest.data(),
+                                  lattice.inv_m.data(),
+                                  lattice.bucket_offsets,
+                                  lattice.bucket_counts,
+                                  lattice.base_index,
+                                  lattice.rigid_count,
+                                  /*iterations=*/4);
+        }
+
         initDensityRender(gpuPhys, vkCtx);
     }
 
@@ -551,6 +745,7 @@ int main(int argc, char** argv) {
 
     /* GPU timestamp accumulators for profiling */
     double gpu_scatter_sum = 0.0, gpu_stencil_sum = 0.0, gpu_gather_sum = 0.0;
+    double gpu_constraint_sum = 0.0;
     double gpu_siphon_sum = 0.0;
     double gpu_project_sum = 0.0, gpu_tonemap_sum = 0.0;
     int gpu_samples = 0;
@@ -765,17 +960,18 @@ int main(int argc, char** argv) {
 
         /* Sample GPU timestamps (non-blocking; silently skipped if not ready) */
         if (use_gpu_physics) {
-            double sc_ms = 0, st_ms = 0, g_ms = 0;
+            double sc_ms = 0, st_ms = 0, g_ms = 0, c_ms = 0;
             double s_ms = 0, p_ms = 0, t_ms = 0;
             if (readTimestamps(gpuPhys, vkCtx.device,
-                               &sc_ms, &st_ms, &g_ms,
+                               &sc_ms, &st_ms, &g_ms, &c_ms,
                                &s_ms, &p_ms, &t_ms)) {
-                gpu_scatter_sum += sc_ms;
-                gpu_stencil_sum += st_ms;
-                gpu_gather_sum  += g_ms;
-                gpu_siphon_sum  += s_ms;
-                gpu_project_sum += p_ms;
-                gpu_tonemap_sum += t_ms;
+                gpu_scatter_sum    += sc_ms;
+                gpu_stencil_sum    += st_ms;
+                gpu_gather_sum     += g_ms;
+                gpu_constraint_sum += c_ms;
+                gpu_siphon_sum     += s_ms;
+                gpu_project_sum    += p_ms;
+                gpu_tonemap_sum    += t_ms;
                 gpu_samples++;
             }
         }
@@ -791,17 +987,20 @@ int main(int argc, char** argv) {
         /* GPU breakdown — print every 500 frames */
         if (use_gpu_physics && frame % 500 == 0 && gpu_samples > 0) {
             double inv = 1.0 / (double)gpu_samples;
-            double sc = gpu_scatter_sum * inv;
-            double st = gpu_stencil_sum * inv;
-            double g  = gpu_gather_sum  * inv;
-            double s  = gpu_siphon_sum  * inv;
-            double p  = gpu_project_sum * inv;
-            double t  = gpu_tonemap_sum * inv;
-            double total = sc + st + g + s + p + t;
-            printf("[gpu] scatter=%.3f stencil=%.3f gather=%.3f siphon=%.3f "
-                   "project=%.3f tonemap=%.3f  total=%.3f ms  (%d samples)\n",
-                   sc, st, g, s, p, t, total, gpu_samples);
+            double sc = gpu_scatter_sum    * inv;
+            double st = gpu_stencil_sum    * inv;
+            double g  = gpu_gather_sum     * inv;
+            double c  = gpu_constraint_sum * inv;
+            double s  = gpu_siphon_sum     * inv;
+            double p  = gpu_project_sum    * inv;
+            double t  = gpu_tonemap_sum    * inv;
+            double total = sc + st + g + c + s + p + t;
+            printf("[gpu] scatter=%.3f stencil=%.3f gather=%.3f constraint=%.3f "
+                   "siphon=%.3f project=%.3f tonemap=%.3f  total=%.3f ms  "
+                   "(%d samples)\n",
+                   sc, st, g, c, s, p, t, total, gpu_samples);
             gpu_scatter_sum = gpu_stencil_sum = gpu_gather_sum = 0.0;
+            gpu_constraint_sum = 0.0;
             gpu_siphon_sum = 0.0;
             gpu_project_sum = gpu_tonemap_sum = 0.0;
             gpu_samples = 0;

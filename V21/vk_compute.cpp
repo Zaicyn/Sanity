@@ -376,9 +376,10 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     VkQueryPoolCreateInfo qpInfo = {};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpInfo.queryCount = 14;  /* 2 frames × 7 timestamps:
-                              * begin, scatter_end, stencil_end, gather_end,
-                              * siphon_end, project_end, tonemap_end */
+    qpInfo.queryCount = 16;  /* 2 frames × 8 timestamps:
+                              *   0 begin         1 scatter_end    2 stencil_end
+                              *   3 gather_end    4 constraint_end 5 siphon_end
+                              *   6 project_end   7 tonemap_end */
     if (vkCreateQueryPool(ctx.device, &qpInfo, nullptr, &phys.queryPool) != VK_SUCCESS)
         throw std::runtime_error("Failed to create timestamp query pool");
 
@@ -809,18 +810,215 @@ void initGatherMeasureCompute(PhysicsCompute& phys, VulkanContext& ctx) {
 }
 
 /* ========================================================================
+ * CONSTRAINT SOLVE (Pass 4) — PBD distance constraints for rigid-body MVP
+ * ======================================================================== */
+
+void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
+                           const uint32_t* pair_indices,
+                           const float*    rest_lengths,
+                           const float*    inv_masses,
+                           const uint32_t* bucket_offsets,
+                           const uint32_t* bucket_counts,
+                           uint32_t        rigid_base,
+                           uint32_t        rigid_count,
+                           uint32_t        iterations) {
+    /* Total constraint count = sum of the 6 buckets */
+    uint32_t M = 0;
+    for (int k = 0; k < 6; k++) M += bucket_counts[k];
+
+    /* --- Allocate device-local SSBOs --- */
+    size_t pairs_bytes = (size_t)M * 2 * sizeof(uint32_t);        /* uvec2 × M */
+    size_t rest_bytes  = (size_t)M * sizeof(float);
+    size_t invm_bytes  = (size_t)rigid_count * sizeof(float);
+
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.constraintPairsBuffer, phys.constraintPairsMemory, pairs_bytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.restLengthsBuffer,     phys.restLengthsMemory,     rest_bytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.invMassesBuffer,       phys.invMassesMemory,       invm_bytes);
+
+    printf("[vk-compute] Constraint solver: %u particles, %u constraints, "
+           "buckets=[%u %u %u %u %u %u], %u iters/frame, %.1f KB total\n",
+           rigid_count, M,
+           bucket_counts[0], bucket_counts[1], bucket_counts[2],
+           bucket_counts[3], bucket_counts[4], bucket_counts[5],
+           iterations,
+           (double)(pairs_bytes + rest_bytes + invm_bytes) / 1024.0);
+
+    /* --- Stage + upload all 3 buffers in one command --- */
+    size_t total_sz = pairs_bytes + rest_bytes + invm_bytes;
+    size_t off_pairs = 0;
+    size_t off_rest  = pairs_bytes;
+    size_t off_invm  = pairs_bytes + rest_bytes;
+
+    VkBuffer       stagingBuf;
+    VkDeviceMemory stagingMem;
+    {
+        VkBufferCreateInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bi.size = total_sz;
+        bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        vkCreateBuffer(ctx.device, &bi, nullptr, &stagingBuf);
+
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(ctx.device, stagingBuf, &mr);
+        VkMemoryAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize = mr.size;
+        ai.memoryTypeIndex = findMemType(ctx.physicalDevice, mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(ctx.device, &ai, nullptr, &stagingMem);
+        vkBindBufferMemory(ctx.device, stagingBuf, stagingMem, 0);
+    }
+
+    char* staging_base;
+    vkMapMemory(ctx.device, stagingMem, 0, total_sz, 0, (void**)&staging_base);
+    memcpy(staging_base + off_pairs, pair_indices, pairs_bytes);
+    memcpy(staging_base + off_rest,  rest_lengths, rest_bytes);
+    memcpy(staging_base + off_invm,  inv_masses,   invm_bytes);
+    vkUnmapMemory(ctx.device, stagingMem);
+
+    VkCommandBuffer ucmd;
+    VkCommandBufferAllocateInfo cba = {};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = ctx.commandPool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    vkAllocateCommandBuffers(ctx.device, &cba, &ucmd);
+
+    VkCommandBufferBeginInfo cbegin = {};
+    cbegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cbegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(ucmd, &cbegin);
+
+    VkBufferCopy c0 = {off_pairs, 0, pairs_bytes};
+    vkCmdCopyBuffer(ucmd, stagingBuf, phys.constraintPairsBuffer, 1, &c0);
+    VkBufferCopy c1 = {off_rest, 0, rest_bytes};
+    vkCmdCopyBuffer(ucmd, stagingBuf, phys.restLengthsBuffer, 1, &c1);
+    VkBufferCopy c2 = {off_invm, 0, invm_bytes};
+    vkCmdCopyBuffer(ucmd, stagingBuf, phys.invMassesBuffer, 1, &c2);
+    vkEndCommandBuffer(ucmd);
+
+    VkSubmitInfo usi = {};
+    usi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    usi.commandBufferCount = 1;
+    usi.pCommandBuffers = &ucmd;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &usi, VK_NULL_HANDLE);
+    vkQueueWaitIdle(ctx.graphicsQueue);
+
+    vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &ucmd);
+    vkDestroyBuffer(ctx.device, stagingBuf, nullptr);
+    vkFreeMemory(ctx.device, stagingMem, nullptr);
+
+    /* --- Descriptor set layout for set 1: 3 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[3] = {};
+    for (int i = 0; i < 3; i++) {
+        set1Bindings[i].binding = i;
+        set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        set1Bindings[i].descriptorCount = 1;
+        set1Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set1Info = {};
+    set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set1Info.bindingCount = 3;
+    set1Info.pBindings = set1Bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.constraintSet1Layout);
+
+    /* --- Pipeline layout: set 0 (siphon particles) + set 1 (constraint data) --- */
+    VkDescriptorSetLayout layouts[2] = { phys.descLayout, phys.constraintSet1Layout };
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(ConstraintPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 2;
+    plInfo.pSetLayouts = layouts;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.constraintPipelineLayout);
+
+    /* --- Pipeline --- */
+    auto code = readShaderFile("constraint_solve.spv");
+    VkShaderModule mod = createShaderModule(ctx.device, code);
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = mod;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = phys.constraintPipelineLayout;
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                  nullptr, &phys.constraintPipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create constraint_solve pipeline");
+    vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+    /* --- Descriptor pool + set for set 1 --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 3;
+
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &dpInfo, nullptr, &phys.constraintDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.constraintDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.constraintSet1Layout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.constraintSet1);
+
+    /* --- Write descriptors for set 1 --- */
+    VkDescriptorBufferInfo bufInfos[3] = {
+        { phys.constraintPairsBuffer, 0, VK_WHOLE_SIZE },
+        { phys.restLengthsBuffer,     0, VK_WHOLE_SIZE },
+        { phys.invMassesBuffer,       0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[3] = {};
+    for (int i = 0; i < 3; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.constraintSet1;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
+
+    /* --- Store solver config --- */
+    phys.rigidBaseIndex      = rigid_base;
+    phys.rigidCount          = rigid_count;
+    phys.constraintIterations = iterations;
+    for (int k = 0; k < 6; k++) {
+        phys.constraintBucketOffsets[k] = bucket_offsets[k];
+        phys.constraintBucketCounts[k]  = bucket_counts[k];
+    }
+    phys.constraintEnabled = true;
+
+    printf("[vk-compute] Constraint solve pipeline created (base=%u count=%u iters=%u)\n",
+           rigid_base, rigid_count, iterations);
+}
+
+/* ========================================================================
  * DISPATCH — record compute commands
  * ======================================================================== */
 
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                             int frame, float sim_time, float dt) {
-    /* Reset this slot's 7 timestamps and write the begin marker.
+    /* Reset this slot's 8 timestamps and write the begin marker.
      * Layout:
      *   +0 begin            +1 scatter_end      +2 stencil_end
-     *   +3 gather_end       +4 siphon_end       +5 project_end
-     *   +6 tonemap_end (written from recordDensityRender) */
-    uint32_t base = phys.queryFrame * 7;
-    vkCmdResetQueryPool(cmd, phys.queryPool, base, 7);
+     *   +3 gather_end       +4 constraint_end   +5 siphon_end
+     *   +6 project_end      +7 tonemap_end (written from recordDensityRender) */
+    uint32_t base = phys.queryFrame * 8;
+    vkCmdResetQueryPool(cmd, phys.queryPool, base, 8);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         phys.queryPool, base + 0);
 
@@ -962,6 +1160,74 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 3);
 
+    /* ---- Pass 4: Constraint Solve (PBD distance constraints, 6-bucket GS)
+     * Dispatches the constraint solver when the rigid-body mode is enabled.
+     * Each outer iteration runs 6 vertex-disjoint bucket dispatches with a
+     * memory barrier between each bucket so later buckets see earlier writes
+     * to pos_x/y/z. The solver touches only positions (PBD style); siphon's
+     * next integration step will feel the new positions via gravitational
+     * pull. When disabled, constraint_ms ≈ 0 from the two adjacent timestamp
+     * writes. */
+    if (phys.constraintEnabled) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.constraintPipeline);
+        VkDescriptorSet csets[2] = { phys.descSet, phys.constraintSet1 };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.constraintPipelineLayout, 0, 2, csets, 0, nullptr);
+
+        ConstraintPushConstants cpc = {};
+        cpc.rigid_base  = phys.rigidBaseIndex;
+        cpc.rigid_count = phys.rigidCount;
+        cpc.beta        = 0.2f;
+        cpc.compliance  = 0.0f;
+        cpc.dt          = dt;
+        cpc._pad        = 0;
+
+        VkMemoryBarrier colorBarrier = {};
+        colorBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        colorBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        colorBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        for (uint32_t it = 0; it < phys.constraintIterations; it++) {
+            for (int bucket = 0; bucket < 6; bucket++) {
+                cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
+                cpc.constraint_count  = phys.constraintBucketCounts[bucket];
+                if (cpc.constraint_count == 0) continue;
+
+                vkCmdPushConstants(cmd, phys.constraintPipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0, sizeof(cpc), &cpc);
+                vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
+
+                /* Barrier between buckets (and between iterations): pos writes
+                 * must be visible to the next bucket's reads. Skip the final
+                 * barrier after the last bucket of the last iteration — the
+                 * final visibility barrier to siphon is emitted below. */
+                bool is_last = (it + 1 == phys.constraintIterations) && (bucket == 5);
+                if (!is_last) {
+                    vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
+                }
+            }
+        }
+
+        /* Final barrier: constraint pos writes → siphon reads */
+        VkMemoryBarrier finalBarrier = {};
+        finalBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        finalBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        finalBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &finalBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    /* Constraint end — written unconditionally so constraint_ms is always
+     * defined. When disabled, constraint_ms reads ≈ 0. */
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        phys.queryPool, base + 4);
+
     /* ---- Siphon (physics) -------------------------------------------- */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1000,7 +1266,7 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Siphon end — after the write-visibility barrier drains */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        phys.queryPool, base + 4);
+                        phys.queryPool, base + 5);
 }
 
 /* ========================================================================
@@ -1393,9 +1659,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Projection end — after compute work drains */
     {
-        uint32_t base = phys.queryFrame * 7;
+        uint32_t base = phys.queryFrame * 8;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            phys.queryPool, base + 5);
+                            phys.queryPool, base + 6);
     }
 
     /* Tone-map render pass */
@@ -1439,9 +1705,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Tone-map end — after color output drains */
     {
-        uint32_t base = phys.queryFrame * 7;
+        uint32_t base = phys.queryFrame * 8;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            phys.queryPool, base + 6);
+                            phys.queryPool, base + 7);
     }
 
     /* Mark this slot as written so the next readback can consume it */
@@ -1457,26 +1723,28 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_scatter_ms,
                     double* out_stencil_ms,
                     double* out_gather_ms,
+                    double* out_constraint_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms) {
     uint32_t slot = phys.queryFrame ^ 1;
     if (!phys.queryValid[slot]) return false;
 
-    uint32_t base = slot * 7;
-    uint64_t ts[7];
-    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 7,
+    uint32_t base = slot * 8;
+    uint64_t ts[8];
+    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 8,
         sizeof(ts), ts, sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (r != VK_SUCCESS) return false;
 
     double nsPerTick = (double)phys.timestampPeriodNs;
-    *out_scatter_ms = (double)(ts[1] - ts[0]) * nsPerTick / 1.0e6;
-    *out_stencil_ms = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
-    *out_gather_ms  = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
-    *out_siphon_ms  = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
-    *out_project_ms = (double)(ts[5] - ts[4]) * nsPerTick / 1.0e6;
-    *out_tonemap_ms = (double)(ts[6] - ts[5]) * nsPerTick / 1.0e6;
+    *out_scatter_ms    = (double)(ts[1] - ts[0]) * nsPerTick / 1.0e6;
+    *out_stencil_ms    = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
+    *out_gather_ms     = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
+    *out_constraint_ms = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
+    *out_siphon_ms     = (double)(ts[5] - ts[4]) * nsPerTick / 1.0e6;
+    *out_project_ms    = (double)(ts[6] - ts[5]) * nsPerTick / 1.0e6;
+    *out_tonemap_ms    = (double)(ts[7] - ts[6]) * nsPerTick / 1.0e6;
     return true;
 }
 
@@ -1669,6 +1937,20 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
     vkDestroyDescriptorPool(device, phys.gatherMeasureDescPool, nullptr);
     vkDestroyBuffer(device, phys.gatherScratchBuffer, nullptr);
     vkFreeMemory(device, phys.gatherScratchMemory, nullptr);
+
+    /* Constraint solve pipeline + constraint SSBOs (optional) */
+    if (phys.constraintEnabled) {
+        vkDestroyPipeline(device, phys.constraintPipeline, nullptr);
+        vkDestroyPipelineLayout(device, phys.constraintPipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, phys.constraintSet1Layout, nullptr);
+        vkDestroyDescriptorPool(device, phys.constraintDescPool, nullptr);
+        vkDestroyBuffer(device, phys.constraintPairsBuffer, nullptr);
+        vkFreeMemory(device, phys.constraintPairsMemory, nullptr);
+        vkDestroyBuffer(device, phys.restLengthsBuffer, nullptr);
+        vkFreeMemory(device, phys.restLengthsMemory, nullptr);
+        vkDestroyBuffer(device, phys.invMassesBuffer, nullptr);
+        vkFreeMemory(device, phys.invMassesMemory, nullptr);
+    }
 
     /* Projection pipeline */
     vkDestroyPipeline(device, phys.projPipeline, nullptr);

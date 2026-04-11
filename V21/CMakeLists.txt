@@ -45,6 +45,7 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/scatter_reduce.comp
     ${KERNEL_DIR}/stencil.comp
     ${KERNEL_DIR}/gather_measure.comp
+    ${KERNEL_DIR}/constraint_solve.comp
 )
 
 set(SPV_OUTPUTS)

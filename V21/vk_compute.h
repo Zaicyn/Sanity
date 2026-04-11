@@ -58,6 +58,18 @@ struct GatherMeasurePushConstants {
     float dt;
 };
 
+/* Push constants for constraint_solve.comp (Pass 4, rigid-body MVP) */
+struct ConstraintPushConstants {
+    uint32_t constraint_offset;   /* start index of current bucket in pairs[] */
+    uint32_t constraint_count;    /* size of current bucket */
+    uint32_t rigid_base;          /* = N_field, first lattice particle index */
+    uint32_t rigid_count;         /* = N_rigid */
+    float    beta;                /* Baumgarte coefficient (0.2 for MVP) */
+    float    compliance;          /* XPBD compliance (0.0 placeholder) */
+    float    dt;
+    uint32_t _pad;
+};
+
 /* Cell grid constants (must match scatter.comp) */
 #define V21_GRID_DIM          64
 #define V21_GRID_CELLS        (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
@@ -156,6 +168,29 @@ struct PhysicsCompute {
     VkDescriptorPool      gatherMeasureDescPool;
     VkDescriptorSet       gatherMeasureSet1;
 
+    /* Constraint solver pipeline (Pass 4 — PBD distance constraints, rigid-body MVP).
+     * All buffers and pipeline state are only allocated when constraintEnabled is
+     * true (i.e. when --rigid-body != off). */
+    VkBuffer              constraintPairsBuffer;   /* uvec2[M], static upload */
+    VkDeviceMemory        constraintPairsMemory;
+    VkBuffer              restLengthsBuffer;       /* float[M] */
+    VkDeviceMemory        restLengthsMemory;
+    VkBuffer              invMassesBuffer;         /* float[N_rigid] */
+    VkDeviceMemory        invMassesMemory;
+    VkDescriptorSetLayout constraintSet1Layout;    /* set 1: pairs + rest + inv_m */
+    VkPipelineLayout      constraintPipelineLayout;
+    VkPipeline            constraintPipeline;
+    VkDescriptorPool      constraintDescPool;
+    VkDescriptorSet       constraintSet1;
+
+    /* Constraint solver config (set by initConstraintCompute) */
+    bool     constraintEnabled;
+    uint32_t rigidBaseIndex;            /* = N_field (first lattice particle index) */
+    uint32_t rigidCount;                /* = N_rigid */
+    uint32_t constraintBucketOffsets[6];/* start offset of each bucket in pairs[] */
+    uint32_t constraintBucketCounts[6]; /* count per (axis × parity) bucket */
+    uint32_t constraintIterations;      /* solver iterations per frame */
+
     /* Projection compute pipeline (rendering) */
     VkDescriptorSetLayout projDescLayout;
     VkPipelineLayout projPipelineLayout;
@@ -232,6 +267,22 @@ void initStencilCompute(PhysicsCompute& phys, VulkanContext& ctx);
  * Must be called after initStencilCompute (depends on pressure buffers). */
 void initGatherMeasureCompute(PhysicsCompute& phys, VulkanContext& ctx);
 
+/* Initialize the constraint-solver pipeline (Pass 4, PBD distance constraints).
+ * Uploads the static constraint data (pair list, rest lengths, inverse masses)
+ * to device-local SSBOs, builds the dual-set pipeline layout sharing set 0 with
+ * siphon's particle layout, and stores bucket metadata needed by the dispatcher.
+ * M = total constraint count (sum of bucket_counts[0..5]).
+ * Must be called after initPhysicsCompute (depends on phys.descLayout). */
+void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
+                           const uint32_t* pair_indices,      /* uvec2[M] flattened */
+                           const float*    rest_lengths,      /* float[M] */
+                           const float*    inv_masses,        /* float[N_rigid] */
+                           const uint32_t* bucket_offsets,    /* uint[6] */
+                           const uint32_t* bucket_counts,     /* uint[6] */
+                           uint32_t        rigid_base,
+                           uint32_t        rigid_count,
+                           uint32_t        iterations);
+
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
 
@@ -257,17 +308,19 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 
 /* Read back GPU timestamps from the previous frame (non-blocking).
  * Breakdown:
- *   scatter_ms = Pass 1 (scatter) + reduce
- *   stencil_ms = Pass 2 (density → pressure gradient)
- *   gather_ms  = Pass 3 measurement-only gather
- *   siphon_ms  = main physics kernel
- *   project_ms = density projection to screen
- *   tonemap_ms = fragment shader tone mapping
+ *   scatter_ms    = Pass 1 (scatter) + reduce
+ *   stencil_ms    = Pass 2 (density → pressure gradient)
+ *   gather_ms     = Pass 3 measurement-only gather
+ *   constraint_ms = Pass 4 distance-constraint solver (0 if --rigid-body off)
+ *   siphon_ms     = main physics kernel
+ *   project_ms    = density projection to screen
+ *   tonemap_ms    = fragment shader tone mapping
  * Returns true if results are valid, false if not yet available. */
 bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_scatter_ms,
                     double* out_stencil_ms,
                     double* out_gather_ms,
+                    double* out_constraint_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms);
