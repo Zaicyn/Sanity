@@ -43,6 +43,21 @@ struct ScatterReducePushConstants {
     int total_cells;
 };
 
+/* Push constants for stencil.comp (Pass 2) */
+struct StencilPushConstants {
+    int   grid_dim;
+    int   total_cells;
+    float grid_cell_size;
+    float pressure_k;
+};
+
+/* Push constants for gather_measure.comp (Pass 3, measurement-only) */
+struct GatherMeasurePushConstants {
+    int   N;
+    int   total_cells;
+    float dt;
+};
+
 /* Cell grid constants (must match scatter.comp) */
 #define V21_GRID_DIM          64
 #define V21_GRID_CELLS        (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
@@ -119,6 +134,28 @@ struct PhysicsCompute {
     VkDescriptorPool      scatterReduceDescPool;
     VkDescriptorSet       scatterReduceSet;
 
+    /* Stencil pipeline (Pass 2 — density → pressure gradient) */
+    VkBuffer              pressureXBuffer;        /* float[V21_GRID_CELLS] */
+    VkDeviceMemory        pressureXMemory;
+    VkBuffer              pressureYBuffer;
+    VkDeviceMemory        pressureYMemory;
+    VkBuffer              pressureZBuffer;
+    VkDeviceMemory        pressureZMemory;
+    VkDescriptorSetLayout stencilSetLayout;
+    VkPipelineLayout      stencilPipelineLayout;
+    VkPipeline            stencilPipeline;
+    VkDescriptorPool      stencilDescPool;
+    VkDescriptorSet       stencilSet;
+
+    /* Gather-measure pipeline (Pass 3 — pressure at cell, write to scratch) */
+    VkBuffer              gatherScratchBuffer;    /* float[N], write-only sink */
+    VkDeviceMemory        gatherScratchMemory;
+    VkDescriptorSetLayout gatherMeasureSet1Layout; /* set 1: particle_cell + pressure + scratch */
+    VkPipelineLayout      gatherMeasurePipelineLayout;
+    VkPipeline            gatherMeasurePipeline;
+    VkDescriptorPool      gatherMeasureDescPool;
+    VkDescriptorSet       gatherMeasureSet1;
+
     /* Projection compute pipeline (rendering) */
     VkDescriptorSetLayout projDescLayout;
     VkPipelineLayout projPipelineLayout;
@@ -187,6 +224,14 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx);
  * Must be called after initScatterCompute (depends on the shards buffer). */
 void initScatterReduceCompute(PhysicsCompute& phys, VulkanContext& ctx);
 
+/* Initialize stencil compute pipeline (Pass 2 — density → pressure gradient).
+ * Must be called after initScatterReduceCompute (depends on gridDensity). */
+void initStencilCompute(PhysicsCompute& phys, VulkanContext& ctx);
+
+/* Initialize gather-measure compute pipeline (Pass 3, measurement-only).
+ * Must be called after initStencilCompute (depends on pressure buffers). */
+void initGatherMeasureCompute(PhysicsCompute& phys, VulkanContext& ctx);
+
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
 
@@ -211,10 +256,18 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
                        int count);
 
 /* Read back GPU timestamps from the previous frame (non-blocking).
- * Writes ms values to out_scatter_ms, out_siphon_ms, out_project_ms, out_tonemap_ms.
+ * Breakdown:
+ *   scatter_ms = Pass 1 (scatter) + reduce
+ *   stencil_ms = Pass 2 (density → pressure gradient)
+ *   gather_ms  = Pass 3 measurement-only gather
+ *   siphon_ms  = main physics kernel
+ *   project_ms = density projection to screen
+ *   tonemap_ms = fragment shader tone mapping
  * Returns true if results are valid, false if not yet available. */
 bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_scatter_ms,
+                    double* out_stencil_ms,
+                    double* out_gather_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms);

@@ -376,7 +376,9 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     VkQueryPoolCreateInfo qpInfo = {};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpInfo.queryCount = 10;  /* 2 frames × 5 timestamps (begin, scatter_end, siphon_end, project_end, tonemap_end) */
+    qpInfo.queryCount = 14;  /* 2 frames × 7 timestamps:
+                              * begin, scatter_end, stencil_end, gather_end,
+                              * siphon_end, project_end, tonemap_end */
     if (vkCreateQueryPool(ctx.device, &qpInfo, nullptr, &phys.queryPool) != VK_SUCCESS)
         throw std::runtime_error("Failed to create timestamp query pool");
 
@@ -393,6 +395,12 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 
     /* Pass 1b reduce pipeline (8 shards → canonical density) */
     initScatterReduceCompute(phys, ctx);
+
+    /* Pass 2 stencil pipeline (density → pressure gradient, 6-neighbor stencil) */
+    initStencilCompute(phys, ctx);
+
+    /* Pass 3 gather-measure pipeline (cells → per-particle scratch, measurement-only) */
+    initGatherMeasureCompute(phys, ctx);
 }
 
 /* ========================================================================
@@ -603,14 +611,216 @@ void initScatterReduceCompute(PhysicsCompute& phys, VulkanContext& ctx) {
 }
 
 /* ========================================================================
+ * STENCIL (Pass 2) — density → pressure gradient via 6-neighbor stencil
+ * ======================================================================== */
+
+void initStencilCompute(PhysicsCompute& phys, VulkanContext& ctx) {
+    /* --- Allocate pressure_x/y/z buffers (float[V21_GRID_CELLS]) --- */
+    size_t pbytes = (size_t)V21_GRID_CELLS * sizeof(float);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.pressureXBuffer, phys.pressureXMemory, pbytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.pressureYBuffer, phys.pressureYMemory, pbytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.pressureZBuffer, phys.pressureZMemory, pbytes);
+    printf("[vk-compute] Pressure grid: 3 × %.1f MB\n",
+           (double)pbytes / (1024.0 * 1024.0));
+
+    /* --- Descriptor set layout: density (read) + 3 pressure (write) --- */
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo lInfo = {};
+    lInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    lInfo.bindingCount = 4;
+    lInfo.pBindings = bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &lInfo, nullptr, &phys.stencilSetLayout);
+
+    /* --- Pipeline layout --- */
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(StencilPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &phys.stencilSetLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.stencilPipelineLayout);
+
+    /* --- Pipeline --- */
+    auto code = readShaderFile("stencil.spv");
+    VkShaderModule mod = createShaderModule(ctx.device, code);
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = mod;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = phys.stencilPipelineLayout;
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                  nullptr, &phys.stencilPipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create stencil pipeline");
+    vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+    /* --- Descriptor pool + set --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 4;
+
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &dpInfo, nullptr, &phys.stencilDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.stencilDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.stencilSetLayout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.stencilSet);
+
+    /* --- Write descriptors --- */
+    VkDescriptorBufferInfo bufInfos[4] = {
+        { phys.gridDensityBuffer, 0, VK_WHOLE_SIZE },
+        { phys.pressureXBuffer,   0, VK_WHOLE_SIZE },
+        { phys.pressureYBuffer,   0, VK_WHOLE_SIZE },
+        { phys.pressureZBuffer,   0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.stencilSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+
+    printf("[vk-compute] Stencil pipeline created\n");
+}
+
+/* ========================================================================
+ * GATHER-MEASURE (Pass 3, measurement-only) — cells → particle scratch
+ * ======================================================================== */
+
+void initGatherMeasureCompute(PhysicsCompute& phys, VulkanContext& ctx) {
+    /* --- Allocate gather_scratch[N] --- */
+    size_t sbytes = (size_t)phys.N * sizeof(float);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.gatherScratchBuffer, phys.gatherScratchMemory, sbytes);
+    printf("[vk-compute] Gather scratch buffer: %.1f MB\n",
+           (double)sbytes / (1024.0 * 1024.0));
+
+    /* --- Descriptor set layout for set 1: 5 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[5] = {};
+    for (int i = 0; i < 5; i++) {
+        set1Bindings[i].binding = i;
+        set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        set1Bindings[i].descriptorCount = 1;
+        set1Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set1Info = {};
+    set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set1Info.bindingCount = 5;
+    set1Info.pBindings = set1Bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.gatherMeasureSet1Layout);
+
+    /* --- Pipeline layout: set 0 (siphon particles) + set 1 (gather IO) --- */
+    VkDescriptorSetLayout layouts[2] = { phys.descLayout, phys.gatherMeasureSet1Layout };
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(GatherMeasurePushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 2;
+    plInfo.pSetLayouts = layouts;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.gatherMeasurePipelineLayout);
+
+    /* --- Pipeline --- */
+    auto code = readShaderFile("gather_measure.spv");
+    VkShaderModule mod = createShaderModule(ctx.device, code);
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = mod;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = phys.gatherMeasurePipelineLayout;
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                  nullptr, &phys.gatherMeasurePipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create gather_measure pipeline");
+    vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+    /* --- Descriptor pool + set for set 1 --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 5;
+
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &dpInfo, nullptr, &phys.gatherMeasureDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.gatherMeasureDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.gatherMeasureSet1Layout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.gatherMeasureSet1);
+
+    /* --- Write descriptors for set 1 --- */
+    VkDescriptorBufferInfo bufInfos[5] = {
+        { phys.particleCellBuffer,   0, VK_WHOLE_SIZE },
+        { phys.pressureXBuffer,      0, VK_WHOLE_SIZE },
+        { phys.pressureYBuffer,      0, VK_WHOLE_SIZE },
+        { phys.pressureZBuffer,      0, VK_WHOLE_SIZE },
+        { phys.gatherScratchBuffer,  0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[5] = {};
+    for (int i = 0; i < 5; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.gatherMeasureSet1;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 5, writes, 0, nullptr);
+
+    printf("[vk-compute] Gather-measure pipeline created\n");
+}
+
+/* ========================================================================
  * DISPATCH — record compute commands
  * ======================================================================== */
 
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                             int frame, float sim_time, float dt) {
-    /* Reset this slot's 5 timestamps and write the begin marker */
-    uint32_t base = phys.queryFrame * 5;
-    vkCmdResetQueryPool(cmd, phys.queryPool, base, 5);
+    /* Reset this slot's 7 timestamps and write the begin marker.
+     * Layout:
+     *   +0 begin            +1 scatter_end      +2 stencil_end
+     *   +3 gather_end       +4 siphon_end       +5 project_end
+     *   +6 tonemap_end (written from recordDensityRender) */
+    uint32_t base = phys.queryFrame * 7;
+    vkCmdResetQueryPool(cmd, phys.queryPool, base, 7);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         phys.queryPool, base + 0);
 
@@ -688,6 +898,70 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 1);
 
+    /* ---- Pass 2: Stencil (density → pressure gradient) --------------- */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.stencilPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.stencilPipelineLayout, 0, 1, &phys.stencilSet, 0, nullptr);
+
+    StencilPushConstants stencilPush = {};
+    stencilPush.grid_dim       = V21_GRID_DIM;
+    stencilPush.total_cells    = V21_GRID_CELLS;
+    stencilPush.grid_cell_size = V21_GRID_CELL_SIZE;
+    stencilPush.pressure_k     = 0.01f;  /* measurement-only scale factor */
+    vkCmdPushConstants(cmd, phys.stencilPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(stencilPush), &stencilPush);
+
+    vkCmdDispatch(cmd, (V21_GRID_CELLS + 255) / 256, 1, 1);
+
+    /* Barrier: stencil's pressure writes must be visible to gather. */
+    {
+        VkMemoryBarrier stencilBarrier = {};
+        stencilBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        stencilBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        stencilBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &stencilBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    /* Stencil end */
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        phys.queryPool, base + 2);
+
+    /* ---- Pass 3: Gather-measure (cells → per-particle scratch) ------- */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.gatherMeasurePipeline);
+    VkDescriptorSet gatherSets[2] = { phys.descSet, phys.gatherMeasureSet1 };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.gatherMeasurePipelineLayout, 0, 2, gatherSets, 0, nullptr);
+
+    GatherMeasurePushConstants gatherPush = {};
+    gatherPush.N           = phys.N;
+    gatherPush.total_cells = V21_GRID_CELLS;
+    gatherPush.dt          = dt;
+    vkCmdPushConstants(cmd, phys.gatherMeasurePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(gatherPush), &gatherPush);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: gather writes to scratch — no downstream consumer in
+     * measurement-only mode, but the fence prevents the driver from
+     * elision-reordering the dispatch relative to siphon. */
+    {
+        VkMemoryBarrier gatherBarrier = {};
+        gatherBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        gatherBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gatherBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &gatherBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    /* Gather end */
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        phys.queryPool, base + 3);
+
     /* ---- Siphon (physics) -------------------------------------------- */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -726,7 +1000,7 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Siphon end — after the write-visibility barrier drains */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        phys.queryPool, base + 2);
+                        phys.queryPool, base + 4);
 }
 
 /* ========================================================================
@@ -1119,9 +1393,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Projection end — after compute work drains */
     {
-        uint32_t base = phys.queryFrame * 5;
+        uint32_t base = phys.queryFrame * 7;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            phys.queryPool, base + 3);
+                            phys.queryPool, base + 5);
     }
 
     /* Tone-map render pass */
@@ -1165,9 +1439,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Tone-map end — after color output drains */
     {
-        uint32_t base = phys.queryFrame * 5;
+        uint32_t base = phys.queryFrame * 7;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            phys.queryPool, base + 4);
+                            phys.queryPool, base + 6);
     }
 
     /* Mark this slot as written so the next readback can consume it */
@@ -1181,28 +1455,28 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
 bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_scatter_ms,
+                    double* out_stencil_ms,
+                    double* out_gather_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms) {
-    /* Read from the slot we just finished writing (phys.queryFrame was flipped
-     * at the end of recordDensityRender, so ^1 is the most recent write).
-     * Use WITHOUT_WAIT so we don't block — if the GPU hasn't finished yet,
-     * VK_NOT_READY is returned and we skip this report. */
     uint32_t slot = phys.queryFrame ^ 1;
     if (!phys.queryValid[slot]) return false;
 
-    uint32_t base = slot * 5;
-    uint64_t ts[5];
-    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 5,
+    uint32_t base = slot * 7;
+    uint64_t ts[7];
+    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 7,
         sizeof(ts), ts, sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (r != VK_SUCCESS) return false;
 
     double nsPerTick = (double)phys.timestampPeriodNs;
     *out_scatter_ms = (double)(ts[1] - ts[0]) * nsPerTick / 1.0e6;
-    *out_siphon_ms  = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
-    *out_project_ms = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
-    *out_tonemap_ms = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
+    *out_stencil_ms = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
+    *out_gather_ms  = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
+    *out_siphon_ms  = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
+    *out_project_ms = (double)(ts[5] - ts[4]) * nsPerTick / 1.0e6;
+    *out_tonemap_ms = (double)(ts[6] - ts[5]) * nsPerTick / 1.0e6;
     return true;
 }
 
@@ -1375,6 +1649,26 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
     vkDestroyPipelineLayout(device, phys.scatterReducePipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(device, phys.scatterReduceSetLayout, nullptr);
     vkDestroyDescriptorPool(device, phys.scatterReduceDescPool, nullptr);
+
+    /* Stencil pipeline + pressure buffers */
+    vkDestroyPipeline(device, phys.stencilPipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.stencilPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.stencilSetLayout, nullptr);
+    vkDestroyDescriptorPool(device, phys.stencilDescPool, nullptr);
+    vkDestroyBuffer(device, phys.pressureXBuffer, nullptr);
+    vkFreeMemory(device, phys.pressureXMemory, nullptr);
+    vkDestroyBuffer(device, phys.pressureYBuffer, nullptr);
+    vkFreeMemory(device, phys.pressureYMemory, nullptr);
+    vkDestroyBuffer(device, phys.pressureZBuffer, nullptr);
+    vkFreeMemory(device, phys.pressureZMemory, nullptr);
+
+    /* Gather-measure pipeline + scratch buffer */
+    vkDestroyPipeline(device, phys.gatherMeasurePipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.gatherMeasurePipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.gatherMeasureSet1Layout, nullptr);
+    vkDestroyDescriptorPool(device, phys.gatherMeasureDescPool, nullptr);
+    vkDestroyBuffer(device, phys.gatherScratchBuffer, nullptr);
+    vkFreeMemory(device, phys.gatherScratchMemory, nullptr);
 
     /* Projection pipeline */
     vkDestroyPipeline(device, phys.projPipeline, nullptr);

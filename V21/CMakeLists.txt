@@ -43,6 +43,8 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/accumulator.comp
     ${KERNEL_DIR}/project.comp
     ${KERNEL_DIR}/scatter_reduce.comp
+    ${KERNEL_DIR}/stencil.comp
+    ${KERNEL_DIR}/gather_measure.comp
 )
 
 set(SPV_OUTPUTS)
