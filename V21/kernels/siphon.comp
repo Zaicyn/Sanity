@@ -69,9 +69,15 @@ const float ISCO_R           = 6.0;
 const float PHI              = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float BIAS             = 0.75;
+// Phase C: pump state machine runs for transitions and ejection-kick
+// bookkeeping, but the UPSTROKE coherence filter is disabled (it was
+// a second energy sink with no matching source and drained the disk
+// to stillness in ~3000 frames). Only the Hopf-fiber ejection kick
+// couples the pump to velocities, and JET_SPEED is 10× softer than
+// the dagger-era value so ejections nudge instead of yoink.
 const float COHERENCE_LAMBDA = 0.1;
 const float COHERENCE_GAMMA  = 0.02;
-const float JET_SPEED        = 4.0;
+const float JET_SPEED        = 0.4;
 const float PUMP_EJECT_THRESHOLD = 0.88;
 const int   PUMP_COHERENT_MAX    = 3;
 
@@ -454,11 +460,11 @@ void main() {
     if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
     if (theta_i < 0.0)            theta_i += 6.28318530718;
 
-    // Gemini surgery step 3: BYPASS the pump state machine. Force IDLE so
-    // the heartbeat→axis coherence filter can't snap velocities to radial,
-    // and no state-driven transitions can affect dynamics. Only the Viviani
-    // field steering + orbital damping + anisotropic damping drive motion.
-    state = PUMP_IDLE;
+    // Phase C: re-enable the pump state machine. COHERENCE_LAMBDA and
+    // JET_SPEED are now 10× reduced, so the pump acts as a soft nudge
+    // on top of the stable phase-sheared disk instead of overwriting
+    // velocities. State transitions and residual/work accounting run
+    // normally — only the force magnitudes are softened.
 
     // ----- Distances and angular momentum -----
     float r3d_sq = px*px + py*py + pz*pz;
@@ -552,8 +558,15 @@ void main() {
     float tidal_stress = max(shear, tidal_radial);
 
     // ----- STEP 10: Siphon pump state machine -----
+    // Phase C: UPSTROKE branches update state/scale/coh_count bookkeeping
+    // but DO NOT apply the coherence filter (v := v - λ·v⊥). That filter
+    // was an unbounded energy sink on the phase-sheared attractor — with
+    // no matching source it drained |v| to zero in ~3000 frames. The
+    // Viviani field rotational transport already handles orientation;
+    // the pump's job here is just to cycle through states and fire
+    // intermittent ejection kicks.
     if (state == PUMP_UPSTROKE_COHERENT) {
-        // Coherence direction from heartbeat mode cycling
+        // Pick the coherence axis for scale bookkeeping (heartbeat mode).
         float nx, ny, nz;
         if (heartbeat > 0.5) {
             nx = frx; ny = fry; nz = frz;
@@ -562,28 +575,17 @@ void main() {
         } else {
             nx = flx; ny = fly; nz = flz;
         }
-        float lambda = COHERENCE_LAMBDA * rate_mod;
-        apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
-
-        if (!isinf(vx) && !isnan(vx) && !isinf(vy) && !isnan(vy) && !isinf(vz) && !isnan(vz)) {
-            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, 1.0);
-            coh_count++;
-            state = PUMP_EXPAND;
-        }
+        scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, 1.0);
+        coh_count++;
+        state = PUMP_EXPAND;
     }
     else if (state == PUMP_UPSTROKE_HOP) {
-        // Hop always uses radial direction × φ factor
         float nx = frx;
         float ny = fry;
         float nz = frz;
-        float lambda = COHERENCE_LAMBDA * PHI * rate_mod;
-        apply_coherence_filter(vx, vy, vz, nx, ny, nz, lambda);
-
-        if (!isinf(vx) && !isnan(vx) && !isinf(vy) && !isnan(vy) && !isinf(vz) && !isnan(vz)) {
-            scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, PHI);
-            coh_count = 0;
-            state = PUMP_EXPAND;
-        }
+        scale = compute_coherence_scale(vx, vy, vz, nx, ny, nz, PHI);
+        coh_count = 0;
+        state = PUMP_EXPAND;
     }
     else {
         siphon_state_step(state, scale, coh_count, residual, work,
