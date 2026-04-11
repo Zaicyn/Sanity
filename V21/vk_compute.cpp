@@ -822,9 +822,9 @@ void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
                            uint32_t        rigid_base,
                            uint32_t        rigid_count,
                            uint32_t        iterations) {
-    /* Total constraint count = sum of the 6 buckets */
+    /* Total constraint count = sum of the 7 buckets (6 lattice + 1 joint) */
     uint32_t M = 0;
-    for (int k = 0; k < 6; k++) M += bucket_counts[k];
+    for (int k = 0; k < 7; k++) M += bucket_counts[k];
 
     /* --- Allocate device-local SSBOs --- */
     size_t pairs_bytes = (size_t)M * 2 * sizeof(uint32_t);        /* uvec2 × M */
@@ -839,10 +839,11 @@ void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
                phys.invMassesBuffer,       phys.invMassesMemory,       invm_bytes);
 
     printf("[vk-compute] Constraint solver: %u particles, %u constraints, "
-           "buckets=[%u %u %u %u %u %u], %u iters/frame, %.1f KB total\n",
+           "buckets=[%u %u %u %u %u %u %u], %u iters/frame, %.1f KB total\n",
            rigid_count, M,
            bucket_counts[0], bucket_counts[1], bucket_counts[2],
            bucket_counts[3], bucket_counts[4], bucket_counts[5],
+           bucket_counts[6],
            iterations,
            (double)(pairs_bytes + rest_bytes + invm_bytes) / 1024.0);
 
@@ -996,7 +997,7 @@ void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
     phys.rigidBaseIndex      = rigid_base;
     phys.rigidCount          = rigid_count;
     phys.constraintIterations = iterations;
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 7; k++) {
         phys.constraintBucketOffsets[k] = bucket_offsets[k];
         phys.constraintBucketCounts[k]  = bucket_counts[k];
     }
@@ -1187,8 +1188,17 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
         colorBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         colorBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
+        /* Precompute the last bucket index that has nonzero work so the
+         * "skip the final barrier" optimization still applies when trailing
+         * buckets are empty (e.g. cube1000 mode with no joints → bucket 6
+         * is empty, last nonempty bucket is 5). */
+        int last_nonempty_bucket = -1;
+        for (int b = 0; b < 7; b++) {
+            if (phys.constraintBucketCounts[b] > 0) last_nonempty_bucket = b;
+        }
+
         for (uint32_t it = 0; it < phys.constraintIterations; it++) {
-            for (int bucket = 0; bucket < 6; bucket++) {
+            for (int bucket = 0; bucket < 7; bucket++) {
                 cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
                 cpc.constraint_count  = phys.constraintBucketCounts[bucket];
                 if (cpc.constraint_count == 0) continue;
@@ -1200,9 +1210,10 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 
                 /* Barrier between buckets (and between iterations): pos writes
                  * must be visible to the next bucket's reads. Skip the final
-                 * barrier after the last bucket of the last iteration — the
-                 * final visibility barrier to siphon is emitted below. */
-                bool is_last = (it + 1 == phys.constraintIterations) && (bucket == 5);
+                 * barrier after the last nonempty bucket of the last iteration
+                 * — the final visibility barrier to siphon is emitted below. */
+                bool is_last = (it + 1 == phys.constraintIterations) &&
+                               (bucket == last_nonempty_bucket);
                 if (!is_last) {
                     vkCmdPipelineBarrier(cmd,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

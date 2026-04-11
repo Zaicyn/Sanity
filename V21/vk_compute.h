@@ -187,8 +187,8 @@ struct PhysicsCompute {
     bool     constraintEnabled;
     uint32_t rigidBaseIndex;            /* = N_field (first lattice particle index) */
     uint32_t rigidCount;                /* = N_rigid */
-    uint32_t constraintBucketOffsets[6];/* start offset of each bucket in pairs[] */
-    uint32_t constraintBucketCounts[6]; /* count per (axis × parity) bucket */
+    uint32_t constraintBucketOffsets[7];/* start offset of each bucket in pairs[] */
+    uint32_t constraintBucketCounts[7]; /* count per (axis × parity) bucket; [6] reserved for joint edges */
     uint32_t constraintIterations;      /* solver iterations per frame */
 
     /* Projection compute pipeline (rendering) */

@@ -150,8 +150,9 @@ enum InitSortMode {
  * particles bound by distance constraints, dropped into the galaxy to test
  * whether GPU constraint work disturbs the Viviani sort's cache coherence. */
 enum RigidBodyMode {
-    RIGID_BODY_OFF      = 0,  /* no lattice (default) */
-    RIGID_BODY_CUBE1000 = 1   /* 10×10×10 cube, 2700 distance constraints */
+    RIGID_BODY_OFF              = 0,  /* no lattice (default) */
+    RIGID_BODY_CUBE1000         = 1,  /* 10×10×10 cube, 2700 distance constraints */
+    RIGID_BODY_CUBE2_BALLSOCKET = 2   /* 2 cubes + 1 ball-socket joint (Phase 2.3 MVP) */
 };
 
 /* Lattice data computed on the host side and uploaded to the GPU constraint
@@ -160,8 +161,8 @@ struct ConstraintLattice {
     std::vector<uint32_t> pairs;              /* flattened uvec2 (size = 2 * M) */
     std::vector<float>    rest;               /* size = M */
     std::vector<float>    inv_m;              /* size = N_rigid */
-    uint32_t              bucket_offsets[6];  /* start offset of each bucket in pairs[] */
-    uint32_t              bucket_counts[6];   /* count per (axis × parity) bucket */
+    uint32_t              bucket_offsets[7];  /* start offset of each bucket in pairs[] */
+    uint32_t              bucket_counts[7];   /* count per (axis × parity) bucket; [6] reserved for joint edges */
     uint32_t              base_index;         /* first lattice particle index */
     uint32_t              rigid_count;        /* = N_rigid */
 };
@@ -318,17 +319,21 @@ static ConstraintLattice init_rigid_body_cube(ParticleState& ps,
 
     const uint32_t base = (uint32_t)n_galaxy;
 
-    /* Per-cube edge buckets, concatenated into 6 super-buckets in cube order.
-     * Within one super-bucket no two edges share an endpoint because (a) each
-     * cube's own bucket k is vertex-disjoint by the (axis × parity) coloring
-     * and (b) different cubes occupy disjoint index ranges
-     * [base + c·1000, base + (c+1)·1000). So GPU Gauss-Seidel holds without
-     * atomics, same as the single-cube MVP, at any cube count. Total GPU
-     * dispatches per frame stays at 24 (4 iters × 6 buckets) regardless of N. */
-    std::vector<std::pair<uint32_t, uint32_t>> super[6];
+    /* Per-cube edge buckets, concatenated into 6 lattice super-buckets in cube
+     * order, plus a 7th reserved for cross-body joint edges (always empty in
+     * this function; populated only by init_rigid_body_cube2_ballsocket and
+     * similar joint-aware helpers). Within one super-bucket no two edges share
+     * an endpoint because (a) each cube's own bucket k is vertex-disjoint by
+     * the (axis × parity) coloring and (b) different cubes occupy disjoint
+     * index ranges [base + c·1000, base + (c+1)·1000). So GPU Gauss-Seidel
+     * holds without atomics, same as the single-cube MVP, at any cube count.
+     * Total GPU dispatches per frame stays at 24 (4 iters × 6 buckets) when
+     * bucket 6 is empty, 28 (4 × 7) when joints are enabled. */
+    std::vector<std::pair<uint32_t, uint32_t>> super[7];
     for (int k = 0; k < 6; k++) {
         super[k].reserve((size_t)n_cubes * 450);
     }
+    /* super[6] stays empty — no joint edges in the pure cube-scaling function. */
 
     for (int c = 0; c < n_cubes; c++) {
         /* Azimuthal placement on the r=50 circle. For N=1 this collapses to
@@ -405,20 +410,20 @@ static ConstraintLattice init_rigid_body_cube(ParticleState& ps,
         }
     }
 
-    ConstraintLattice L;
+    ConstraintLattice L = {};   /* value-init so bucket slot [6] is zero */
     L.base_index  = base;
     L.rigid_count = (uint32_t)N_LATTICE_TOT;
     L.inv_m.assign(N_LATTICE_TOT, 1.0f);
 
     uint32_t running = 0;
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 7; k++) {
         L.bucket_offsets[k] = running;
         L.bucket_counts[k]  = (uint32_t)super[k].size();
         running += L.bucket_counts[k];
     }
     L.pairs.reserve(2u * running);
     L.rest.reserve(running);
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < 7; k++) {
         for (auto& pr : super[k]) {
             L.pairs.push_back(pr.first);
             L.pairs.push_back(pr.second);
@@ -426,11 +431,157 @@ static ConstraintLattice init_rigid_body_cube(ParticleState& ps,
         }
     }
 
+    /* 6-bucket printf unchanged — bucket 6 is always 0 in this function and
+     * printing it would break the Phase 2.1 regression-check format. The new
+     * init_rigid_body_cube2_ballsocket function has its own 7-bucket printf. */
     printf("[rigid] cube1000 x%d on r=%.0f circle: %d lattice particles, "
            "%u constraints, buckets=[%u %u %u %u %u %u], base=%u\n",
            n_cubes, R_ORBIT, N_LATTICE_TOT, running,
            L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
            L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5], base);
+    return L;
+}
+
+/* Phase 2.3 MVP: two cubes + one ball-socket joint.
+ *
+ * Builds two 10×10×10 lattices stacked vertically in y at (50, ±2.75, 0)
+ * with a 0.5-unit gap at y=0. Adds a single zero-length distance constraint
+ * between the center of cube 0's top face (iy=9) and the center of cube 1's
+ * bottom face (iy=0). The joint constraint lives in super-bucket 6 — a 7th
+ * bucket append to the normal 6 lattice buckets. Within super-bucket 6 the
+ * MVP has exactly one edge, so vertex-disjointness is trivially preserved.
+ *
+ * Both cubes get the same circular-orbit velocity tangent to r=50 (not
+ * each cube's own r — the y-offset makes their r slightly different, but
+ * using a midpoint velocity is within the joint's correction envelope and
+ * keeps the math simpler).
+ *
+ * This function does NOT share code with init_rigid_body_cube despite
+ * superficial similarity — the contracts are different (fixed 2 bodies
+ * + joint vs. N independent bodies on a circle), and the per-cube
+ * placement duplication is ~20 lines and acceptable. */
+static ConstraintLattice init_rigid_body_cube2_ballsocket(ParticleState& ps,
+                                                          int n_galaxy) {
+    const int   LX = 10, LY = 10, LZ = 10;
+    const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
+    const int   N_LATTICE_TOT = 2 * N_LATTICE;         /* 2000 */
+    const float SPACING       = 0.5f;
+    const float R_MIDPOINT    = 50.0f;
+    const float Y_OFFSET      = 2.75f;                 /* half-gap between cube centers */
+
+    if (n_galaxy + N_LATTICE_TOT > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
+                        "2 cubes + joint\n", ps.N, n_galaxy);
+        return ConstraintLattice{};
+    }
+
+    /* Shared orbital velocity, computed at the midpoint (50, 0, 0).
+     * Each cube's own center is at r ≈ 50.075; the 0.15% velocity mismatch
+     * is well within the joint's correction envelope. */
+    const float r_center = R_MIDPOINT;
+    const float v_orbit  = sqrtf(BH_MASS / fmaxf(r_center, ISCO_R));
+    const float vx0      = 0.0f;
+    const float vz0      = v_orbit;   /* tangent to +x at (50, 0, 0) */
+
+    const uint32_t base = (uint32_t)n_galaxy;
+
+    /* 7 super-buckets: 0..5 lattice, 6 joint. */
+    std::vector<std::pair<uint32_t, uint32_t>> super[7];
+    for (int k = 0; k < 6; k++) super[k].reserve(900);
+    super[6].reserve(1);
+
+    const float cube_centers_y[2] = { -Y_OFFSET, +Y_OFFSET };
+    uint32_t joint_anchor[2] = { 0, 0 };
+
+    for (int c = 0; c < 2; c++) {
+        const float cx = R_MIDPOINT;
+        const float cy = cube_centers_y[c];
+        const float cz = 0.0f;
+
+        const uint32_t cube_base = base + (uint32_t)(c * N_LATTICE);
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        /* Place particles — same body as init_rigid_body_cube per-cube block. */
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.vel_x[p] = vx0;
+            ps.vel_y[p] = 0.0f;
+            ps.vel_z[p] = vz0;
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;
+        }
+
+        /* Build this cube's 6 local buckets with the same coloring. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) local[0 + (ix & 1)].push_back({a, idx_of(ix + 1, iy, iz)});
+            if (iy + 1 < LY) local[2 + (iy & 1)].push_back({a, idx_of(ix, iy + 1, iz)});
+            if (iz + 1 < LZ) local[4 + (iz & 1)].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
+        }
+
+        /* Record this cube's joint anchor particle.
+         * Cube 0: top face (iy = LY - 1), centered in (ix, iz).
+         * Cube 1: bottom face (iy = 0), centered in (ix, iz). */
+        int anchor_iy = (c == 0) ? (LY - 1) : 0;
+        joint_anchor[c] = idx_of(LX / 2, anchor_iy, LZ / 2);
+    }
+
+    /* Joint edge: single distance constraint between the two anchor
+     * particles, rest length 1.0 (the y-gap between the facing cube
+     * faces: cube 0 top at y=-0.5, cube 1 bottom at y=+0.5). */
+    super[6].push_back({joint_anchor[0], joint_anchor[1]});
+
+    ConstraintLattice L = {};
+    L.base_index  = base;
+    L.rigid_count = (uint32_t)N_LATTICE_TOT;
+    L.inv_m.assign(N_LATTICE_TOT, 1.0f);
+
+    uint32_t running = 0;
+    for (int k = 0; k < 7; k++) {
+        L.bucket_offsets[k] = running;
+        L.bucket_counts[k]  = (uint32_t)super[k].size();
+        running += L.bucket_counts[k];
+    }
+    L.pairs.reserve(2u * running);
+    L.rest.reserve(running);
+    /* Lattice edges (rest = SPACING). */
+    for (int k = 0; k < 6; k++) {
+        for (auto& pr : super[k]) {
+            L.pairs.push_back(pr.first);
+            L.pairs.push_back(pr.second);
+            L.rest.push_back(SPACING);
+        }
+    }
+    /* Joint edges (rest = 1.0 = y-gap between facing cube faces). */
+    for (auto& pr : super[6]) {
+        L.pairs.push_back(pr.first);
+        L.pairs.push_back(pr.second);
+        L.rest.push_back(1.0f);
+    }
+
+    printf("[rigid] cube2-ballsocket: %d lattice particles, %u constraints "
+           "(5400 lattice + %u joint), buckets=[%u %u %u %u %u %u %u], "
+           "base=%u, joint_anchors=(%u, %u)\n",
+           N_LATTICE_TOT, running, L.bucket_counts[6],
+           L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
+           L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5],
+           L.bucket_counts[6], base, joint_anchor[0], joint_anchor[1]);
     return L;
 }
 
@@ -606,11 +757,12 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--rigid-body") == 0 && i+1 < argc) {
             const char* m = argv[++i];
-            if      (strcmp(m, "off")      == 0) rigid_body_mode = RIGID_BODY_OFF;
-            else if (strcmp(m, "cube1000") == 0) rigid_body_mode = RIGID_BODY_CUBE1000;
+            if      (strcmp(m, "off")              == 0) rigid_body_mode = RIGID_BODY_OFF;
+            else if (strcmp(m, "cube1000")         == 0) rigid_body_mode = RIGID_BODY_CUBE1000;
+            else if (strcmp(m, "cube2-ballsocket") == 0) rigid_body_mode = RIGID_BODY_CUBE2_BALLSOCKET;
             else {
                 fprintf(stderr, "unknown --rigid-body '%s' "
-                                "(expected off or cube1000)\n", m);
+                                "(expected off, cube1000, or cube2-ballsocket)\n", m);
                 return 1;
             }
         }
@@ -626,7 +778,7 @@ int main(int argc, char** argv) {
                    "[--gpu-physics] [--project-only] "
                    "[--scatter-mode baseline|uniform|squaragon] "
                    "[--init-sort none|cell|viviani] "
-                   "[--rigid-body off|cube1000] [--rigid-count N]\n");
+                   "[--rigid-body off|cube1000|cube2-ballsocket] [--rigid-count N]\n");
             return 0;
         }
     }
@@ -642,7 +794,9 @@ int main(int argc, char** argv) {
      * SoA arrays so its indices are known and its presence does not perturb
      * the Viviani sort ordering on the first n_galaxy particles. */
     const int n_galaxy = num_particles;
-    const int n_rigid  = (rigid_body_mode == RIGID_BODY_CUBE1000) ? (rigid_count * 1000) : 0;
+    int n_rigid = 0;
+    if      (rigid_body_mode == RIGID_BODY_CUBE1000)         n_rigid = rigid_count * 1000;
+    else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) n_rigid = 2000;
     num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
 
     /* Init particles — only [0, n_galaxy) gets generated and sorted;
@@ -654,6 +808,8 @@ int main(int argc, char** argv) {
     ConstraintLattice lattice = {};
     if (rigid_body_mode == RIGID_BODY_CUBE1000) {
         lattice = init_rigid_body_cube(particles, n_galaxy, rigid_count);
+    } else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) {
+        lattice = init_rigid_body_cube2_ballsocket(particles, n_galaxy);
     }
 
     /* Init validation oracle */
@@ -722,9 +878,9 @@ int main(int argc, char** argv) {
             particles.N, scatter_mode);
 
         /* Rigid-body constraint solver (Pass 4) — only when --rigid-body != off.
-         * Uses the lattice built by init_rigid_body_cube above. Hardcoded to
+         * Uses the lattice built by init_rigid_body_cube* above. Hardcoded to
          * 4 PBD iterations per frame per the constraint_experiment plan. */
-        if (rigid_body_mode == RIGID_BODY_CUBE1000) {
+        if (rigid_body_mode != RIGID_BODY_OFF) {
             initConstraintCompute(gpuPhys, vkCtx,
                                   lattice.pairs.data(),
                                   lattice.rest.data(),
@@ -835,6 +991,57 @@ int main(int argc, char** argv) {
                    rb_px[0], rb_py[0], rb_pz[0],
                    rb_vx[0], rb_vy[0], rb_vz[0],
                    (unsigned)rb_flags[0]);
+
+            /* Lattice + joint stability probe — fires only when the full
+             * rigid-body particle range [n_galaxy, n_galaxy + n_rigid) fits
+             * inside the oracle readback window (ORACLE_SUBSET_SIZE = 100000).
+             * For -n 99000 --rigid-body cube1000: covers cube 0 at [99000,
+             *   100000). Shows cube-internal distances to neighbors.
+             * For -n 98000 --rigid-body cube2-ballsocket: covers both cubes
+             *   at [98000, 100000). Shows cube-internal distances AND the
+             *   joint anchor distance.
+             * At -n 20M the lattice is at [20M, 20M+n_rigid) which is far
+             * outside the first 100K oracle window, so the probe silently
+             * no-ops — measurement runs are unaffected. */
+            if ((rigid_body_mode == RIGID_BODY_CUBE1000 ||
+                 rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) &&
+                (n_galaxy + n_rigid) <= oracle_count) {
+                int b = n_galaxy;
+                auto dist_idx = [&](int i, int j) -> float {
+                    float dx = rb_px[i] - rb_px[j];
+                    float dy = rb_py[i] - rb_py[j];
+                    float dz = rb_pz[i] - rb_pz[j];
+                    return sqrtf(dx*dx + dy*dy + dz*dz);
+                };
+                /* Cube 0 internal: particle at b+0 is its (ix=0,iy=0,iz=0)
+                 * corner. Neighbors are at +1 (X axis), +10 (Y axis), +100
+                 * (Z axis) — matches the idx_of formula for LX=LY=LZ=10. */
+                float d0_x = dist_idx(b + 0, b + 1);
+                float d0_y = dist_idx(b + 0, b + 10);
+                float d0_z = dist_idx(b + 0, b + 100);
+                printf("[rigid] frame=%d  cube0[0]=(%.3f,%.3f,%.3f)  "
+                       "d(0,1)=%.4f d(0,10)=%.4f d(0,100)=%.4f (rest=0.5)\n",
+                       frame, rb_px[b], rb_py[b], rb_pz[b], d0_x, d0_y, d0_z);
+
+                if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) {
+                    /* Joint anchors: cube 0 (ix=5, iy=9, iz=5) → offset
+                     * 5 + 9*10 + 5*100 = 595. Cube 1 (ix=5, iy=0, iz=5) →
+                     * offset 5 + 0 + 500 = 505. Cube 1's base is b+1000. */
+                    int anchor0 = b + 595;
+                    int anchor1 = b + 1000 + 505;
+                    float d_joint = dist_idx(anchor0, anchor1);
+                    /* Cube 1 internal check: particle at b+1000 is its
+                     * (0,0,0) corner. */
+                    float d1_x = dist_idx(b + 1000, b + 1001);
+                    float d1_y = dist_idx(b + 1000, b + 1010);
+                    float d1_z = dist_idx(b + 1000, b + 1100);
+                    printf("[rigid] frame=%d  cube1[0]=(%.3f,%.3f,%.3f)  "
+                           "d(0,1)=%.4f d(0,10)=%.4f d(0,100)=%.4f  "
+                           "d_joint=%.4f (rest=1.0)\n",
+                           frame, rb_px[b + 1000], rb_py[b + 1000], rb_pz[b + 1000],
+                           d1_x, d1_y, d1_z, d_joint);
+                }
+            }
 
             /* Diagnostic: pump-state histogram + pos/vel/scale distributions */
             readbackPumpStateSample(gpuPhys, vkCtx, rb_pump_state, oracle_count);
