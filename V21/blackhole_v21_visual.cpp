@@ -15,6 +15,9 @@
 #include <cstring>
 #include <cmath>
 #include <chrono>
+#include <cstdint>
+#include <vector>
+#include <algorithm>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -133,7 +136,17 @@ struct ParticleState {
     int N, capacity;
 };
 
-static void init_particles(ParticleState& ps, int N, unsigned int seed) {
+/* Init-time particle sort mode. Affects memory order of the initial
+ * particle arrays — changes cache behavior of downstream per-particle
+ * kernels without changing physics. */
+enum InitSortMode {
+    INIT_SORT_NONE    = 0,  /* original generation order (random) */
+    INIT_SORT_CELL    = 1,  /* sorted by scatter.comp's cell index */
+    INIT_SORT_VIVIANI = 2   /* sorted by Viviani curve parameter (atan2 in xz) */
+};
+
+static void init_particles(ParticleState& ps, int N, unsigned int seed,
+                           InitSortMode sort_mode = INIT_SORT_NONE) {
     ps.N = N;
     ps.capacity = N;
     ps.pos_x = (float*)calloc(N, sizeof(float));
@@ -151,6 +164,16 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed) {
     ps.flags = (uint8_t*)calloc(N, sizeof(uint8_t));
     ps.topo_state = (uint8_t*)calloc(N, sizeof(uint8_t));
 
+    /* Temporary AoS buffer for generation + sort. Free before return. */
+    struct Particle {
+        float px, py, pz;
+        float vx, vy, vz;
+        float theta, omega_nat;
+        uint8_t topo_state;
+    };
+    std::vector<Particle> tmp(N);
+    std::vector<uint64_t> sort_key(N);
+
     srand(seed);
     for (int i = 0; i < N; i++) {
         float x = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * DISK_OUTER_R;
@@ -158,31 +181,77 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed) {
         float z = ((float)rand()/RAND_MAX * 2.0f - 1.0f) * DISK_OUTER_R;
         float r = sqrtf(x*x+y*y+z*z);
         if (r < 6.0f) { float s=6.0f/r; x*=s; y*=s; z*=s; }
-        ps.pos_x[i]=x; ps.pos_y[i]=y; ps.pos_z[i]=z;
+
+        Particle p = {};
+        p.px = x; p.py = y; p.pz = z;
 
         float r_xz = sqrtf(x*x+z*z);
         if (r_xz > 0.1f) {
             float v = sqrtf(BH_MASS / fmaxf(r_xz, ISCO_R));
-            ps.vel_x[i] = -v*(z/r_xz);
-            ps.vel_z[i] =  v*(x/r_xz);
+            p.vx = -v*(z/r_xz);
+            p.vz =  v*(x/r_xz);
         }
-        ps.pump_scale[i] = 1.0f;
-        ps.flags[i] = 0x01;
-        ps.theta[i] = (float)rand()/RAND_MAX * 6.28318f;
-        /* Per-particle phase rate — r-dependent so inner shells advance
-         * faster than outer shells. This is GPT's phase-field solution
-         * to the rigid-rotation problem: instead of all particles sharing
-         * a global cos(theta_pos) target, each particle carries its own
-         * phase that advances at a rate proportional to 1/r. Inner
-         * particles cycle the Viviani target 20× faster than outer
-         * particles, creating the shear that differentiates shells into
-         * a layered galaxy rather than a rigid sheet. */
+        p.theta = (float)rand()/RAND_MAX * 6.28318f;
         float r3d_init = sqrtf(x*x + y*y + z*z);
         float r_eff = fmaxf(r3d_init, ISCO_R);
-        ps.omega_nat[i] = 0.377f / r_eff;  /* ≈ 1 cycle / 100 frames at ISCO */
+        p.omega_nat = 0.377f / r_eff;
         int axis = rand()%4; int sign = (rand()%2)?1:-1;
-        ps.topo_state[i] = (uint8_t)(((sign>0)?1:2) << (axis*2));
+        p.topo_state = (uint8_t)(((sign>0)?1:2) << (axis*2));
+        tmp[i] = p;
+
+        /* Compute sort key based on mode. Both cell and viviani produce
+         * uint64 keys we can sort linearly. */
+        if (sort_mode == INIT_SORT_CELL) {
+            /* Match scatter.comp's cellIndex() math exactly — 64^3 grid
+             * over [-250, +250]. Particles in the same cell get the same
+             * key, so stable sort preserves intra-cell order. */
+            const float half = 250.0f;
+            const int   dim  = 64;
+            const float inv_h = (float)dim / (2.0f * half);
+            int cx = (int)fmaxf(0.0f, fminf((float)(dim-1), (x + half) * inv_h));
+            int cy = (int)fmaxf(0.0f, fminf((float)(dim-1), (y + half) * inv_h));
+            int cz = (int)fmaxf(0.0f, fminf((float)(dim-1), (z + half) * inv_h));
+            sort_key[i] = (uint64_t)(cx + cy * dim + cz * dim * dim);
+        } else if (sort_mode == INIT_SORT_VIVIANI) {
+            /* Primary axis: Viviani curve parameter θ = atan2(pz, px)
+             * mapped to [0, 2π). Inner particles (small r) get a lower-
+             * radix tiebreak so each theta-slice is radially coherent. */
+            float theta_v = atan2f(z, x) + 3.14159265f;   /* [0, 2π) */
+            float r2d = sqrtf(x*x + z*z);
+            /* Pack as uint64: high 32 bits = theta bucket (1024 buckets),
+             * low 32 bits = radius bucket (16384 buckets). */
+            uint32_t theta_bucket = (uint32_t)(theta_v * (1024.0f / 6.28318f));
+            uint32_t r_bucket     = (uint32_t)fminf(16383.0f, r2d * (16384.0f / DISK_OUTER_R));
+            sort_key[i] = ((uint64_t)theta_bucket << 32) | r_bucket;
+        } else {
+            sort_key[i] = (uint64_t)i;  /* identity */
+        }
     }
+
+    /* Build permutation indices and sort by key. */
+    std::vector<uint32_t> perm(N);
+    for (int i = 0; i < N; i++) perm[i] = i;
+    if (sort_mode != INIT_SORT_NONE) {
+        std::stable_sort(perm.begin(), perm.end(),
+            [&sort_key](uint32_t a, uint32_t b) { return sort_key[a] < sort_key[b]; });
+    }
+
+    /* Scatter sorted AoS back into SoA arrays. */
+    for (int i = 0; i < N; i++) {
+        const Particle& p = tmp[perm[i]];
+        ps.pos_x[i] = p.px; ps.pos_y[i] = p.py; ps.pos_z[i] = p.pz;
+        ps.vel_x[i] = p.vx; ps.vel_y[i] = p.vy; ps.vel_z[i] = p.vz;
+        ps.theta[i] = p.theta;
+        ps.omega_nat[i] = p.omega_nat;
+        ps.topo_state[i] = p.topo_state;
+        ps.pump_scale[i] = 1.0f;
+        ps.flags[i] = 0x01;
+    }
+
+    const char* sort_name =
+        (sort_mode == INIT_SORT_CELL)    ? "cell"    :
+        (sort_mode == INIT_SORT_VIVIANI) ? "viviani" : "none";
+    printf("[init] %d particles generated, sort=%s\n", N, sort_name);
 }
 
 /* ========================================================================
@@ -320,6 +389,7 @@ int main(int argc, char** argv) {
     bool use_gpu_physics = false;
     bool project_only = false;
     ScatterMode scatter_mode = SCATTER_MODE_BASELINE;
+    InitSortMode init_sort = INIT_SORT_NONE;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -341,6 +411,17 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--init-sort") == 0 && i+1 < argc) {
+            const char* m = argv[++i];
+            if      (strcmp(m, "none")    == 0) init_sort = INIT_SORT_NONE;
+            else if (strcmp(m, "cell")    == 0) init_sort = INIT_SORT_CELL;
+            else if (strcmp(m, "viviani") == 0) init_sort = INIT_SORT_VIVIANI;
+            else {
+                fprintf(stderr, "unknown --init-sort '%s' "
+                                "(expected none, cell, or viviani)\n", m);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
                    "[--gpu-physics] [--project-only] "
@@ -357,7 +438,7 @@ int main(int argc, char** argv) {
 
     /* Init particles */
     ParticleState particles;
-    init_particles(particles, num_particles, seed);
+    init_particles(particles, num_particles, seed, init_sort);
 
     /* Init validation oracle */
     v21_oracle_t oracle;
