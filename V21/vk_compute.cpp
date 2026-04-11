@@ -375,7 +375,7 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     VkQueryPoolCreateInfo qpInfo = {};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpInfo.queryCount = 8;  /* 2 frames × 4 timestamps */
+    qpInfo.queryCount = 10;  /* 2 frames × 5 timestamps (begin, scatter_end, siphon_end, project_end, tonemap_end) */
     if (vkCreateQueryPool(ctx.device, &qpInfo, nullptr, &phys.queryPool) != VK_SUCCESS)
         throw std::runtime_error("Failed to create timestamp query pool");
 
@@ -386,6 +386,113 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     phys.initialized = true;
     printf("[vk-compute] Physics compute ready (%d particles, %d SSBOs, timestamp period %.2f ns)\n",
            N, VK_COMPUTE_NUM_BINDINGS, phys.timestampPeriodNs);
+
+    /* Pass 1 scatter pipeline (particles → cell grid) */
+    initScatterCompute(phys, ctx);
+}
+
+/* ========================================================================
+ * SCATTER (Pass 1) — particles → cell grid
+ * ======================================================================== */
+
+void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
+    /* --- Allocate grid density buffer (uint[V21_GRID_CELLS]) --- */
+    size_t grid_bytes = (size_t)V21_GRID_CELLS * sizeof(uint32_t);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.gridDensityBuffer, phys.gridDensityMemory, grid_bytes);
+
+    /* --- Allocate particle_cell buffer (uint[N]) --- */
+    size_t pcell_bytes = (size_t)phys.N * sizeof(uint32_t);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.particleCellBuffer, phys.particleCellMemory, pcell_bytes);
+
+    printf("[vk-compute] Scatter grid: %d cells (%.1f MB) + particle_cell (%.1f MB)\n",
+           V21_GRID_CELLS,
+           (double)grid_bytes / (1024.0 * 1024.0),
+           (double)pcell_bytes / (1024.0 * 1024.0));
+
+    /* --- Descriptor set layout for set 1 (grid buffers only) --- */
+    VkDescriptorSetLayoutBinding set1Bindings[2] = {};
+    for (int i = 0; i < 2; i++) {
+        set1Bindings[i].binding = i;
+        set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        set1Bindings[i].descriptorCount = 1;
+        set1Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set1Info = {};
+    set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set1Info.bindingCount = 2;
+    set1Info.pBindings = set1Bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.scatterSet1Layout);
+
+    /* --- Pipeline layout: set 0 = siphon's existing layout, set 1 = grid --- */
+    VkDescriptorSetLayout layouts[2] = { phys.descLayout, phys.scatterSet1Layout };
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(ScatterPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 2;
+    plInfo.pSetLayouts = layouts;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.scatterPipelineLayout);
+
+    /* --- Load scatter.spv and create compute pipeline --- */
+    auto code = readShaderFile("scatter.spv");
+    VkShaderModule mod = createShaderModule(ctx.device, code);
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = mod;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = phys.scatterPipelineLayout;
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                  nullptr, &phys.scatterPipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create scatter compute pipeline");
+
+    vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+    /* --- Descriptor pool + set for set 1 --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 2;
+
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &dpInfo, nullptr, &phys.scatterDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.scatterDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.scatterSet1Layout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.scatterSet1);
+
+    /* --- Write descriptors for set 1 --- */
+    VkDescriptorBufferInfo bufInfos[2] = {
+        { phys.gridDensityBuffer,  0, VK_WHOLE_SIZE },
+        { phys.particleCellBuffer, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[2] = {};
+    for (int i = 0; i < 2; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.scatterSet1;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+
+    printf("[vk-compute] Scatter compute pipeline created\n");
 }
 
 /* ========================================================================
@@ -394,12 +501,63 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                             int frame, float sim_time, float dt) {
-    /* Reset this slot's 4 timestamps and write the siphon-begin marker */
-    uint32_t base = phys.queryFrame * 4;
-    vkCmdResetQueryPool(cmd, phys.queryPool, base, 4);
+    /* Reset this slot's 5 timestamps and write the begin marker */
+    uint32_t base = phys.queryFrame * 5;
+    vkCmdResetQueryPool(cmd, phys.queryPool, base, 5);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         phys.queryPool, base + 0);
 
+    /* ---- Pass 1: Scatter (particles → cell grid) ---------------------- */
+    /* Zero the density buffer before scatter accumulates into it. */
+    vkCmdFillBuffer(cmd, phys.gridDensityBuffer, 0,
+                    (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t), 0);
+
+    /* Barrier: fill must complete before scatter reads/writes density. */
+    {
+        VkMemoryBarrier fillBarrier = {};
+        fillBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        fillBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        fillBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &fillBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.scatterPipeline);
+    VkDescriptorSet scatterSets[2] = { phys.descSet, phys.scatterSet1 };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.scatterPipelineLayout, 0, 2, scatterSets, 0, nullptr);
+
+    ScatterPushConstants scatterPush = {};
+    scatterPush.N              = phys.N;
+    scatterPush.grid_dim       = V21_GRID_DIM;
+    scatterPush.grid_cell_size = V21_GRID_CELL_SIZE;
+    scatterPush.grid_half_size = V21_GRID_HALF_SIZE;
+    vkCmdPushConstants(cmd, phys.scatterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(scatterPush), &scatterPush);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: scatter's writes to grid buffers are not read by siphon, but
+     * they will be read by any future Pass 2/3 shaders. For now this is just
+     * a safety fence; cost is negligible. */
+    {
+        VkMemoryBarrier scatterBarrier = {};
+        scatterBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        scatterBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        scatterBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &scatterBarrier, 0, nullptr, 0, nullptr);
+    }
+
+    /* Scatter end — record after the drain-barrier */
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        phys.queryPool, base + 1);
+
+    /* ---- Siphon (physics) -------------------------------------------- */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
         phys.pipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
@@ -437,7 +595,7 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Siphon end — after the write-visibility barrier drains */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        phys.queryPool, base + 1);
+                        phys.queryPool, base + 2);
 }
 
 /* ========================================================================
@@ -830,9 +988,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Projection end — after compute work drains */
     {
-        uint32_t base = phys.queryFrame * 4;
+        uint32_t base = phys.queryFrame * 5;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            phys.queryPool, base + 2);
+                            phys.queryPool, base + 3);
     }
 
     /* Tone-map render pass */
@@ -876,9 +1034,9 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     /* Tone-map end — after color output drains */
     {
-        uint32_t base = phys.queryFrame * 4;
+        uint32_t base = phys.queryFrame * 5;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            phys.queryPool, base + 3);
+                            phys.queryPool, base + 4);
     }
 
     /* Mark this slot as written so the next readback can consume it */
@@ -891,6 +1049,7 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
  * ======================================================================== */
 
 bool readTimestamps(PhysicsCompute& phys, VkDevice device,
+                    double* out_scatter_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms) {
@@ -901,17 +1060,18 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
     uint32_t slot = phys.queryFrame ^ 1;
     if (!phys.queryValid[slot]) return false;
 
-    uint32_t base = slot * 4;
-    uint64_t ts[4];
-    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 4,
+    uint32_t base = slot * 5;
+    uint64_t ts[5];
+    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 5,
         sizeof(ts), ts, sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (r != VK_SUCCESS) return false;
 
     double nsPerTick = (double)phys.timestampPeriodNs;
-    *out_siphon_ms  = (double)(ts[1] - ts[0]) * nsPerTick / 1.0e6;
-    *out_project_ms = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
-    *out_tonemap_ms = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
+    *out_scatter_ms = (double)(ts[1] - ts[0]) * nsPerTick / 1.0e6;
+    *out_siphon_ms  = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
+    *out_project_ms = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
+    *out_tonemap_ms = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
     return true;
 }
 
@@ -1066,6 +1226,16 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
     vkDestroyPipelineLayout(device, phys.pipelineLayout, nullptr);
     vkDestroyDescriptorSetLayout(device, phys.descLayout, nullptr);
     vkDestroyDescriptorPool(device, phys.descPool, nullptr);
+
+    /* Scatter pipeline + grid buffers */
+    vkDestroyPipeline(device, phys.scatterPipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.scatterPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.scatterSet1Layout, nullptr);
+    vkDestroyDescriptorPool(device, phys.scatterDescPool, nullptr);
+    vkDestroyBuffer(device, phys.gridDensityBuffer, nullptr);
+    vkFreeMemory(device, phys.gridDensityMemory, nullptr);
+    vkDestroyBuffer(device, phys.particleCellBuffer, nullptr);
+    vkFreeMemory(device, phys.particleCellMemory, nullptr);
 
     /* Projection pipeline */
     vkDestroyPipeline(device, phys.projPipeline, nullptr);

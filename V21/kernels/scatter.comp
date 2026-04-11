@@ -1,7 +1,22 @@
-// scatter.comp — Particle-to-cell scatter (density + momentum + phase)
-// ====================================================================
-// GLSL equivalent of scatterParticlesToCells (CUDA).
-// Each thread processes one particle, atomically accumulating into grid cells.
+// scatter.comp — Particle-to-cell scatter (density + particle_cell assignment)
+// ============================================================================
+// Pass 1 of the three-pass streaming architecture:
+//   Pass 1: Particles → Cells (this file — scatter with atomicAdd)
+//   Pass 2: Cells → Cells      (stencil, pending)
+//   Pass 3: Cells → Particles  (gather.comp, pending wiring)
+//
+// Each thread processes one particle. It computes which cell the particle
+// falls in, writes the cell index back to particle_cell[i], and atomically
+// increments grid_density[cell].
+//
+// Set 0 matches siphon.comp's particle SSBO layout exactly so this shader
+// can share the existing siphon descriptor set. Only bindings 0-2 (pos) and
+// 14 (flags) are read — the others are declared for layout compatibility
+// but left unused.
+//
+// Set 1 holds only the two buffers this pass actually writes:
+//   binding 0: grid_density[grid_cells]      (uint, atomicAdd target)
+//   binding 1: particle_cell[N]              (uint, 1:1 with particles)
 //
 // Dispatch: ceil(N / 256) workgroups
 
@@ -9,43 +24,52 @@
 
 layout(local_size_x = 256) in;
 
-// Particle buffers (SoA)
-layout(std430, set = 0, binding = 0) readonly buffer PosX   { float pos_x[];   };
-layout(std430, set = 0, binding = 1) readonly buffer PosY   { float pos_y[];   };
-layout(std430, set = 0, binding = 2) readonly buffer PosZ   { float pos_z[];   };
-layout(std430, set = 0, binding = 3) readonly buffer VelX   { float vel_x[];   };
-layout(std430, set = 0, binding = 4) readonly buffer VelY   { float vel_y[];   };
-layout(std430, set = 0, binding = 5) readonly buffer VelZ   { float vel_z[];   };
-layout(std430, set = 0, binding = 6) readonly buffer Theta  { float theta[];   };
-layout(std430, set = 0, binding = 7) readonly buffer Flags  { uint  flags[];   };
+// ----------------------------------------------------------------------------
+// Set 0 — particle SSBOs, identical layout to siphon.comp
+// Only bindings 0, 1, 2, 14 are read. Others are placeholder declarations so
+// we can share siphon's descriptor set without breaking the layout.
+// ----------------------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  readonly buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  readonly buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  readonly buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  readonly buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) readonly buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) readonly buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) readonly buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) readonly buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion { uint  in_active_region[]; };
 
-// Grid buffers (accumulation targets — atomicAdd)
-// Using uint for atomic operations; reinterpret as float on read
-layout(std430, set = 1, binding = 0) buffer GridDensity { uint grid_density[];   };
-layout(std430, set = 1, binding = 1) buffer GridMomX   { uint grid_momentum_x[];};
-layout(std430, set = 1, binding = 2) buffer GridMomY   { uint grid_momentum_y[];};
-layout(std430, set = 1, binding = 3) buffer GridMomZ   { uint grid_momentum_z[];};
-layout(std430, set = 1, binding = 4) buffer GridPhaseS { uint grid_phase_sin[]; };
-layout(std430, set = 1, binding = 5) buffer GridPhaseC { uint grid_phase_cos[]; };
-layout(std430, set = 1, binding = 6) buffer ParticleCell { uint particle_cell[];};
+// ----------------------------------------------------------------------------
+// Set 1 — grid SSBOs (new)
+// ----------------------------------------------------------------------------
+layout(std430, set = 1, binding = 0) buffer GridDensity  { uint grid_density[];  };
+layout(std430, set = 1, binding = 1) buffer ParticleCell { uint particle_cell[]; };
 
-layout(push_constant) uniform PushConstants {
+// ----------------------------------------------------------------------------
+// Push constants
+// ----------------------------------------------------------------------------
+layout(push_constant) uniform ScatterPushConstants {
     int   N;
     int   grid_dim;
     float grid_cell_size;
     float grid_half_size;
 } pc;
 
-const uint PFLAG_ACTIVE = 0x01u;
-
-// Note: Float atomic add requires GL_EXT_shader_atomic_float extension
-// or a CAS loop on the SSBO element. For now, density uses uint atomics
-// and momentum/phase accumulation is deferred to a separate pass.
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
 
 uint cellIndex(float px, float py, float pz) {
-    uint cx = uint(clamp((px + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
-    uint cy = uint(clamp((py + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
-    uint cz = uint(clamp((pz + pc.grid_half_size) / pc.grid_cell_size, 0.0, float(pc.grid_dim - 1)));
+    float inv_h = 1.0 / pc.grid_cell_size;
+    uint cx = uint(clamp((px + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
+    uint cy = uint(clamp((py + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
+    uint cz = uint(clamp((pz + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
     return cx + cy * uint(pc.grid_dim) + cz * uint(pc.grid_dim * pc.grid_dim);
 }
 
@@ -53,7 +77,10 @@ void main() {
     int i = int(gl_GlobalInvocationID.x);
     if (i >= pc.N) return;
 
-    if ((flags[i] & PFLAG_ACTIVE) == 0u) return;
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if (in_active_region[i] == 0u) return;
 
     float px = pos_x[i];
     float py = pos_y[i];
@@ -63,16 +90,11 @@ void main() {
     uint total_cells = uint(pc.grid_dim * pc.grid_dim * pc.grid_dim);
     if (cell >= total_cells) return;
 
-    // Store cell assignment for gather phase
+    // Store cell assignment for downstream passes (stencil / gather)
     particle_cell[i] = cell;
 
-    // Atomic accumulation (using integer atomics, will convert on read)
+    // Atomic density accumulation. THIS is the contention point that Squaragon's
+    // scatter LUT is designed to alleviate — 20M particles racing on a handful
+    // of dense-region cell indices.
     atomicAdd(grid_density[cell], 1u);
-
-    // For momentum and phase, we need float atomics.
-    // GLSL 4.5 supports atomicAdd on uint SSBOs. Float atomics
-    // require the GL_EXT_shader_atomic_float extension or CAS loop.
-    // For now, accumulate density only (uint-safe).
-    // Momentum and phase accumulation will use the CAS pattern or
-    // a separate reduction pass.
 }

@@ -455,7 +455,8 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
 
     /* GPU timestamp accumulators for profiling */
-    double gpu_siphon_sum = 0.0, gpu_project_sum = 0.0, gpu_tonemap_sum = 0.0;
+    double gpu_scatter_sum = 0.0, gpu_siphon_sum = 0.0;
+    double gpu_project_sum = 0.0, gpu_tonemap_sum = 0.0;
     int gpu_samples = 0;
 
     while (!glfwWindowShouldClose(window)) {
@@ -668,8 +669,9 @@ int main(int argc, char** argv) {
 
         /* Sample GPU timestamps (non-blocking; silently skipped if not ready) */
         if (use_gpu_physics) {
-            double s_ms = 0, p_ms = 0, t_ms = 0;
-            if (readTimestamps(gpuPhys, vkCtx.device, &s_ms, &p_ms, &t_ms)) {
+            double sc_ms = 0, s_ms = 0, p_ms = 0, t_ms = 0;
+            if (readTimestamps(gpuPhys, vkCtx.device, &sc_ms, &s_ms, &p_ms, &t_ms)) {
+                gpu_scatter_sum += sc_ms;
                 gpu_siphon_sum  += s_ms;
                 gpu_project_sum += p_ms;
                 gpu_tonemap_sum += t_ms;
@@ -688,17 +690,21 @@ int main(int argc, char** argv) {
         /* GPU breakdown — print every 500 frames */
         if (use_gpu_physics && frame % 500 == 0 && gpu_samples > 0) {
             double inv = 1.0 / (double)gpu_samples;
-            double s = gpu_siphon_sum * inv;
-            double p = gpu_project_sum * inv;
-            double t = gpu_tonemap_sum * inv;
-            double total = s + p + t;
-            printf("[gpu] siphon=%.3f ms (%4.1f%%)  project=%.3f ms (%4.1f%%)  "
-                   "tonemap=%.3f ms (%4.1f%%)  total=%.3f ms  (%d samples)\n",
-                   s, 100.0 * s / total,
-                   p, 100.0 * p / total,
-                   t, 100.0 * t / total,
+            double sc = gpu_scatter_sum * inv;
+            double s  = gpu_siphon_sum  * inv;
+            double p  = gpu_project_sum * inv;
+            double t  = gpu_tonemap_sum * inv;
+            double total = sc + s + p + t;
+            printf("[gpu] scatter=%.3f ms (%4.1f%%)  siphon=%.3f ms (%4.1f%%)  "
+                   "project=%.3f ms (%4.1f%%)  tonemap=%.3f ms (%4.1f%%)  "
+                   "total=%.3f ms  (%d samples)\n",
+                   sc, 100.0 * sc / total,
+                   s,  100.0 * s  / total,
+                   p,  100.0 * p  / total,
+                   t,  100.0 * t  / total,
                    total, gpu_samples);
-            gpu_siphon_sum = gpu_project_sum = gpu_tonemap_sum = 0.0;
+            gpu_scatter_sum = gpu_siphon_sum = 0.0;
+            gpu_project_sum = gpu_tonemap_sum = 0.0;
             gpu_samples = 0;
         }
     }

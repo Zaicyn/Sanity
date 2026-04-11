@@ -30,6 +30,20 @@ struct SiphonPushConstants {
     float bias;
 };
 
+/* Push constants for scatter.comp */
+struct ScatterPushConstants {
+    int   N;
+    int   grid_dim;
+    float grid_cell_size;
+    float grid_half_size;
+};
+
+/* Cell grid constants (must match scatter.comp) */
+#define V21_GRID_DIM        64
+#define V21_GRID_CELLS      (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
+#define V21_GRID_HALF_SIZE  250.0f
+#define V21_GRID_CELL_SIZE  (2.0f * V21_GRID_HALF_SIZE / (float)V21_GRID_DIM)
+
 /* Push constants for project.comp */
 struct ProjectPushConstants {
     int   particle_count;
@@ -70,6 +84,17 @@ struct PhysicsCompute {
     VkPipeline pipeline;
     VkDescriptorPool descPool;
     VkDescriptorSet descSet;
+
+    /* Scatter compute pipeline (particles → cell grid, Pass 1) */
+    VkBuffer              gridDensityBuffer;     /* uint[V21_GRID_CELLS] */
+    VkDeviceMemory        gridDensityMemory;
+    VkBuffer              particleCellBuffer;    /* uint[N] */
+    VkDeviceMemory        particleCellMemory;
+    VkDescriptorSetLayout scatterSet1Layout;     /* layout for set 1 (grid only) */
+    VkPipelineLayout      scatterPipelineLayout; /* uses desc set 0 (shared with siphon) + set 1 */
+    VkPipeline            scatterPipeline;
+    VkDescriptorPool      scatterDescPool;
+    VkDescriptorSet       scatterSet1;           /* the grid buffer set */
 
     /* Projection compute pipeline (rendering) */
     VkDescriptorSetLayout projDescLayout;
@@ -130,6 +155,9 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                             int frame, float sim_time, float dt);
 
+/* Initialize scatter compute pipeline + grid SSBOs (Pass 1 of streaming arch) */
+void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx);
+
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
 
@@ -154,9 +182,10 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
                        int count);
 
 /* Read back GPU timestamps from the previous frame (non-blocking).
- * Writes ms values to out_siphon_ms, out_project_ms, out_tonemap_ms.
+ * Writes ms values to out_scatter_ms, out_siphon_ms, out_project_ms, out_tonemap_ms.
  * Returns true if results are valid, false if not yet available. */
 bool readTimestamps(PhysicsCompute& phys, VkDevice device,
+                    double* out_scatter_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms);
