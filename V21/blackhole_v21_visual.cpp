@@ -300,105 +300,135 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed,
  * Returns the constraint pair list bucketed into 6 vertex-disjoint groups
  * by (axis, parity-of-starting-endpoint) so the GPU solver can do true
  * Gauss-Seidel without atomics or graph coloring at runtime. */
-static ConstraintLattice init_rigid_body_cube(ParticleState& ps, int n_galaxy) {
+static ConstraintLattice init_rigid_body_cube(ParticleState& ps,
+                                              int n_galaxy,
+                                              int n_cubes) {
     const int   LX = 10, LY = 10, LZ = 10;
-    const int   N_LATTICE = LX * LY * LZ;   /* 1000 */
-    const float SPACING = 0.5f;
-    const float cx = 50.0f, cy = 0.0f, cz = 0.0f;
+    const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
+    const int   N_LATTICE_TOT = n_cubes * N_LATTICE;
+    const float SPACING       = 0.5f;
+    const float R_ORBIT       = 50.0f;
 
-    if (n_galaxy + N_LATTICE > ps.N) {
-        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + lattice=%d\n",
-                ps.N, n_galaxy, N_LATTICE);
+    if (n_galaxy + N_LATTICE_TOT > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
+                        "%d cubes (%d lattice particles)\n",
+                ps.N, n_galaxy, n_cubes, N_LATTICE_TOT);
         return ConstraintLattice{};
     }
 
     const uint32_t base = (uint32_t)n_galaxy;
-    auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
-        return base + (uint32_t)(ix + iy * LX + iz * LX * LY);
-    };
 
-    /* Lattice positions + circular orbit velocity + active flag.
-     * The Viviani field applies rotational transport only (|v| invariant by
-     * construction), so particles with zero velocity sit still — which means
-     * a zero-v lattice would never feel the galactic environment and the
-     * constraint solver would have nothing to push against. Give every
-     * lattice particle the same rigid-body circular-orbit velocity that a
-     * galaxy particle at the lattice CENTER would have. This makes the whole
-     * cube orbit as a rigid body, letting the Viviani field's differential
-     * rotation try to shear it apart while constraints pull it back. */
-    const float r_center = sqrtf(cx * cx + cy * cy + cz * cz);
-    const float v_orbit  = (r_center > 0.1f)
-                         ? sqrtf(BH_MASS / fmaxf(r_center, ISCO_R))
-                         : 0.0f;
-    /* Tangential direction in the xz plane: perpendicular to (cx,cz). */
-    const float r_xz   = sqrtf(cx * cx + cz * cz);
-    const float vx0    = (r_xz > 0.1f) ? -v_orbit * (cz / r_xz) : 0.0f;
-    const float vz0    = (r_xz > 0.1f) ?  v_orbit * (cx / r_xz) : 0.0f;
-
-    for (int iz = 0; iz < LZ; iz++)
-    for (int iy = 0; iy < LY; iy++)
-    for (int ix = 0; ix < LX; ix++) {
-        uint32_t p = idx_of(ix, iy, iz);
-        ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
-        ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
-        ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
-        ps.vel_x[p] = vx0;
-        ps.vel_y[p] = 0.0f;
-        ps.vel_z[p] = vz0;
-        ps.theta[p] = 0.0f;
-        ps.omega_nat[p] = 0.1f;
-        ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
-        ps.pump_scale[p] = 1.0f;
-        ps.topo_state[p] = 0x01;        /* any non-zero topo state */
+    /* Per-cube edge buckets, concatenated into 6 super-buckets in cube order.
+     * Within one super-bucket no two edges share an endpoint because (a) each
+     * cube's own bucket k is vertex-disjoint by the (axis × parity) coloring
+     * and (b) different cubes occupy disjoint index ranges
+     * [base + c·1000, base + (c+1)·1000). So GPU Gauss-Seidel holds without
+     * atomics, same as the single-cube MVP, at any cube count. Total GPU
+     * dispatches per frame stays at 24 (4 iters × 6 buckets) regardless of N. */
+    std::vector<std::pair<uint32_t, uint32_t>> super[6];
+    for (int k = 0; k < 6; k++) {
+        super[k].reserve((size_t)n_cubes * 450);
     }
 
-    /* Build 6 vertex-disjoint buckets:
-     *   0 = X_even, 1 = X_odd, 2 = Y_even, 3 = Y_odd, 4 = Z_even, 5 = Z_odd
-     * Within one bucket no two edges share an endpoint, so the solver can
-     * write pos[i] and pos[j] without races. */
-    std::vector<std::pair<uint32_t, uint32_t>> b[6];
-    for (int iz = 0; iz < LZ; iz++)
-    for (int iy = 0; iy < LY; iy++)
-    for (int ix = 0; ix < LX; ix++) {
-        uint32_t a = idx_of(ix, iy, iz);
-        if (ix + 1 < LX) {
-            int bucket = 0 + (ix & 1);
-            b[bucket].push_back({a, idx_of(ix + 1, iy, iz)});
+    for (int c = 0; c < n_cubes; c++) {
+        /* Azimuthal placement on the r=50 circle. For N=1 this collapses to
+         * theta=0 → (cx,cy,cz) = (50, 0, 0), bit-identical to the MVP. */
+        const float theta = 2.0f * 3.14159265f * (float)c / (float)n_cubes;
+        const float cx = R_ORBIT * cosf(theta);
+        const float cy = 0.0f;
+        const float cz = R_ORBIT * sinf(theta);
+
+        /* Circular-orbit velocity tangent to this cube's own center.
+         * Viviani field is rotational transport only (|v| invariant), so a
+         * zero-v lattice would sit still and the constraint solver would have
+         * nothing to push against. Each cube gets the velocity a galaxy
+         * particle at its center would carry, so it orbits as a rigid body
+         * while differential rotation tries to shear it. */
+        const float r_center = sqrtf(cx * cx + cy * cy + cz * cz);
+        const float v_orbit  = (r_center > 0.1f)
+                             ? sqrtf(BH_MASS / fmaxf(r_center, ISCO_R))
+                             : 0.0f;
+        const float r_xz = sqrtf(cx * cx + cz * cz);
+        const float vx0  = (r_xz > 0.1f) ? -v_orbit * (cz / r_xz) : 0.0f;
+        const float vz0  = (r_xz > 0.1f) ?  v_orbit * (cx / r_xz) : 0.0f;
+
+        const uint32_t cube_base = base + (uint32_t)(c * N_LATTICE);
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        /* Place this cube's 1000 particles. Same nested-loop order as MVP, so
+         * for n_cubes==1 the SoA writes are bit-identical to commit eda621d. */
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.vel_x[p] = vx0;
+            ps.vel_y[p] = 0.0f;
+            ps.vel_z[p] = vz0;
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;        /* any non-zero topo state */
         }
-        if (iy + 1 < LY) {
-            int bucket = 2 + (iy & 1);
-            b[bucket].push_back({a, idx_of(ix, iy + 1, iz)});
+
+        /* Build this cube's 6 local buckets with the same (axis × parity)
+         * coloring as the MVP. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) {
+                int bucket = 0 + (ix & 1);
+                local[bucket].push_back({a, idx_of(ix + 1, iy, iz)});
+            }
+            if (iy + 1 < LY) {
+                int bucket = 2 + (iy & 1);
+                local[bucket].push_back({a, idx_of(ix, iy + 1, iz)});
+            }
+            if (iz + 1 < LZ) {
+                int bucket = 4 + (iz & 1);
+                local[bucket].push_back({a, idx_of(ix, iy, iz + 1)});
+            }
         }
-        if (iz + 1 < LZ) {
-            int bucket = 4 + (iz & 1);
-            b[bucket].push_back({a, idx_of(ix, iy, iz + 1)});
+
+        /* Concat this cube's locals onto the super-buckets in cube order.
+         * Cube 0 first, then cube 1, ... — deterministic ordering so N=1
+         * produces a flattened pair list bit-identical to the MVP. */
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
         }
     }
 
     ConstraintLattice L;
     L.base_index  = base;
-    L.rigid_count = (uint32_t)N_LATTICE;
-    L.inv_m.assign(N_LATTICE, 1.0f);
+    L.rigid_count = (uint32_t)N_LATTICE_TOT;
+    L.inv_m.assign(N_LATTICE_TOT, 1.0f);
 
     uint32_t running = 0;
     for (int k = 0; k < 6; k++) {
         L.bucket_offsets[k] = running;
-        L.bucket_counts[k]  = (uint32_t)b[k].size();
+        L.bucket_counts[k]  = (uint32_t)super[k].size();
         running += L.bucket_counts[k];
     }
-    L.pairs.reserve(2 * running);
+    L.pairs.reserve(2u * running);
     L.rest.reserve(running);
     for (int k = 0; k < 6; k++) {
-        for (auto& pr : b[k]) {
+        for (auto& pr : super[k]) {
             L.pairs.push_back(pr.first);
             L.pairs.push_back(pr.second);
             L.rest.push_back(SPACING);      /* regular grid → uniform rest length */
         }
     }
 
-    printf("[rigid] cube1000: %d particles @ (%.1f, %.1f, %.1f), %u constraints, "
-           "buckets=[%u %u %u %u %u %u], base=%u\n",
-           N_LATTICE, cx, cy, cz, running,
+    printf("[rigid] cube1000 x%d on r=%.0f circle: %d lattice particles, "
+           "%u constraints, buckets=[%u %u %u %u %u %u], base=%u\n",
+           n_cubes, R_ORBIT, N_LATTICE_TOT, running,
            L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
            L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5], base);
     return L;
@@ -541,6 +571,7 @@ int main(int argc, char** argv) {
     ScatterMode scatter_mode = SCATTER_MODE_BASELINE;
     InitSortMode init_sort = INIT_SORT_NONE;
     RigidBodyMode rigid_body_mode = RIGID_BODY_OFF;
+    int rigid_count = 1;   /* number of cubes; only meaningful when --rigid-body cube1000 */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -583,12 +614,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--rigid-count") == 0 && i+1 < argc) {
+            rigid_count = atoi(argv[++i]);
+            if (rigid_count < 1) {
+                fprintf(stderr, "--rigid-count must be >= 1 (got %d)\n", rigid_count);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
                    "[--gpu-physics] [--project-only] "
                    "[--scatter-mode baseline|uniform|squaragon] "
                    "[--init-sort none|cell|viviani] "
-                   "[--rigid-body off|cube1000]\n");
+                   "[--rigid-body off|cube1000] [--rigid-count N]\n");
             return 0;
         }
     }
@@ -604,7 +642,7 @@ int main(int argc, char** argv) {
      * SoA arrays so its indices are known and its presence does not perturb
      * the Viviani sort ordering on the first n_galaxy particles. */
     const int n_galaxy = num_particles;
-    const int n_rigid  = (rigid_body_mode == RIGID_BODY_CUBE1000) ? 1000 : 0;
+    const int n_rigid  = (rigid_body_mode == RIGID_BODY_CUBE1000) ? (rigid_count * 1000) : 0;
     num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
 
     /* Init particles — only [0, n_galaxy) gets generated and sorted;
@@ -615,7 +653,7 @@ int main(int argc, char** argv) {
     /* Fill the trailing lattice slots (if enabled) before the GPU upload. */
     ConstraintLattice lattice = {};
     if (rigid_body_mode == RIGID_BODY_CUBE1000) {
-        lattice = init_rigid_body_cube(particles, n_galaxy);
+        lattice = init_rigid_body_cube(particles, n_galaxy, rigid_count);
     }
 
     /* Init validation oracle */
