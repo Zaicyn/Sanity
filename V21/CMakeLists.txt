@@ -32,16 +32,17 @@ set(SPV_DIR    ${CMAKE_CURRENT_BINARY_DIR}/kernels)
 
 file(MAKE_DIRECTORY ${SPV_DIR})
 
+# Single-variant shaders (compiled once with no defines)
 set(KERNEL_SOURCES
     ${KERNEL_DIR}/siphon.comp
     ${KERNEL_DIR}/passive.comp
     ${KERNEL_DIR}/hopfion.comp
-    ${KERNEL_DIR}/scatter.comp
     ${KERNEL_DIR}/gather.comp
     ${KERNEL_DIR}/spawn.comp
     ${KERNEL_DIR}/region.comp
     ${KERNEL_DIR}/accumulator.comp
     ${KERNEL_DIR}/project.comp
+    ${KERNEL_DIR}/scatter_reduce.comp
 )
 
 set(SPV_OUTPUTS)
@@ -55,6 +56,28 @@ foreach(SHADER ${KERNEL_SOURCES})
         COMMENT "Compiling ${SHADER_NAME}.comp → ${SHADER_NAME}.spv"
     )
     list(APPEND SPV_OUTPUTS ${SPV_FILE})
+endforeach()
+
+# scatter.comp is compiled THREE times with different V21_SCATTER_MODE defines
+# (0 = baseline, 1 = privatized uniform, 2 = privatized squaragon).
+set(SCATTER_SRC ${KERNEL_DIR}/scatter.comp)
+set(SCATTER_VARIANTS
+    "baseline:0"
+    "uniform:1"
+    "squaragon:2"
+)
+foreach(VARIANT ${SCATTER_VARIANTS})
+    string(REPLACE ":" ";" PARTS ${VARIANT})
+    list(GET PARTS 0 VARIANT_NAME)
+    list(GET PARTS 1 VARIANT_MODE)
+    set(SCATTER_SPV ${SPV_DIR}/scatter_${VARIANT_NAME}.spv)
+    add_custom_command(
+        OUTPUT ${SCATTER_SPV}
+        COMMAND ${GLSLC} -DV21_SCATTER_MODE=${VARIANT_MODE} ${SCATTER_SRC} -o ${SCATTER_SPV}
+        DEPENDS ${SCATTER_SRC}
+        COMMENT "Compiling scatter.comp [mode=${VARIANT_NAME}] → scatter_${VARIANT_NAME}.spv"
+    )
+    list(APPEND SPV_OUTPUTS ${SCATTER_SPV})
 endforeach()
 
 add_custom_target(v21_shaders ALL DEPENDS ${SPV_OUTPUTS})

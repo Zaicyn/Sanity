@@ -1,33 +1,31 @@
-// scatter.comp — Particle-to-cell scatter (density + particle_cell assignment)
-// ============================================================================
-// Pass 1 of the three-pass streaming architecture:
-//   Pass 1: Particles → Cells (this file — scatter with atomicAdd)
-//   Pass 2: Cells → Cells      (stencil, pending)
-//   Pass 3: Cells → Particles  (gather.comp, pending wiring)
+// scatter.comp — Particle-to-cell scatter (Pass 1), three compile variants
+// ===========================================================================
+// Compile-time variant selector (define at glslc invocation):
+//   -DV21_SCATTER_MODE=0  → baseline (1 shard, max atomic contention)
+//   -DV21_SCATTER_MODE=1  → privatized uniform (8 shards, shard = lane & 7)
+//   -DV21_SCATTER_MODE=2  → privatized squaragon (8 shards, LUT-derived)
 //
-// Each thread processes one particle. It computes which cell the particle
-// falls in, writes the cell index back to particle_cell[i], and atomically
-// increments grid_density[cell].
+// The three variants have IDENTICAL memory footprint (N_SHARDS * CELLS for
+// modes 1 and 2, N_SHARDS * CELLS for mode 0 with only shard 0 used, so we
+// waste 7/8 of the buffer in baseline mode — but that keeps the descriptor
+// layout uniform across variants and the reduce pass works for all three).
 //
-// Set 0 matches siphon.comp's particle SSBO layout exactly so this shader
-// can share the existing siphon descriptor set. Only bindings 0-2 (pos) and
-// 14 (flags) are read — the others are declared for layout compatibility
-// but left unused.
+// After this pass, scatter_reduce.comp sums the 8 shards into grid_density[].
 //
-// Set 1 holds only the two buffers this pass actually writes:
-//   binding 0: grid_density[grid_cells]      (uint, atomicAdd target)
-//   binding 1: particle_cell[N]              (uint, 1:1 with particles)
-//
-// Dispatch: ceil(N / 256) workgroups
+// Dispatch: ceil(N / 256) workgroups, 256 threads per group.
 
 #version 450
+
+#ifndef V21_SCATTER_MODE
+#define V21_SCATTER_MODE 0
+#endif
+
+#define V21_GRID_SHARD_COUNT 8u
 
 layout(local_size_x = 256) in;
 
 // ----------------------------------------------------------------------------
-// Set 0 — particle SSBOs, identical layout to siphon.comp
-// Only bindings 0, 1, 2, 14 are read. Others are placeholder declarations so
-// we can share siphon's descriptor set without breaking the layout.
+// Set 0 — siphon-compatible particle SSBO layout
 // ----------------------------------------------------------------------------
 layout(std430, set = 0, binding = 0)  readonly buffer PosX         { float pos_x[];          };
 layout(std430, set = 0, binding = 1)  readonly buffer PosY         { float pos_y[];          };
@@ -47,14 +45,13 @@ layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags
 layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion { uint  in_active_region[]; };
 
 // ----------------------------------------------------------------------------
-// Set 1 — grid SSBOs (new)
+// Set 1 — scatter output buffers
+//   binding 0: grid_density_shards[N_SHARDS * total_cells]
+//   binding 1: particle_cell[N]
 // ----------------------------------------------------------------------------
-layout(std430, set = 1, binding = 0) buffer GridDensity  { uint grid_density[];  };
-layout(std430, set = 1, binding = 1) buffer ParticleCell { uint particle_cell[]; };
+layout(std430, set = 1, binding = 0) buffer GridDensityShards { uint grid_density_shards[]; };
+layout(std430, set = 1, binding = 1) buffer ParticleCell      { uint particle_cell[]; };
 
-// ----------------------------------------------------------------------------
-// Push constants
-// ----------------------------------------------------------------------------
 layout(push_constant) uniform ScatterPushConstants {
     int   N;
     int   grid_dim;
@@ -64,6 +61,36 @@ layout(push_constant) uniform ScatterPushConstants {
 
 const uint PFLAG_ACTIVE  = 0x01u;
 const uint PFLAG_EJECTED = 0x02u;
+
+// ----------------------------------------------------------------------------
+// Squaragon scatter LUT (V21_SCATTER_LUT from v21_geometry.h line 98)
+// Precomputed O(1) contention-free distribution table — 32 entries, values
+// in [0, 7].
+// ----------------------------------------------------------------------------
+#if V21_SCATTER_MODE == 2
+const uint SQ_SCATTER_LUT[32] = uint[32](
+    6u, 5u, 4u, 1u, 6u, 7u, 1u, 2u, 0u, 0u, 1u, 5u, 6u, 3u, 4u, 7u,
+    6u, 5u, 4u, 1u, 6u, 7u, 1u, 2u, 0u, 0u, 1u, 5u, 6u, 3u, 4u, 7u
+);
+#endif
+
+// ----------------------------------------------------------------------------
+// Shard selector — one of the three modes
+// ----------------------------------------------------------------------------
+uint pickShard(uint lane_id) {
+#if V21_SCATTER_MODE == 0
+    // Baseline: single shard. Every thread writes to shard 0, maximum contention.
+    return 0u;
+#elif V21_SCATTER_MODE == 1
+    // Privatized uniform: round-robin by lane id, 8 shards.
+    return lane_id & 7u;
+#elif V21_SCATTER_MODE == 2
+    // Privatized Squaragon: lane → LUT → [0, 7].
+    return SQ_SCATTER_LUT[lane_id & 31u] & 7u;
+#else
+#error "V21_SCATTER_MODE must be 0, 1, or 2"
+#endif
+}
 
 uint cellIndex(float px, float py, float pz) {
     float inv_h = 1.0 / pc.grid_cell_size;
@@ -90,11 +117,16 @@ void main() {
     uint total_cells = uint(pc.grid_dim * pc.grid_dim * pc.grid_dim);
     if (cell >= total_cells) return;
 
-    // Store cell assignment for downstream passes (stencil / gather)
+    // Record the particle's cell for downstream Pass 2/3 consumers.
     particle_cell[i] = cell;
 
-    // Atomic density accumulation. THIS is the contention point that Squaragon's
-    // scatter LUT is designed to alleviate — 20M particles racing on a handful
-    // of dense-region cell indices.
-    atomicAdd(grid_density[cell], 1u);
+    // Pick a shard for this lane. gl_LocalInvocationID.x is the lane within
+    // the workgroup; for a 256-thread workgroup the lane within a warp is
+    // (local_id & 31).
+    uint lane_in_warp = gl_LocalInvocationID.x & 31u;
+    uint shard = pickShard(lane_in_warp);
+
+    // Atomic add to the chosen shard's cell slot.
+    uint shard_offset = shard * total_cells + cell;
+    atomicAdd(grid_density_shards[shard_offset], 1u);
 }

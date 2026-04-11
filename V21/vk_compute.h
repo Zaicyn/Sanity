@@ -38,11 +38,24 @@ struct ScatterPushConstants {
     float grid_half_size;
 };
 
+/* Push constants for scatter_reduce.comp */
+struct ScatterReducePushConstants {
+    int total_cells;
+};
+
 /* Cell grid constants (must match scatter.comp) */
-#define V21_GRID_DIM        64
-#define V21_GRID_CELLS      (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
-#define V21_GRID_HALF_SIZE  250.0f
-#define V21_GRID_CELL_SIZE  (2.0f * V21_GRID_HALF_SIZE / (float)V21_GRID_DIM)
+#define V21_GRID_DIM          64
+#define V21_GRID_CELLS        (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
+#define V21_GRID_HALF_SIZE    250.0f
+#define V21_GRID_CELL_SIZE    (2.0f * V21_GRID_HALF_SIZE / (float)V21_GRID_DIM)
+#define V21_GRID_SHARD_COUNT  8
+
+/* Scatter contention-mode selector (A/B/C test for Squaragon thesis). */
+enum ScatterMode {
+    SCATTER_MODE_BASELINE  = 0,  /* 1 shard, maximum atomic contention */
+    SCATTER_MODE_UNIFORM   = 1,  /* 8 shards, uniform lane & 7 selector */
+    SCATTER_MODE_SQUARAGON = 2   /* 8 shards, V21_SCATTER_LUT[lane&31] & 7 */
+};
 
 /* Push constants for project.comp */
 struct ProjectPushConstants {
@@ -86,15 +99,25 @@ struct PhysicsCompute {
     VkDescriptorSet descSet;
 
     /* Scatter compute pipeline (particles → cell grid, Pass 1) */
-    VkBuffer              gridDensityBuffer;     /* uint[V21_GRID_CELLS] */
+    ScatterMode           scatterMode;           /* 0=baseline, 1=uniform, 2=squaragon */
+    VkBuffer              gridDensityBuffer;     /* uint[V21_GRID_CELLS] — canonical, after reduce */
     VkDeviceMemory        gridDensityMemory;
+    VkBuffer              gridDensityShardsBuffer; /* uint[SHARD_COUNT * V21_GRID_CELLS] */
+    VkDeviceMemory        gridDensityShardsMemory;
     VkBuffer              particleCellBuffer;    /* uint[N] */
     VkDeviceMemory        particleCellMemory;
-    VkDescriptorSetLayout scatterSet1Layout;     /* layout for set 1 (grid only) */
+    VkDescriptorSetLayout scatterSet1Layout;     /* layout for set 1 (shards + particle_cell) */
     VkPipelineLayout      scatterPipelineLayout; /* uses desc set 0 (shared with siphon) + set 1 */
     VkPipeline            scatterPipeline;
     VkDescriptorPool      scatterDescPool;
-    VkDescriptorSet       scatterSet1;           /* the grid buffer set */
+    VkDescriptorSet       scatterSet1;
+
+    /* Scatter reduce pipeline (8 shards → 1 canonical density) */
+    VkDescriptorSetLayout scatterReduceSetLayout;
+    VkPipelineLayout      scatterReducePipelineLayout;
+    VkPipeline            scatterReducePipeline;
+    VkDescriptorPool      scatterReduceDescPool;
+    VkDescriptorSet       scatterReduceSet;
 
     /* Projection compute pipeline (rendering) */
     VkDescriptorSetLayout projDescLayout;
@@ -141,7 +164,8 @@ struct PhysicsCompute {
     bool initialized;
 };
 
-/* Initialize compute pipeline + SSBOs, upload initial particle state */
+/* Initialize compute pipeline + SSBOs, upload initial particle state.
+ * scatterMode selects the scatter variant (baseline / uniform / squaragon). */
 void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
                          const float* pos_x, const float* pos_y, const float* pos_z,
                          const float* vel_x, const float* vel_y, const float* vel_z,
@@ -149,14 +173,19 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
                          const float* pump_history, const int* pump_state,
                          const float* theta, const float* omega_nat,
                          const uint8_t* flags, const uint8_t* topo_state,
-                         int N);
+                         int N, ScatterMode scatterMode);
 
 /* Record compute dispatch commands into command buffer */
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                             int frame, float sim_time, float dt);
 
-/* Initialize scatter compute pipeline + grid SSBOs (Pass 1 of streaming arch) */
+/* Initialize scatter compute pipeline + grid SSBOs (Pass 1 of streaming arch).
+ * Loads the SPIRV corresponding to phys.scatterMode. */
 void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx);
+
+/* Initialize scatter reduce compute pipeline (8 shards → canonical density).
+ * Must be called after initScatterCompute (depends on the shards buffer). */
+void initScatterReduceCompute(PhysicsCompute& phys, VulkanContext& ctx);
 
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);

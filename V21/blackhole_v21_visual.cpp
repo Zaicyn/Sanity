@@ -319,6 +319,7 @@ int main(int argc, char** argv) {
     unsigned int seed = 42;
     bool use_gpu_physics = false;
     bool project_only = false;
+    ScatterMode scatter_mode = SCATTER_MODE_BASELINE;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -329,8 +330,21 @@ int main(int argc, char** argv) {
             use_gpu_physics = true;
         else if (strcmp(argv[i], "--project-only") == 0)
             { use_gpu_physics = true; project_only = true; }
+        else if (strcmp(argv[i], "--scatter-mode") == 0 && i+1 < argc) {
+            const char* m = argv[++i];
+            if      (strcmp(m, "baseline")  == 0) scatter_mode = SCATTER_MODE_BASELINE;
+            else if (strcmp(m, "uniform")   == 0) scatter_mode = SCATTER_MODE_UNIFORM;
+            else if (strcmp(m, "squaragon") == 0) scatter_mode = SCATTER_MODE_SQUARAGON;
+            else {
+                fprintf(stderr, "unknown --scatter-mode '%s' "
+                                "(expected baseline, uniform, or squaragon)\n", m);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] [--gpu-physics] [--project-only]\n");
+            printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
+                   "[--gpu-physics] [--project-only] "
+                   "[--scatter-mode baseline|uniform|squaragon]\n");
             return 0;
         }
     }
@@ -408,7 +422,7 @@ int main(int argc, char** argv) {
             particles.pump_history, particles.pump_state,
             particles.theta, particles.omega_nat,
             particles.flags, particles.topo_state,
-            particles.N);
+            particles.N, scatter_mode);
         initDensityRender(gpuPhys, vkCtx);
     }
 
