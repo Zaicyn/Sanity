@@ -348,7 +348,15 @@ void main() {
     {
         const float OMEGA_PATTERN = 0.004;
         float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time);
-        vel_r += ARM_M3_EPSILON * cos(phi_pattern) * pc.dt;
+        // Vertical confinement: Gaussian envelope confines arm formation to midplane.
+        // Scale height controls where arms fade. At |y| >> scale_height, kick → 0.
+        // Also apply gentle phase twist with height (0.01/unit) so residual
+        // off-plane coherence doesn't form vertical columns.
+        const float ARM_SCALE_HEIGHT = 10.0;
+        const float ARM_VERT_TWIST  = 0.01;
+        float vert_atten = exp(-(delta_y * delta_y) / (2.0 * ARM_SCALE_HEIGHT * ARM_SCALE_HEIGHT));
+        phi_pattern += 3.0 * ARM_VERT_TWIST * delta_y;
+        vel_r += ARM_M3_EPSILON * cos(phi_pattern) * vert_atten * pc.dt;
     }
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
