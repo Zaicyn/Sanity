@@ -2256,8 +2256,13 @@ void initCountingSortCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
     }
 
-    phys.countingSortEnabled = true;
-    printf("[vk-compute] Counting sort initialized (histogram + scan + reorder)\n");
+    /* Counting sort is slower than atomic scatter at ≤20M particles on Turing.
+     * Atomic scatter: 1.986 ms. Counting sort: 33 ms (reorder bandwidth dominates).
+     * Keep infrastructure for future use at higher particle counts or different
+     * GPU architectures where atomic contention becomes the bottleneck.
+     * Toggle via CLI flag --counting-sort when needed. */
+    phys.countingSortEnabled = false;
+    printf("[vk-compute] Counting sort initialized (disabled — atomic scatter faster at this scale)\n");
 }
 
 void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd) {
