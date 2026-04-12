@@ -1,0 +1,157 @@
+// collision_resolve_graded.comp — Phase 3.4: fused broadphase + impulse on graded state
+// ======================================================================================
+// Same physics as collision_resolve.comp but reads positions and velocities from
+// the grade-separated buffers (set 2) instead of Cartesian (set 0).
+//
+// Positions are reconstructed from (r, phi, delta_r, delta_y):
+//   x = (r + delta_r) * cos(phi)
+//   y = delta_y
+//   z = (r + delta_r) * sin(phi)
+//
+// Velocities reconstructed from (vel_r, omega_orb, vel_y):
+//   vx = vel_r * cos(phi) - r_eff * omega_orb * sin(phi)
+//   vy = vel_y
+//   vz = vel_r * sin(phi) + r_eff * omega_orb * cos(phi)
+//
+// Impulses are accumulated into vel_delta[k*3] in Cartesian (unchanged from
+// Phase 2) — the apply kernel decomposes back to graded.
+//
+// Dispatch: 2D, (ceil(N_rigid/16), ceil(N_rigid/16), 1) of (16, 16, 1).
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Set 0 — siphon layout (declared for descriptor compat, not read)
+layout(std430, set = 0, binding = 0)  readonly buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  readonly buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  readonly buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  readonly buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  readonly buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) readonly buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) readonly buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) readonly buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) readonly buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion { uint  in_active_region[]; };
+
+// Set 1 — collision data
+layout(std430, set = 1, binding = 0) readonly buffer RigidBodyId       { uint  rigid_body_id[]; };
+layout(std430, set = 1, binding = 1)          buffer VelDelta          { int   vel_delta[];     };
+layout(std430, set = 1, binding = 2)          buffer ContactCount      { uint  contact_count[]; };
+layout(std430, set = 1, binding = 3)          buffer FirstContactFrame { uint  first_contact_frame[]; };
+
+// Set 2 — graded particle state (read-only for resolve)
+layout(std430, set = 2, binding = 0) readonly buffer GR       { float g_r[];         };
+layout(std430, set = 2, binding = 1) readonly buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2) readonly buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3) readonly buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4) readonly buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5) readonly buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6) readonly buffer GOmegaOrb{ float g_omega_orb[]; };
+layout(std430, set = 2, binding = 7) readonly buffer GTheta   { float g_theta[];     };
+layout(std430, set = 2, binding = 8) readonly buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9) readonly buffer GLTilt   { float g_L_tilt[];    };
+
+layout(push_constant) uniform CollisionResolvePushConstants {
+    uint  rigid_base;
+    uint  rigid_count;
+    float dt;
+    uint  frame_number;
+} pc;
+
+#define PARTICLE_RADIUS     0.25
+#define REST_DISTANCE       0.5
+#define CONTACT_THRESHOLD   0.75
+#define CONTACT_THRESHOLD_SQ (CONTACT_THRESHOLD * CONTACT_THRESHOLD)
+#define RESTITUTION         0.5
+#define BAUMGARTE_BETA      0.2
+#define FIXED_POINT_SCALE   1000000.0
+
+void main() {
+    uint i_local = gl_GlobalInvocationID.x;
+    uint j_local = gl_GlobalInvocationID.y;
+
+    if (i_local >= pc.rigid_count) return;
+    if (j_local >= pc.rigid_count) return;
+    if (i_local >= j_local) return;
+
+    uint i = pc.rigid_base + i_local;
+    uint j = pc.rigid_base + j_local;
+
+    if (rigid_body_id[i] == rigid_body_id[j]) return;
+
+    // --- Reconstruct Cartesian positions from graded ---
+    float ri = g_r[i] + g_delta_r[i];
+    float rj = g_r[j] + g_delta_r[j];
+    float cpi = cos(g_phi[i]), spi = sin(g_phi[i]);
+    float cpj = cos(g_phi[j]), spj = sin(g_phi[j]);
+
+    float pix = ri * cpi, piy = g_delta_y[i], piz = ri * spi;
+    float pjx = rj * cpj, pjy = g_delta_y[j], pjz = rj * spj;
+
+    // --- Broadphase ---
+    float dx = pjx - pix;
+    float dy = pjy - piy;
+    float dz = pjz - piz;
+    float L_sq = dx*dx + dy*dy + dz*dz;
+
+    if (L_sq > CONTACT_THRESHOLD_SQ) return;
+
+    float L = sqrt(L_sq);
+    if (L >= REST_DISTANCE) return;
+
+    float inv_L = 1.0 / max(L, 1e-6);
+    float nx = dx * inv_L;
+    float ny = dy * inv_L;
+    float nz = dz * inv_L;
+
+    float penetration = REST_DISTANCE - L;
+
+    // --- Reconstruct Cartesian velocities from graded ---
+    float vr_i = g_vel_r[i], omega_i = g_omega_orb[i], vy_i = g_vel_y[i];
+    float vr_j = g_vel_r[j], omega_j = g_omega_orb[j], vy_j = g_vel_y[j];
+
+    float vt_i = ri * omega_i;
+    float vix = vr_i * cpi - vt_i * spi;
+    float viy = vy_i;
+    float viz = vr_i * spi + vt_i * cpi;
+
+    float vt_j = rj * omega_j;
+    float vjx = vr_j * cpj - vt_j * spj;
+    float vjy = vy_j;
+    float vjz = vr_j * spj + vt_j * cpj;
+
+    // --- Relative velocity along contact normal ---
+    float v_rel = (vjx - vix) * nx + (vjy - viy) * ny + (vjz - viz) * nz;
+
+    float bias = BAUMGARTE_BETA * penetration / pc.dt;
+
+    if (v_rel >= 0.0 && bias < 1e-4) return;
+
+    const float W_SUM = 2.0;
+    float j_mag = (-(1.0 + RESTITUTION) * v_rel + bias) / W_SUM;
+
+    float dvi_x = -j_mag * nx;
+    float dvi_y = -j_mag * ny;
+    float dvi_z = -j_mag * nz;
+    float dvj_x =  j_mag * nx;
+    float dvj_y =  j_mag * ny;
+    float dvj_z =  j_mag * nz;
+
+    // --- Accumulate in Cartesian vel_delta (decomposed in apply kernel) ---
+    atomicAdd(vel_delta[i_local * 3u + 0u], int(dvi_x * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[i_local * 3u + 1u], int(dvi_y * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[i_local * 3u + 2u], int(dvi_z * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 0u], int(dvj_x * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 1u], int(dvj_y * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 2u], int(dvj_z * FIXED_POINT_SCALE));
+
+    atomicAdd(contact_count[0], 1u);
+    atomicMin(first_contact_frame[0], pc.frame_number);
+}

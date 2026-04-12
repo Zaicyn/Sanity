@@ -330,6 +330,12 @@ struct PhysicsCompute {
     /* Graded constraint pipeline (Phase 3.3) — set 0 (compat) + set 1 (pairs) + set 2 (graded) */
     VkPipelineLayout      constraintGradedPipelineLayout;
     VkPipeline            constraintGradedPipeline;
+
+    /* Graded collision pipelines (Phase 3.4) — set 0 (compat) + set 1 (collision) + set 2 (graded) */
+    VkPipelineLayout      collisionResolveGradedPipelineLayout;
+    VkPipeline            collisionResolveGradedPipeline;
+    VkPipelineLayout      collisionApplyGradedPipelineLayout;
+    VkPipeline            collisionApplyGradedPipeline;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.
