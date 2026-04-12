@@ -52,6 +52,7 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/collision_sync.comp
     ${KERNEL_DIR}/cartesian_to_graded.comp
     ${KERNEL_DIR}/graded_to_cartesian.comp
+    ${KERNEL_DIR}/siphon_graded.comp
 )
 
 set(SPV_OUTPUTS)

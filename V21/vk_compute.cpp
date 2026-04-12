@@ -1633,10 +1633,6 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                         phys.queryPool, base + 5);
 
     /* ---- Siphon (physics) -------------------------------------------- */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.pipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-
     SiphonPushConstants push = {};
     push.N = phys.N;
     push.time = sim_time;
@@ -1648,25 +1644,56 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     push.seam_bits = 0x03;  /* SEAM_FULL */
     push.bias = 0.75f;
 
-    vkCmdPushConstants(cmd, phys.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(push), &push);
+    if (phys.gradedEnabled) {
+        /* Phase 3.2: graded siphon — operates on set 0 (pump) + set 2 (graded) */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.siphonGradedPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
-    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+        vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-    /* Memory barrier: siphon's SSBO writes must be visible to:
-     *   - the subsequent projection compute pass (shader read)
-     *   - transfer reads (oracle readback copies)
-     * Compute→compute is critical; without it the driver may reorder or
-     * even eliminate the siphon dispatch when the next consumer only sees
-     * transfer/vertex reads. */
-    VkMemoryBarrier barrier = {};
-    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 1, &barrier, 0, nullptr, 0, nullptr);
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+        /* Barrier: graded siphon writes must complete before graded_to_cartesian */
+        VkMemoryBarrier gbar = {};
+        gbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        gbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &gbar, 0, nullptr, 0, nullptr);
+
+        /* Reconstruct Cartesian from graded for rendering + oracle */
+        dispatchGradedToCartesian(phys, cmd);
+    } else {
+        /* Original Cartesian siphon */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.pipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+
+        vkCmdPushConstants(cmd, phys.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+    }
+
+    /* Memory barrier: siphon (or graded_to_cartesian) writes must be visible
+     * to the projection pass and transfer reads (oracle readback). */
+    {
+        VkMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
 
     /* Siphon end */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1810,6 +1837,45 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         writes[i].pBufferInfo = &bufInfos[i];
     }
     vkUpdateDescriptorSets(ctx.device, VK_GRADED_NUM_BINDINGS, writes, 0, nullptr);
+
+    /* --- Graded siphon pipeline (Phase 3.2): set 0 (pump) + set 2 (graded) --- */
+    {
+        VkDescriptorSetLayoutCreateInfo emptyInfo = {};
+        emptyInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        emptyInfo.bindingCount = 0;
+        VkDescriptorSetLayout emptyLayout;
+        vkCreateDescriptorSetLayout(ctx.device, &emptyInfo, nullptr, &emptyLayout);
+        VkDescriptorSetLayout allSets[3] = { phys.descLayout, emptyLayout, phys.gradedSetLayout };
+
+        /* Same push constants as original siphon */
+        VkPushConstantRange pcRange = {};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset = 0;
+        pcRange.size = sizeof(SiphonPushConstants);
+        VkPipelineLayoutCreateInfo plInfo = {};
+        plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plInfo.setLayoutCount = 3;
+        plInfo.pSetLayouts = allSets;
+        plInfo.pushConstantRangeCount = 1;
+        plInfo.pPushConstantRanges = &pcRange;
+        vkCreatePipelineLayout(ctx.device, &plInfo, nullptr,
+                               &phys.siphonGradedPipelineLayout);
+
+        auto code = readShaderFile("siphon_graded.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.siphonGradedPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr,
+                                 &phys.siphonGradedPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+        vkDestroyDescriptorSetLayout(ctx.device, emptyLayout, nullptr);
+        printf("[vk-compute] Graded siphon pipeline created\n");
+    }
 
     phys.gradedEnabled = true;
     printf("[vk-compute] Grade-separated buffers initialized (%d bindings, %.1f MB)\n",

@@ -322,6 +322,10 @@ struct PhysicsCompute {
     VkPipeline            gradedToCartPipeline;
     VkDescriptorPool      gradedDescPool;
     VkDescriptorSet       gradedSet;
+
+    /* Graded siphon pipeline (Phase 3.2) — reads set 0 (pump) + set 2 (graded) */
+    VkPipelineLayout      siphonGradedPipelineLayout;
+    VkPipeline            siphonGradedPipeline;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.

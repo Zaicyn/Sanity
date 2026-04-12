@@ -1,0 +1,430 @@
+// siphon_graded.comp — Viviani field physics on grade-separated state
+// ====================================================================
+// Phase 3.2: rewrites siphon.comp to operate on the grade-separated
+// SSBO layout (set 2). Each grade is touched by exactly one class of
+// operation:
+//
+//   Grade 0 (scalars):  pump state machine — energy accounting
+//   Grade 1 (vectors):  damping, radial integration
+//   Grade 2 (bivectors): Viviani transport, phase advance, orbital integration
+//
+// The Viviani rotational transport, which was a double cross-product in
+// Cartesian (9+ FMAs), becomes a direct phase coupling between theta
+// (Viviani phase) and the radial/tangential velocity split.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Set 0 — Pump state machine buffers (grade 0, unchanged from Cartesian era)
+// Only the pump-related bindings are touched. pos/vel bindings are NOT read.
+// ============================================================================
+
+layout(std430, set = 0, binding = 6)  buffer PumpState   { int   pump_state[];   };
+layout(std430, set = 0, binding = 7)  buffer PumpScale   { float pump_scale[];   };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent{ int   pump_coherent[];};
+layout(std430, set = 0, binding = 9)  buffer PumpResidual{ float pump_residual[];};
+layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];    };
+layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
+layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion{ uint in_active_region[]; };
+
+// ============================================================================
+// Set 2 — Grade-separated particle state
+// ============================================================================
+
+layout(std430, set = 2, binding = 0)  buffer GR       { float g_r[];         };
+layout(std430, set = 2, binding = 1)  buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2)  buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3)  buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4)  buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5)  buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6)  buffer GOmegaOrb{ float g_omega_orb[]; };
+layout(std430, set = 2, binding = 7)  buffer GTheta   { float g_theta[];     };
+layout(std430, set = 2, binding = 8)  buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9)  buffer GLTilt   { float g_L_tilt[];    };
+
+// ============================================================================
+// Push constants
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Constants (match siphon.comp exactly)
+// ============================================================================
+
+const float PI               = 3.14159265358979;
+const float TWO_PI           = 6.28318530718;
+const float SCHW_R           = 2.0;
+const float ISCO_R           = 6.0;
+const float PHI_CONST        = 1.6180339887498948;
+const float PHI_EXCESS       = 0.09017;
+const float COHERENCE_GAMMA  = 0.02;
+const float JET_SPEED        = 0.4;
+const float PUMP_EJECT_THRESHOLD = 0.88;
+const int   PUMP_COHERENT_MAX    = 3;
+
+// Pump states
+const int PUMP_IDLE               = 0;
+const int PUMP_PRIMED             = 1;
+const int PUMP_UPSTROKE_COHERENT  = 2;
+const int PUMP_UPSTROKE_HOP       = 3;
+const int PUMP_EXPAND             = 4;
+const int PUMP_DOWNSTROKE         = 5;
+const int PUMP_VALVE_OPEN         = 6;
+const int PUMP_RECIRCULATE        = 7;
+
+// Seam bits
+const uint SEAM_CLOSED   = 0x00u;
+const uint SEAM_UP_ONLY  = 0x01u;
+const uint SEAM_DOWN_ONLY= 0x02u;
+const uint SEAM_FULL     = 0x03u;
+
+// Flags
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+
+// ============================================================================
+// Viviani transport on graded state
+// ============================================================================
+//
+// In Cartesian, the transport was:
+//   n̂ = Viviani_curve(theta) / |Viviani_curve(theta)|
+//   axis = n̂ × v
+//   dv = FIELD_STRENGTH * (axis × v)
+//
+// This is a rotation of v toward the plane perpendicular to the Viviani
+// normal. In cylindrical graded coords, v has two components: vel_r (radial)
+// and v_t = r * omega_orb (tangential). The transport converts radial motion
+// into tangential motion (and vice versa) based on the angle between the
+// Viviani normal and the radial direction.
+//
+// The Viviani curve point at phase theta:
+//   cx = sin(theta) - 0.5 * sin(3*theta)
+//   cy = -cos(theta) + 0.5 * cos(3*theta)
+//   cz = cos(theta) * cos(3*theta)
+//
+// The radial direction in xz-plane at orbital phase phi is (cos phi, sin phi).
+// The projection of the Viviani normal onto the radial direction gives the
+// coupling strength between radial and tangential:
+//
+//   n_r = (cx * cos(phi) + cz * sin(phi)) / |c|
+//
+// The transport rotates velocity in the (r̂, t̂) plane by an amount
+// proportional to FIELD_STRENGTH. In the graded representation:
+//
+//   d_vel_r   = -FIELD_STRENGTH * v_t * f(theta, phi)
+//   d_omega_orb = +FIELD_STRENGTH * vel_r * f(theta, phi) / r
+//
+// where f(theta, phi) encodes the Viviani normal's projection.
+
+void apply_viviani_transport(
+    float r, float phi, float theta_i,
+    float vel_r_in, float omega_orb_in,
+    out float d_vel_r, out float d_omega_orb)
+{
+    // Viviani curve point (same as Cartesian siphon)
+    float s1 = sin(theta_i);
+    float c1 = cos(theta_i);
+    float s3 = sin(3.0 * theta_i);
+    float c3 = cos(3.0 * theta_i);
+
+    float cx = s1 - 0.5 * s3;
+    float cy = -c1 + 0.5 * c3;
+    float cz = c1 * c3;
+
+    // Normalize to get unit Viviani normal
+    float inv_c = inversesqrt(cx*cx + cy*cy + cz*cz + 1e-8);
+    float nx = cx * inv_c;
+    float ny = cy * inv_c;
+    float nz = cz * inv_c;
+
+    // Project Viviani normal onto the radial direction (cos phi, 0, sin phi)
+    float cp = cos(phi);
+    float sp = sin(phi);
+    float n_radial = nx * cp + nz * sp;
+
+    // Project onto tangential direction (-sin phi, 0, cos phi)
+    float n_tangential = -nx * sp + nz * cp;
+
+    // The Cartesian transport was: dv = FIELD_STRENGTH * (n̂×v)×v
+    // In the (r̂, t̂) plane, this is a rotation whose rate depends on
+    // the angle between n̂ and the velocity direction.
+    // Decompose: the component of n̂ perpendicular to v in the (r̂, t̂) plane
+    // drives the rotation.
+    float v_t = r * omega_orb_in;
+    float v_mag_sq = vel_r_in * vel_r_in + v_t * v_t;
+
+    // Cross product magnitude in 2D: |n̂_xz × v̂_xz| = n_r * v_t/|v| - n_t * v_r/|v|
+    // This gives the "torque" that rotates velocity.
+    float inv_vmag = inversesqrt(v_mag_sq + 1e-8);
+
+    // The rotation transfers velocity between radial and tangential:
+    //   dv_r = -strength * (n_r * v_t - n_t * v_r) * v_t
+    //   dv_t = +strength * (n_r * v_t - n_t * v_r) * v_r
+    // (This is the double cross product expanded in cylindrical coords)
+    float cross_2d = n_radial * v_t - n_tangential * vel_r_in;
+
+    d_vel_r    = -pc.FIELD_STRENGTH * cross_2d * v_t * inv_vmag * inv_vmag;
+    d_omega_orb = pc.FIELD_STRENGTH * cross_2d * vel_r_in * inv_vmag * inv_vmag / max(r, 1e-6);
+}
+
+// ============================================================================
+// Pump state machine (identical to siphon.comp — grade 0 only)
+// ============================================================================
+
+float compute_pressure(float scale) {
+    return PHI_EXCESS * sqrt(scale);
+}
+
+uint select_seam_bits(float coupling) {
+    if (coupling > 0.5) return SEAM_FULL;
+    if (coupling > 0.2) return SEAM_UP_ONLY;
+    return SEAM_CLOSED;
+}
+
+void siphon_state_step(inout int state, inout float scale, inout int coh_count,
+                       inout float residual, inout float work,
+                       uint seam_bits, float pressure, float global_bias,
+                       float tidal_stress, float history)
+{
+    if (state == PUMP_IDLE) {
+        if (seam_bits != 0u) state = PUMP_PRIMED;
+        residual = 0.0;
+    }
+    else if (state == PUMP_PRIMED) {
+        residual = 0.0;
+        if (seam_bits == SEAM_FULL) {
+            state = (coh_count < PUMP_COHERENT_MAX)
+                ? PUMP_UPSTROKE_COHERENT
+                : PUMP_UPSTROKE_HOP;
+        }
+    }
+    else if (state == PUMP_EXPAND) {
+        state = PUMP_DOWNSTROKE;
+    }
+    else if (state == PUMP_DOWNSTROKE) {
+        state = PUMP_VALVE_OPEN;
+    }
+    else if (state == PUMP_VALVE_OPEN) {
+        float effective_bias = global_bias;
+        if (scale > 10.0) {
+            effective_bias *= 1.0 / (1.0 + 0.1 * log2(scale / 10.0));
+        }
+        effective_bias = min(effective_bias, 1.0);
+        residual = pressure * (1.0 - effective_bias);
+        float tidal_coupling = tidal_stress * history * 0.1;
+        residual += tidal_coupling;
+        work += pressure * residual;
+        state = PUMP_RECIRCULATE;
+    }
+    else if (state == PUMP_RECIRCULATE) {
+        state = PUMP_PRIMED;
+    }
+}
+
+void regulate_scale(inout float scale, inout int coh_count) {
+    const float SCALE_SOFT_CAP = 30.0;
+    const float SCALE_HARD_CAP = 100.0;
+    const float DECAY_RATE     = 0.05;
+    if (scale > SCALE_SOFT_CAP) {
+        float overshoot = (scale - SCALE_SOFT_CAP) / (SCALE_HARD_CAP - SCALE_SOFT_CAP);
+        overshoot = min(overshoot, 1.0);
+        scale *= (1.0 - DECAY_RATE * overshoot * overshoot * overshoot);
+        if (overshoot > 0.3 && coh_count > 0) coh_count--;
+    }
+    if (scale > SCALE_HARD_CAP) {
+        scale = SCALE_SOFT_CAP * 0.8;
+        coh_count = 0;
+    }
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if (in_active_region[i] == 0u) return;
+
+    // ----- Load graded state -----
+    float r         = g_r[i];
+    float delta_r   = g_delta_r[i];
+    float delta_y   = g_delta_y[i];
+    float vel_r     = g_vel_r[i];
+    float vel_y     = g_vel_y[i];
+    float phi       = g_phi[i];
+    float omega_orb = g_omega_orb[i];
+    float theta_i   = g_theta[i];
+    float omega_i   = g_omega_nat[i];
+
+    // ----- Load pump state (grade 0) -----
+    int   state     = pump_state[i];
+    float scale     = pump_scale[i];
+    int   coh_count = pump_coherent[i];
+    float residual  = pump_residual[i];
+    float work      = pump_work[i];
+    float history   = pump_history[i];
+
+    // ----- Grade 2: Viviani phase advance -----
+    theta_i += omega_i * pc.dt;
+    if (theta_i >= TWO_PI) theta_i -= TWO_PI;
+    if (theta_i < 0.0)     theta_i += TWO_PI;
+
+    // ----- Grade 2: Viviani rotational transport -----
+    // Couples theta → (vel_r, omega_orb) via the Viviani normal projection
+    float r_eff = r + delta_r;
+    float r_safe = max(r_eff, SCHW_R * 0.5);
+
+    float d_vel_r, d_omega_orb;
+    apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb,
+                            d_vel_r, d_omega_orb);
+
+    vel_r     += d_vel_r;
+    omega_orb += d_omega_orb;
+
+    // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
+    if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
+        float r3 = r_safe * r_safe * r_safe;
+        float omega_z = sqrt(pc.BH_MASS / max(r3, 1.0));
+        float damping = min(2.0 * omega_z, 0.50);
+        vel_y *= (1.0 - damping);
+    }
+
+    // ----- Grade 1: Integration -----
+    // vel_r and omega_orb already include transport corrections
+    vel_r += 0.0;  // no additional radial force in current model
+    // (centripetal is implicit in cylindrical coords — omega_orb² * r)
+
+    // NaN guard
+    if (isinf(vel_r) || isnan(vel_r) || isinf(omega_orb) || isnan(omega_orb)) {
+        return;
+    }
+
+    // Integrate position
+    r       += vel_r * pc.dt;
+    r        = max(r, 0.01);  // clamp to avoid negative radius
+    phi     += omega_orb * pc.dt;
+    delta_y += vel_y * pc.dt;
+
+    // Wrap phi to [0, 2π)
+    if (phi >= TWO_PI) phi -= TWO_PI;
+    if (phi < 0.0)     phi += TWO_PI;
+
+    // Update r_eff for pump diagnostics
+    r_eff = r + delta_r;
+    r_safe = max(r_eff, SCHW_R * 0.5);
+
+    // ----- Grade 0: Harmonic terms for pump -----
+    // orb_phi in Cartesian was atan2(pz, px) — which IS phi in graded space
+    float heartbeat = cos(phi) * cos(3.0 * phi);  // z-axis mixer
+    float phase_stress = max(cos(phi)*cos(phi), sin(phi)*sin(phi));
+
+    // Coupling (circularity) — in cylindrical, v_tangential / v_total
+    float v_t = r_safe * omega_orb;
+    float v_mag = sqrt(vel_r * vel_r + v_t * v_t + vel_y * vel_y + 1e-8);
+    float circularity = min(abs(v_t) / v_mag, 1.0);
+    uint seam = select_seam_bits(circularity);
+
+    float pressure = compute_pressure(scale);
+
+    // Tidal (simplified in cylindrical — shear from differential rotation)
+    float shear = 0.0, tidal_radial = 0.0;
+    if (r_safe > SCHW_R * 1.5) {
+        float r5 = r_safe * r_safe * r_safe * r_safe * r_safe;
+        shear = 1.5 * sqrt(pc.BH_MASS / r5) * sqrt(scale);
+    }
+    if (r_safe > SCHW_R * 1.2) {
+        float r3 = r_safe * r_safe * r_safe;
+        tidal_radial = pc.BH_MASS / r3 * sqrt(scale);
+    }
+    float tidal_stress = max(shear, tidal_radial);
+
+    // ----- Grade 0: Pump state machine -----
+    if (state == PUMP_UPSTROKE_COHERENT) {
+        // Coherence scale from vel alignment — simplified in cylindrical
+        float vel_alignment = abs(vel_r) / v_mag;
+        scale = 1.0 + vel_alignment;
+        coh_count++;
+        state = PUMP_EXPAND;
+    }
+    else if (state == PUMP_UPSTROKE_HOP) {
+        float vel_alignment = abs(vel_r) / v_mag;
+        scale = 1.0 + vel_alignment * PHI_CONST;
+        coh_count = 0;
+        state = PUMP_EXPAND;
+    }
+    else {
+        siphon_state_step(state, scale, coh_count, residual, work,
+                          seam, pressure, pc.bias, tidal_stress, history);
+    }
+
+    regulate_scale(scale, coh_count);
+
+    // ----- Ejection check -----
+    bool eject = false;
+    {
+        float r_cyl = r_safe;
+        bool close_enough = (r_cyl < ISCO_R * 2.5);
+        bool phase_polarized = (phase_stress > 0.95);
+        eject = phase_polarized && close_enough
+            && (abs(residual) > PUMP_EJECT_THRESHOLD * 0.5);
+    }
+
+    if (eject) {
+        // Ejection kick — in graded space, kick is a radial velocity impulse
+        // plus a vertical velocity impulse (the "jet" along L̂ ≈ ŷ)
+        float muzzle = residual * (1.0 + history * 0.5) * JET_SPEED;
+        // Collimation: inner particles → more vertical, outer → more radial
+        float collimation = clamp(1.0 - (r_safe - SCHW_R) / (ISCO_R * 2.0), 0.0, 1.0);
+        vel_y += muzzle * collimation;        // vertical jet component
+        vel_r += muzzle * (1.0 - collimation); // radial scatter component
+    }
+
+    // ----- Grade 1: Anisotropic damping (radial, γ=0.02) -----
+    vel_r *= (1.0 - COHERENCE_GAMMA);
+
+    // ----- Write back graded state -----
+    g_r[i]         = r;
+    g_delta_r[i]   = delta_r;
+    g_delta_y[i]   = delta_y;
+    g_vel_r[i]     = vel_r;
+    g_vel_y[i]     = vel_y;
+    g_phi[i]       = phi;
+    g_omega_orb[i] = omega_orb;
+    g_theta[i]     = theta_i;
+
+    // ----- Write back pump state (grade 0) -----
+    pump_state[i]    = state;
+    pump_scale[i]    = scale;
+    pump_coherent[i] = coh_count;
+    pump_residual[i] = residual;
+    pump_work[i]     = work;
+
+    if (eject) {
+        flags[i] = f | PFLAG_EJECTED;
+    }
+
+    // Pump history (exponential smoothing)
+    const float HISTORY_SMOOTH = 0.02;
+    pump_history[i] = history * (1.0 - HISTORY_SMOOTH) + scale * HISTORY_SMOOTH;
+}
