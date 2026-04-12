@@ -1,0 +1,85 @@
+// collision_apply.comp — Phase 2.2 C1: int-to-float velocity writeback
+// =====================================================================
+// Reads vel_delta[k*3 + 0..2] (int32 fixed-point, scaled 1e6), converts
+// to float, and adds to vel_x/y/z[rigid_base + k] for each lattice
+// particle. Vertex-disjoint by construction (one thread per particle),
+// no atomics, no contention.
+//
+// In C1 the vel_delta buffer is always zero (no resolve kernel yet), so
+// this kernel is a no-op except for the int->float conversion + add.
+// Smoke testing C1 means launching --rigid-body cube2-collide and
+// verifying:
+//   1. The pipeline binds without Vulkan validation errors.
+//   2. The cubes drift inward as expected (apply does nothing because
+//      vel_delta == 0, so siphon's existing integration is unaffected).
+//
+// In C2, the collision_resolve kernel populates vel_delta via atomicAdd
+// and this apply pass becomes the writeback step that lets siphon see
+// the contact corrections on the next integration.
+//
+// Set 0: shared with siphon — full 16-binding descriptor layout. We
+//        only touch vel_x/y/z (bindings 3, 4, 5) but must declare all
+//        bindings to satisfy the descriptor set layout.
+// Set 1: collision data — bindings match initCollisionCompute().
+//        Binding 0 (rigid_body_id) is unused here but declared so the
+//        layout matches the C2 kernels that will share it.
+//
+// Dispatch: ceil(rigid_count / 64) workgroups of 64 threads.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// ----------------------------------------------------------------------------
+// Set 0 — siphon particle SSBOs (full 16-binding layout, reused via
+// phys.descLayout). Only vel_x/y/z are touched.
+// ----------------------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion { uint  in_active_region[]; };
+
+// ----------------------------------------------------------------------------
+// Set 1 — collision data (4 SSBOs, layout matches initCollisionCompute)
+//   binding 0: rigid_body_id[N]                uint32 (unused here)
+//   binding 1: vel_delta[rigid_count * 3]      int32 fixed-point
+//   binding 2: contact_count[1]                uint32 (unused here)
+//   binding 3: first_contact_frame[1]          uint32 (unused here)
+// ----------------------------------------------------------------------------
+layout(std430, set = 1, binding = 0) readonly buffer RigidBodyId       { uint  rigid_body_id[]; };
+layout(std430, set = 1, binding = 1)          buffer VelDelta          { int   vel_delta[];     };
+layout(std430, set = 1, binding = 2)          buffer ContactCount      { uint  contact_count[]; };
+layout(std430, set = 1, binding = 3)          buffer FirstContactFrame { uint  first_contact_frame[]; };
+
+layout(push_constant) uniform CollisionApplyPushConstants {
+    uint rigid_base;
+    uint rigid_count;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.rigid_count) return;
+
+    uint i = pc.rigid_base + k;
+
+    const float INV_SCALE = 1.0e-6;
+    float dvx = float(vel_delta[k * 3u + 0u]) * INV_SCALE;
+    float dvy = float(vel_delta[k * 3u + 1u]) * INV_SCALE;
+    float dvz = float(vel_delta[k * 3u + 2u]) * INV_SCALE;
+
+    vel_x[i] += dvx;
+    vel_y[i] += dvy;
+    vel_z[i] += dvz;
+}

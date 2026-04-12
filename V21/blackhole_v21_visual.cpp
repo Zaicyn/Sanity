@@ -153,7 +153,8 @@ enum RigidBodyMode {
     RIGID_BODY_OFF              = 0,  /* no lattice (default) */
     RIGID_BODY_CUBE1000         = 1,  /* 10×10×10 cube, 2700 distance constraints */
     RIGID_BODY_CUBE2_BALLSOCKET = 2,  /* 2 cubes + 1 ball-socket joint (Phase 2.3 MVP) */
-    RIGID_BODY_CUBE2_HINGE      = 3   /* 2 cubes + hinge (2 distance constraints along x-axis, Phase 2.3.1) */
+    RIGID_BODY_CUBE2_HINGE      = 3,  /* 2 cubes + hinge (2 distance constraints along x-axis, Phase 2.3.1) */
+    RIGID_BODY_CUBE2_COLLIDE    = 4   /* 2 antipodal cubes drifting inward, dynamic contact (Phase 2.2) */
 };
 
 /* Lattice data computed on the host side and uploaded to the GPU constraint
@@ -166,6 +167,13 @@ struct ConstraintLattice {
     uint32_t              bucket_counts[7];   /* count per (axis × parity) bucket; [6] reserved for joint edges */
     uint32_t              base_index;         /* first lattice particle index */
     uint32_t              rigid_count;        /* = N_rigid */
+
+    /* Phase 2.2 collision pipeline metadata. Empty unless the scenario
+     * populates it (currently only cube2-collide). When non-empty, length
+     * equals the total particle count N (host arrays know N from ParticleState).
+     * Each entry is the rigid-body id: 0 for field particles, 1 for cube 0,
+     * 2 for cube 1, etc. */
+    std::vector<uint32_t> rigid_body_id;
 };
 
 /* N          = total allocation size (galaxy + optional trailing lattice slots)
@@ -749,6 +757,151 @@ static ConstraintLattice init_rigid_body_cube2_hinge(ParticleState& ps,
     return L;
 }
 
+/* Phase 2.2: two cubes on antipodal orbits, drifting inward toward each other.
+ *
+ * Builds two 10×10×10 lattices placed at (±R_ANTIPODE, 0, 0) on the orbital
+ * plane. Each cube gets the orbital tangent velocity at its own location plus
+ * a small inward radial drift so the two cubes close on the origin and
+ * eventually collide. No joints — bucket 6 is empty.
+ *
+ *   Cube 0 at (+R_ANTIPODE, 0, 0)
+ *     orbital tangent: (0, 0, +v_orbit)         (+ŷ × +x̂ = +ẑ)
+ *     inward drift:    (-v_drift, 0, 0)
+ *   Cube 1 at (-R_ANTIPODE, 0, 0)
+ *     orbital tangent: (0, 0, -v_orbit)         (+ŷ × -x̂ = -ẑ)
+ *     inward drift:    (+v_drift, 0, 0)
+ *
+ * Combined closing velocity along x = 2 * v_drift; with v_drift = 0.01 the
+ * gap of 2*R_ANTIPODE = 100 closes at 0.02 per frame. Adjusting for cube
+ * half-width (4.5 SPACING ≈ 2.25 each side), expected first contact frame is
+ * roughly (100 - 4.5) / 0.02 ≈ 4775.
+ *
+ * Populates lattice.rigid_body_id with N entries:
+ *   index 0..n_galaxy-1                              → 0 (field particles)
+ *   index n_galaxy..n_galaxy+999                     → 1 (cube 0)
+ *   index n_galaxy+1000..n_galaxy+1999               → 2 (cube 1)
+ *
+ * This is the data the C2 broadphase will use to filter cross-body pairs. C1
+ * uploads it but does not yet read it from any kernel — the apply kernel only
+ * touches vel_delta. */
+static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
+                                                       int n_galaxy) {
+    const int   LX = 10, LY = 10, LZ = 10;
+    const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
+    const int   N_LATTICE_TOT = 2 * N_LATTICE;         /* 2000 */
+    const float SPACING       = 0.5f;
+    const float R_ANTIPODE    = 50.0f;                 /* orbital radius */
+    const float V_DRIFT       = 0.01f;                 /* inward radial speed per frame */
+
+    if (n_galaxy + N_LATTICE_TOT > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
+                        "2 cubes (cube2-collide)\n", ps.N, n_galaxy);
+        return ConstraintLattice{};
+    }
+
+    /* Each cube gets the orbital tangent at its OWN location. */
+    const float v_orbit = sqrtf(BH_MASS / fmaxf(R_ANTIPODE, ISCO_R));
+
+    const uint32_t base = (uint32_t)n_galaxy;
+
+    /* 7 super-buckets: 0..5 lattice, 6 joint (empty for cube2-collide). */
+    std::vector<std::pair<uint32_t, uint32_t>> super[7];
+    for (int k = 0; k < 6; k++) super[k].reserve(900);
+
+    /* Per-cube center placement: cube 0 at +x, cube 1 at -x. */
+    const float cube_centers_x[2] = { +R_ANTIPODE, -R_ANTIPODE };
+    /* Tangent z-component: +v at +x, -v at -x (consistent CCW orbit around y). */
+    const float cube_tangent_z[2] = { +v_orbit,    -v_orbit    };
+    /* Inward drift x-component: -v at +x cube, +v at -x cube. */
+    const float cube_drift_x[2]   = { -V_DRIFT,    +V_DRIFT    };
+
+    for (int c = 0; c < 2; c++) {
+        const float cx = cube_centers_x[c];
+        const float cy = 0.0f;
+        const float cz = 0.0f;
+
+        const uint32_t cube_base = base + (uint32_t)(c * N_LATTICE);
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.vel_x[p] = cube_drift_x[c];
+            ps.vel_y[p] = 0.0f;
+            ps.vel_z[p] = cube_tangent_z[c];
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;
+        }
+
+        /* Build this cube's 6 lattice buckets — same coloring as the
+         * other cube2 modes. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) local[0 + (ix & 1)].push_back({a, idx_of(ix + 1, iy, iz)});
+            if (iy + 1 < LY) local[2 + (iy & 1)].push_back({a, idx_of(ix, iy + 1, iz)});
+            if (iz + 1 < LZ) local[4 + (iz & 1)].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
+        }
+    }
+
+    /* Bucket 6 stays empty: no joints for cube2-collide. */
+
+    ConstraintLattice L = {};
+    L.base_index  = base;
+    L.rigid_count = (uint32_t)N_LATTICE_TOT;
+    L.inv_m.assign(N_LATTICE_TOT, 1.0f);
+
+    uint32_t running = 0;
+    for (int k = 0; k < 7; k++) {
+        L.bucket_offsets[k] = running;
+        L.bucket_counts[k]  = (uint32_t)super[k].size();
+        running += L.bucket_counts[k];
+    }
+    L.pairs.reserve(2u * running);
+    L.rest.reserve(running);
+    for (int k = 0; k < 6; k++) {
+        for (auto& pr : super[k]) {
+            L.pairs.push_back(pr.first);
+            L.pairs.push_back(pr.second);
+            L.rest.push_back(SPACING);
+        }
+    }
+    /* Bucket 6 has zero edges; no rest lengths to push. */
+
+    /* Populate the rigid_body_id table for the collision pipeline.
+     * Field particles default to 0; cube 0 = 1; cube 1 = 2. */
+    L.rigid_body_id.assign((size_t)ps.N, 0u);
+    for (int k = 0; k < N_LATTICE; k++) {
+        L.rigid_body_id[(size_t)base + (size_t)k] = 1u;
+        L.rigid_body_id[(size_t)base + (size_t)N_LATTICE + (size_t)k] = 2u;
+    }
+
+    printf("[rigid] cube2-collide: %d lattice particles, %u constraints "
+           "(5400 lattice + 0 joint), buckets=[%u %u %u %u %u %u %u], "
+           "base=%u, R_ANTIPODE=%.1f, v_orbit=%.4f, v_drift=%.4f, "
+           "expected_first_contact_frame≈%d\n",
+           N_LATTICE_TOT, running,
+           L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
+           L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5],
+           L.bucket_counts[6], base, R_ANTIPODE, v_orbit, V_DRIFT,
+           (int)((2.0f * R_ANTIPODE - (LX - 1) * SPACING) / (2.0f * V_DRIFT)));
+    return L;
+}
+
 /* ========================================================================
  * VIVIANI FIELD (same as blackhole_v21.c)
  * ======================================================================== */
@@ -888,6 +1041,7 @@ int main(int argc, char** argv) {
     RigidBodyMode rigid_body_mode = RIGID_BODY_OFF;
     int   rigid_count = 1;      /* number of cubes; only meaningful when --rigid-body cube1000 */
     float spin_rate   = 0.0f;   /* cube 1 angular velocity around hinge axis (rad/frame); cube2-hinge only */
+    int   max_frames  = 0;      /* exit after this many frames; 0 = run until window closed */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -926,9 +1080,10 @@ int main(int argc, char** argv) {
             else if (strcmp(m, "cube1000")         == 0) rigid_body_mode = RIGID_BODY_CUBE1000;
             else if (strcmp(m, "cube2-ballsocket") == 0) rigid_body_mode = RIGID_BODY_CUBE2_BALLSOCKET;
             else if (strcmp(m, "cube2-hinge")      == 0) rigid_body_mode = RIGID_BODY_CUBE2_HINGE;
+            else if (strcmp(m, "cube2-collide")    == 0) rigid_body_mode = RIGID_BODY_CUBE2_COLLIDE;
             else {
                 fprintf(stderr, "unknown --rigid-body '%s' "
-                                "(expected off, cube1000, cube2-ballsocket, or cube2-hinge)\n", m);
+                                "(expected off, cube1000, cube2-ballsocket, cube2-hinge, or cube2-collide)\n", m);
                 return 1;
             }
         }
@@ -942,13 +1097,17 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--spin-rate") == 0 && i+1 < argc) {
             spin_rate = (float)atof(argv[++i]);
         }
+        else if (strcmp(argv[i], "--frames") == 0 && i+1 < argc) {
+            max_frames = atoi(argv[++i]);
+            if (max_frames < 0) max_frames = 0;
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
                    "[--gpu-physics] [--project-only] "
                    "[--scatter-mode baseline|uniform|squaragon] "
                    "[--init-sort none|cell|viviani] "
-                   "[--rigid-body off|cube1000|cube2-ballsocket|cube2-hinge] "
-                   "[--rigid-count N] [--spin-rate R]\n");
+                   "[--rigid-body off|cube1000|cube2-ballsocket|cube2-hinge|cube2-collide] "
+                   "[--rigid-count N] [--spin-rate R] [--frames F]\n");
             return 0;
         }
     }
@@ -968,6 +1127,7 @@ int main(int argc, char** argv) {
     if      (rigid_body_mode == RIGID_BODY_CUBE1000)         n_rigid = rigid_count * 1000;
     else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) n_rigid = 2000;
     else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE)      n_rigid = 2000;
+    else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE)    n_rigid = 2000;
     num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
 
     /* Init particles — only [0, n_galaxy) gets generated and sorted;
@@ -983,6 +1143,8 @@ int main(int argc, char** argv) {
         lattice = init_rigid_body_cube2_ballsocket(particles, n_galaxy);
     } else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE) {
         lattice = init_rigid_body_cube2_hinge(particles, n_galaxy, spin_rate);
+    } else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) {
+        lattice = init_rigid_body_cube2_collide(particles, n_galaxy);
     }
 
     /* Init validation oracle */
@@ -1065,6 +1227,17 @@ int main(int argc, char** argv) {
                                   /*iterations=*/4);
         }
 
+        /* Phase 2.2 collision pipeline — only when the scenario populated
+         * lattice.rigid_body_id (currently only cube2-collide). C1 ships only
+         * the apply kernel + buffer infrastructure; C2 will add the fused
+         * broadphase+resolve kernel that actually generates contacts. */
+        if (!lattice.rigid_body_id.empty()) {
+            initCollisionCompute(gpuPhys, vkCtx,
+                                 lattice.rigid_body_id.data(),
+                                 lattice.base_index,
+                                 lattice.rigid_count);
+        }
+
         initDensityRender(gpuPhys, vkCtx);
     }
 
@@ -1118,6 +1291,7 @@ int main(int argc, char** argv) {
     int gpu_samples = 0;
 
     while (!glfwWindowShouldClose(window)) {
+        if (max_frames > 0 && frame >= max_frames) break;
         glfwPollEvents();
 
         if (!use_gpu_physics) {

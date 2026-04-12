@@ -1008,6 +1008,144 @@ void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
 }
 
 /* ========================================================================
+ * Phase 2.2 — COLLISION PIPELINE (dynamic contact constraints)
+ * ========================================================================
+ *
+ * C1 implements only the apply kernel + buffer infrastructure. The fused
+ * broadphase+resolve kernel arrives in C2 and reuses the same descriptor set.
+ *
+ * Per-pipeline set 1 layout:
+ *   binding 0  rigid_body_id[N]                uint32, init-time only
+ *   binding 1  vel_delta[N_rigid * 3]          int32,  zeroed/written per frame
+ *   binding 2  contact_count[1]                uint32, probe, reset per frame
+ *   binding 3  first_contact_frame[1]          uint32, probe, reset per frame
+ *
+ * The descriptor set is sized for 4 bindings even though C1's apply kernel
+ * only needs vel_delta — keeping the layout stable across C1/C2 means C2 only
+ * adds new pipelines, no re-layout, no re-bind.
+ */
+void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
+                          const uint32_t* rigid_body_ids,
+                          uint32_t        rigid_base,
+                          uint32_t        rigid_count) {
+    if (rigid_count == 0) {
+        fprintf(stderr, "[vk-compute] initCollisionCompute called with rigid_count=0; skipping\n");
+        return;
+    }
+
+    /* --- Allocate device-local SSBOs --- */
+    size_t rbid_bytes  = (size_t)phys.N * sizeof(uint32_t);
+    size_t vdelta_bytes = (size_t)rigid_count * 3 * sizeof(int32_t);
+    size_t counter_bytes = sizeof(uint32_t);
+
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.rigidBodyIdBuffer, phys.rigidBodyIdMemory, rbid_bytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.velDeltaBuffer, phys.velDeltaMemory, vdelta_bytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.contactCountBuffer, phys.contactCountMemory, counter_bytes);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.firstContactFrameBuffer, phys.firstContactFrameMemory, counter_bytes);
+
+    printf("[vk-compute] Collision pipeline: N=%d, rigid_base=%u, rigid_count=%u, "
+           "vel_delta=%.1f KB, rigid_body_id=%.1f KB\n",
+           phys.N, rigid_base, rigid_count,
+           (double)vdelta_bytes / 1024.0,
+           (double)rbid_bytes / 1024.0);
+
+    /* --- Stage + upload rigid_body_id once --- */
+    uploadToSSBO(ctx, phys.rigidBodyIdBuffer, rigid_body_ids, rbid_bytes);
+
+    /* --- Descriptor set layout for set 1: 4 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        set1Bindings[i].binding = i;
+        set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        set1Bindings[i].descriptorCount = 1;
+        set1Bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo set1Info = {};
+    set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    set1Info.bindingCount = 4;
+    set1Info.pBindings = set1Bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.collisionSet1Layout);
+
+    /* --- Pipeline layout for collision_apply: set 0 (siphon particles) + set 1 (collision) --- */
+    VkDescriptorSetLayout layouts[2] = { phys.descLayout, phys.collisionSet1Layout };
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(CollisionApplyPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 2;
+    plInfo.pSetLayouts = layouts;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.collisionApplyPipelineLayout);
+
+    /* --- collision_apply pipeline --- */
+    {
+        auto code = readShaderFile("collision_apply.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.collisionApplyPipelineLayout;
+
+        if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                      nullptr, &phys.collisionApplyPipeline) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create collision_apply pipeline");
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
+    /* --- Descriptor pool + set for set 1 --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = 4;
+
+    VkDescriptorPoolCreateInfo dpInfo = {};
+    dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpInfo.maxSets = 1;
+    dpInfo.poolSizeCount = 1;
+    dpInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &dpInfo, nullptr, &phys.collisionDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.collisionDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.collisionSet1Layout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.collisionSet1);
+
+    /* --- Write descriptors for set 1 --- */
+    VkDescriptorBufferInfo bufInfos[4] = {
+        { phys.rigidBodyIdBuffer,       0, VK_WHOLE_SIZE },
+        { phys.velDeltaBuffer,          0, VK_WHOLE_SIZE },
+        { phys.contactCountBuffer,      0, VK_WHOLE_SIZE },
+        { phys.firstContactFrameBuffer, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.collisionSet1;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+
+    phys.collisionEnabled = true;
+    printf("[vk-compute] Collision apply pipeline created (base=%u count=%u)\n",
+           rigid_base, rigid_count);
+}
+
+/* ========================================================================
  * DISPATCH — record compute commands
  * ======================================================================== */
 
@@ -1238,6 +1376,74 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      * defined. When disabled, constraint_ms reads ≈ 0. */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 4);
+
+    /* ---- Phase 2.2: Collision pipeline (dynamic contact constraints) ----
+     * C1 only ships the apply kernel + buffer reset. The fused
+     * broadphase+resolve kernel arrives in C2 and slots in between the
+     * reset and the apply. Until then, vel_delta stays zero each frame and
+     * the apply kernel is a no-op (int->float conversion + add of zero).
+     *
+     * Order:
+     *   1. vkCmdFillBuffer: zero vel_delta, contact_count, first_contact_frame
+     *   2. transfer->compute barrier
+     *   3. collision_apply dispatch (over rigid_count threads)
+     *   4. compute->compute barrier so siphon sees the (no-op for C1) vel writes
+     *
+     * collision_ms metric is deferred to C2 — it would require growing the
+     * timestamp pool from 8 to 9 slots per frame, which is more invasive than
+     * is justified for the C1 smoke test where there's no real collision work
+     * to time. */
+    if (phys.collisionEnabled) {
+        /* Reset the collision scratch buffers. */
+        vkCmdFillBuffer(cmd, phys.velDeltaBuffer, 0,
+                        (VkDeviceSize)phys.rigidCount * 3u * sizeof(int32_t), 0u);
+        vkCmdFillBuffer(cmd, phys.contactCountBuffer, 0,
+                        (VkDeviceSize)sizeof(uint32_t), 0u);
+        vkCmdFillBuffer(cmd, phys.firstContactFrameBuffer, 0,
+                        (VkDeviceSize)sizeof(uint32_t), 0xFFFFFFFFu);
+
+        /* Transfer -> compute barrier so collision_apply sees the zeros. */
+        {
+            VkMemoryBarrier b = {};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+
+        /* C2 will dispatch collision_resolve here, between reset and apply. */
+
+        /* collision_apply: vel_delta -> vel_x/y/z */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionApplyPipeline);
+        VkDescriptorSet asets[2] = { phys.descSet, phys.collisionSet1 };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionApplyPipelineLayout, 0, 2, asets, 0, nullptr);
+
+        CollisionApplyPushConstants apc = {};
+        apc.rigid_base  = phys.rigidBaseIndex;
+        apc.rigid_count = phys.rigidCount;
+        vkCmdPushConstants(cmd, phys.collisionApplyPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(apc), &apc);
+
+        vkCmdDispatch(cmd, (phys.rigidCount + 63u) / 64u, 1, 1);
+
+        /* Compute -> compute barrier so siphon sees vel writes. */
+        {
+            VkMemoryBarrier b = {};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+    }
 
     /* ---- Siphon (physics) -------------------------------------------- */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
@@ -1961,6 +2167,22 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
         vkFreeMemory(device, phys.restLengthsMemory, nullptr);
         vkDestroyBuffer(device, phys.invMassesBuffer, nullptr);
         vkFreeMemory(device, phys.invMassesMemory, nullptr);
+    }
+
+    /* Collision pipeline + collision SSBOs (optional, Phase 2.2) */
+    if (phys.collisionEnabled) {
+        vkDestroyPipeline(device, phys.collisionApplyPipeline, nullptr);
+        vkDestroyPipelineLayout(device, phys.collisionApplyPipelineLayout, nullptr);
+        vkDestroyDescriptorSetLayout(device, phys.collisionSet1Layout, nullptr);
+        vkDestroyDescriptorPool(device, phys.collisionDescPool, nullptr);
+        vkDestroyBuffer(device, phys.rigidBodyIdBuffer, nullptr);
+        vkFreeMemory(device, phys.rigidBodyIdMemory, nullptr);
+        vkDestroyBuffer(device, phys.velDeltaBuffer, nullptr);
+        vkFreeMemory(device, phys.velDeltaMemory, nullptr);
+        vkDestroyBuffer(device, phys.contactCountBuffer, nullptr);
+        vkFreeMemory(device, phys.contactCountMemory, nullptr);
+        vkDestroyBuffer(device, phys.firstContactFrameBuffer, nullptr);
+        vkFreeMemory(device, phys.firstContactFrameMemory, nullptr);
     }
 
     /* Projection pipeline */

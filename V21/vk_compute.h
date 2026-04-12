@@ -70,6 +70,14 @@ struct ConstraintPushConstants {
     uint32_t _pad;
 };
 
+/* Push constants for collision_apply.comp (Phase 2.2 C1 — int->float vel writeback).
+ * Phase 2.2 C2 will introduce a separate ConstraintResolvePushConstants struct
+ * for the fused broadphase+impulse kernel. */
+struct CollisionApplyPushConstants {
+    uint32_t rigid_base;          /* = N_field, first lattice particle index */
+    uint32_t rigid_count;         /* = N_rigid */
+};
+
 /* Cell grid constants (must match scatter.comp) */
 #define V21_GRID_DIM          64
 #define V21_GRID_CELLS        (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
@@ -191,6 +199,34 @@ struct PhysicsCompute {
     uint32_t constraintBucketCounts[7]; /* count per (axis × parity) bucket; [6] reserved for joint edges */
     uint32_t constraintIterations;      /* solver iterations per frame */
 
+    /* Collision pipeline (Phase 2.2 — dynamic contact constraints, velocity-level
+     * impulses). Allocated when collisionEnabled is true (set by initCollisionCompute).
+     *
+     * C1 ships only the apply kernel + buffer infrastructure; the fused broadphase
+     * + resolve kernel lands in C2. Buffers are sized for the rigid lattice range
+     * only (vel_delta is N_rigid*3 int32 = 24 KB for cube2-collide).
+     *
+     * Descriptor set layout (per-pipeline set 1):
+     *   binding 0  rigid_body_id[N]                uint32, init-time
+     *   binding 1  vel_delta[N_rigid * 3]          int32,  zeroed/written per frame
+     *   binding 2  contact_count[1]                uint32, probe, reset per frame
+     *   binding 3  first_contact_frame[1]          uint32, probe, reset per frame
+     */
+    bool                  collisionEnabled;
+    VkBuffer              rigidBodyIdBuffer;        /* uint32[N], init-time only */
+    VkDeviceMemory        rigidBodyIdMemory;
+    VkBuffer              velDeltaBuffer;           /* int32[N_rigid * 3] */
+    VkDeviceMemory        velDeltaMemory;
+    VkBuffer              contactCountBuffer;       /* uint32[1] */
+    VkDeviceMemory        contactCountMemory;
+    VkBuffer              firstContactFrameBuffer;  /* uint32[1] */
+    VkDeviceMemory        firstContactFrameMemory;
+    VkDescriptorSetLayout collisionSet1Layout;      /* set 1: 4 SSBOs */
+    VkPipelineLayout      collisionApplyPipelineLayout;
+    VkPipeline            collisionApplyPipeline;
+    VkDescriptorPool      collisionDescPool;
+    VkDescriptorSet       collisionSet1;
+
     /* Projection compute pipeline (rendering) */
     VkDescriptorSetLayout projDescLayout;
     VkPipelineLayout projPipelineLayout;
@@ -282,6 +318,22 @@ void initConstraintCompute(PhysicsCompute& phys, VulkanContext& ctx,
                            uint32_t        rigid_base,
                            uint32_t        rigid_count,
                            uint32_t        iterations);
+
+/* Initialize the collision pipeline (Phase 2.2 — dynamic contact constraints).
+ * C1 builds the descriptor set, allocates the rigid_body_id / vel_delta /
+ * probe SSBOs, uploads rigid_body_id once, and creates the collision_apply
+ * pipeline. The fused broadphase+resolve kernel is added in C2.
+ *
+ * rigid_body_ids must point to a host array of length phys.N: 0 for field
+ * particles, 1 for cube 0, 2 for cube 1, etc. (Whatever scheme the rigid
+ * scenario init function uses.)
+ *
+ * Must be called after initConstraintCompute (depends on phys.descLayout
+ * for set 0). */
+void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
+                          const uint32_t* rigid_body_ids,    /* uint32[N] */
+                          uint32_t        rigid_base,
+                          uint32_t        rigid_count);
 
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
