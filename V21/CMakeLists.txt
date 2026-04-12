@@ -50,6 +50,8 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/collision_resolve.comp
     ${KERNEL_DIR}/collision_snapshot.comp
     ${KERNEL_DIR}/collision_sync.comp
+    ${KERNEL_DIR}/cartesian_to_graded.comp
+    ${KERNEL_DIR}/graded_to_cartesian.comp
 )
 
 set(SPV_OUTPUTS)

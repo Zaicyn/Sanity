@@ -1,0 +1,75 @@
+// graded_to_cartesian.comp — Reconstruct Cartesian from grade-separated state
+// ============================================================================
+// Per-frame extraction kernel. Reads graded state from set 2 and writes
+// Cartesian pos_x/y/z, vel_x/y/z to set 0 for oracle readback + rendering.
+//
+// Reconstruction:
+//   r_eff = r + delta_r
+//   pos_x = r_eff * cos(phi)
+//   pos_y = delta_y
+//   pos_z = r_eff * sin(phi)
+//
+//   vel_x = vel_r * cos(phi) - r_eff * omega_orb * sin(phi)
+//   vel_y = vel_y
+//   vel_z = vel_r * sin(phi) + r_eff * omega_orb * cos(phi)
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Set 0 — Cartesian particle SSBOs (write targets for reconstruction)
+// ============================================================================
+
+layout(std430, set = 0, binding = 0)  writeonly buffer PosX   { float pos_x[];   };
+layout(std430, set = 0, binding = 1)  writeonly buffer PosY   { float pos_y[];   };
+layout(std430, set = 0, binding = 2)  writeonly buffer PosZ   { float pos_z[];   };
+layout(std430, set = 0, binding = 3)  writeonly buffer VelX   { float vel_x[];   };
+layout(std430, set = 0, binding = 4)  writeonly buffer VelY   { float vel_y[];   };
+layout(std430, set = 0, binding = 5)  writeonly buffer VelZ   { float vel_z[];   };
+
+// ============================================================================
+// Set 2 — Graded particle state (read sources)
+// ============================================================================
+
+layout(std430, set = 2, binding = 0)  readonly buffer GR       { float g_r[];         };
+layout(std430, set = 2, binding = 1)  readonly buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2)  readonly buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3)  readonly buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4)  readonly buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5)  readonly buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6)  readonly buffer GOmegaOrb{ float g_omega_orb[]; };
+
+layout(push_constant) uniform PushConstants {
+    int N;
+} pc;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    float r     = g_r[i];
+    float dr    = g_delta_r[i];
+    float dy    = g_delta_y[i];
+    float vr    = g_vel_r[i];
+    float vy    = g_vel_y[i];
+    float phi   = g_phi[i];
+    float omega = g_omega_orb[i];
+
+    float r_eff = r + dr;
+    float cp    = cos(phi);
+    float sp    = sin(phi);
+
+    // Position reconstruction
+    pos_x[i] = r_eff * cp;
+    pos_y[i] = dy;
+    pos_z[i] = r_eff * sp;
+
+    // Velocity reconstruction: radial + tangential components
+    float v_t = r_eff * omega;
+    vel_x[i] = vr * cp - v_t * sp;
+    vel_y[i] = vy;
+    vel_z[i] = vr * sp + v_t * cp;
+}

@@ -1674,6 +1674,211 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 }
 
 /* ========================================================================
+ * GRADE-SEPARATED STATE — Phase 3.1 scaffolding
+ * ======================================================================== */
+
+void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
+    int N = phys.N;
+
+    /* --- Allocate 10 graded SSBOs (all float[N]) --- */
+    for (int i = 0; i < VK_GRADED_NUM_BINDINGS; i++) {
+        createSSBO(ctx.device, ctx.physicalDevice,
+                   phys.graded_buffers[i], phys.graded_memory[i],
+                   (size_t)N * sizeof(float));
+    }
+
+    /* --- Descriptor set layout for set 2 (10 storage buffers) --- */
+    VkDescriptorSetLayoutBinding bindings[VK_GRADED_NUM_BINDINGS] = {};
+    for (int i = 0; i < VK_GRADED_NUM_BINDINGS; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo layoutInfo = {};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = VK_GRADED_NUM_BINDINGS;
+    layoutInfo.pBindings = bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &layoutInfo, nullptr,
+                                &phys.gradedSetLayout);
+
+    /* --- cartesian_to_graded pipeline: set 0 (read) + set 2 (write) --- */
+    {
+        VkDescriptorSetLayout sets[2] = { phys.descLayout, phys.gradedSetLayout };
+        VkPushConstantRange pcRange = {};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset = 0;
+        pcRange.size = sizeof(CartesianToGradedPushConstants);
+        VkPipelineLayoutCreateInfo plInfo = {};
+        plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plInfo.setLayoutCount = 3;  /* set 0, (skip set 1), set 2 */
+        /* We need a dummy set 1 layout to keep set indices correct.
+         * Use an empty layout. */
+        VkDescriptorSetLayoutCreateInfo emptyInfo = {};
+        emptyInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        emptyInfo.bindingCount = 0;
+        VkDescriptorSetLayout emptyLayout;
+        vkCreateDescriptorSetLayout(ctx.device, &emptyInfo, nullptr, &emptyLayout);
+        VkDescriptorSetLayout allSets[3] = { phys.descLayout, emptyLayout, phys.gradedSetLayout };
+        plInfo.pSetLayouts = allSets;
+        plInfo.setLayoutCount = 3;
+        plInfo.pushConstantRangeCount = 1;
+        plInfo.pPushConstantRanges = &pcRange;
+        vkCreatePipelineLayout(ctx.device, &plInfo, nullptr,
+                               &phys.cartToGradedPipelineLayout);
+
+        auto code = readShaderFile("cartesian_to_graded.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.cartToGradedPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr,
+                                 &phys.cartToGradedPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+        vkDestroyDescriptorSetLayout(ctx.device, emptyLayout, nullptr);
+    }
+
+    /* --- graded_to_cartesian pipeline: set 0 (write) + set 2 (read) --- */
+    {
+        VkDescriptorSetLayoutCreateInfo emptyInfo = {};
+        emptyInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        emptyInfo.bindingCount = 0;
+        VkDescriptorSetLayout emptyLayout;
+        vkCreateDescriptorSetLayout(ctx.device, &emptyInfo, nullptr, &emptyLayout);
+        VkDescriptorSetLayout allSets[3] = { phys.descLayout, emptyLayout, phys.gradedSetLayout };
+        VkPushConstantRange pcRange = {};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset = 0;
+        pcRange.size = sizeof(GradedToCartesianPushConstants);
+        VkPipelineLayoutCreateInfo plInfo = {};
+        plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plInfo.setLayoutCount = 3;
+        plInfo.pSetLayouts = allSets;
+        plInfo.pushConstantRangeCount = 1;
+        plInfo.pPushConstantRanges = &pcRange;
+        vkCreatePipelineLayout(ctx.device, &plInfo, nullptr,
+                               &phys.gradedToCartPipelineLayout);
+
+        auto code = readShaderFile("graded_to_cartesian.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.gradedToCartPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr,
+                                 &phys.gradedToCartPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+        vkDestroyDescriptorSetLayout(ctx.device, emptyLayout, nullptr);
+    }
+
+    /* --- Descriptor pool + set allocation for set 2 --- */
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = VK_GRADED_NUM_BINDINGS;
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 1;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &phys.gradedDescPool);
+
+    VkDescriptorSetAllocateInfo dsInfo = {};
+    dsInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsInfo.descriptorPool = phys.gradedDescPool;
+    dsInfo.descriptorSetCount = 1;
+    dsInfo.pSetLayouts = &phys.gradedSetLayout;
+    vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.gradedSet);
+
+    /* --- Write descriptors for set 2 --- */
+    VkDescriptorBufferInfo bufInfos[VK_GRADED_NUM_BINDINGS];
+    VkWriteDescriptorSet writes[VK_GRADED_NUM_BINDINGS];
+    for (int i = 0; i < VK_GRADED_NUM_BINDINGS; i++) {
+        bufInfos[i] = { phys.graded_buffers[i], 0, VK_WHOLE_SIZE };
+        writes[i] = {};
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.gradedSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, VK_GRADED_NUM_BINDINGS, writes, 0, nullptr);
+
+    phys.gradedEnabled = true;
+    printf("[vk-compute] Grade-separated buffers initialized (%d bindings, %.1f MB)\n",
+           VK_GRADED_NUM_BINDINGS,
+           (float)VK_GRADED_NUM_BINDINGS * N * sizeof(float) / (1024.0f * 1024.0f));
+}
+
+void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd) {
+    if (!phys.gradedEnabled) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      phys.cartToGradedPipeline);
+
+    VkDescriptorSet sets[3] = { phys.descSet, VK_NULL_HANDLE, phys.gradedSet };
+    /* Bind set 0 and set 2 only (set 1 is unused). */
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.cartToGradedPipelineLayout, 0, 1, &sets[0], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.cartToGradedPipelineLayout, 2, 1, &sets[2], 0, nullptr);
+
+    CartesianToGradedPushConstants pc = {};
+    pc.N = phys.N;
+    pc.BH_MASS = 1.0f;
+    vkCmdPushConstants(cmd, phys.cartToGradedPipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: graded writes must complete before any reader. */
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd) {
+    if (!phys.gradedEnabled) return;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      phys.gradedToCartPipeline);
+
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.gradedToCartPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.gradedToCartPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+
+    GradedToCartesianPushConstants pc = {};
+    pc.N = phys.N;
+    vkCmdPushConstants(cmd, phys.gradedToCartPipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: Cartesian writes must complete before oracle/rendering. */
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+/* ========================================================================
  * DENSITY RENDERING — compute projection + tone-map (no rasterizer)
  * ======================================================================== */
 

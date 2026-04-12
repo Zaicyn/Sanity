@@ -127,6 +127,20 @@ struct ProjectCameraUBO {
 /* Number of SoA arrays bound as SSBOs */
 #define VK_COMPUTE_NUM_BINDINGS 16
 
+/* Number of grade-separated buffers (set 2) */
+#define VK_GRADED_NUM_BINDINGS 10
+
+/* Push constants for cartesian_to_graded.comp */
+struct CartesianToGradedPushConstants {
+    int   N;
+    float BH_MASS;
+};
+
+/* Push constants for graded_to_cartesian.comp */
+struct GradedToCartesianPushConstants {
+    int N;
+};
+
 /* Physics compute state */
 struct PhysicsCompute {
     /* Per-array SSBOs */
@@ -285,6 +299,29 @@ struct PhysicsCompute {
     /* Particle count */
     int N;
     bool initialized;
+
+    /* ---- Grade-separated state (Phase 3.1 scaffolding) ----
+     * 10 SSBOs in descriptor set 2, mirroring Cartesian set 0.
+     * Binding 0: r[N]          (grade 0, cylindrical radius)
+     * Binding 1: delta_r[N]    (grade 1, radial offset from shell)
+     * Binding 2: delta_y[N]    (grade 1, vertical offset)
+     * Binding 3: vel_r[N]      (grade 1, radial velocity)
+     * Binding 4: vel_y[N]      (grade 1, vertical velocity)
+     * Binding 5: phi[N]        (grade 2, orbital azimuthal phase)
+     * Binding 6: omega_orb[N]  (grade 2, orbital angular velocity)
+     * Binding 7: theta[N]      (grade 2, Viviani phase)
+     * Binding 8: omega_nat[N]  (grade 2, natural frequency)
+     * Binding 9: L_tilt[N]     (grade 2, angular momentum tilt) */
+    bool                  gradedEnabled;
+    VkBuffer              graded_buffers[VK_GRADED_NUM_BINDINGS];
+    VkDeviceMemory        graded_memory[VK_GRADED_NUM_BINDINGS];
+    VkDescriptorSetLayout gradedSetLayout;
+    VkPipelineLayout      cartToGradedPipelineLayout;
+    VkPipeline            cartToGradedPipeline;
+    VkPipelineLayout      gradedToCartPipelineLayout;
+    VkPipeline            gradedToCartPipeline;
+    VkDescriptorPool      gradedDescPool;
+    VkDescriptorSet       gradedSet;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.
@@ -349,6 +386,20 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
                           const uint32_t* rigid_body_ids,    /* uint32[N] */
                           uint32_t        rigid_base,
                           uint32_t        rigid_count);
+
+/* Initialize grade-separated buffers + conversion pipelines (Phase 3.1).
+ * Allocates 10 SSBOs in descriptor set 2, creates cartesian_to_graded
+ * and graded_to_cartesian compute pipelines. Must be called after
+ * initPhysicsCompute (depends on phys.descLayout for set 0). */
+void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx);
+
+/* One-shot: convert Cartesian set 0 → graded set 2.
+ * Run once after initGradedCompute to populate graded buffers. */
+void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd);
+
+/* Per-frame: reconstruct Cartesian set 0 from graded set 2.
+ * Run each frame before oracle readback / rendering. */
+void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd);
 
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
