@@ -1380,44 +1380,9 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 3);
 
-    /* ---- Phase 2.2: Position snapshot (before constraint solve) ----
-     * Only needed in Cartesian mode. In graded mode (Phase 3), there's no
-     * velocity sync — constraints write Grade 1 only, vel is independent. */
-    if (phys.collisionEnabled && !phys.gradedEnabled) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          phys.collisionSnapshotPipeline);
-        VkDescriptorSet snapsets[2] = { phys.descSet, phys.collisionSet1 };
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.collisionApplyPipelineLayout, 0, 2, snapsets, 0, nullptr);
-
-        CollisionApplyPushConstants snappc = {};
-        snappc.rigid_base  = phys.rigidBaseIndex;
-        snappc.rigid_count = phys.rigidCount;
-        snappc.dt          = dt;
-        snappc._pad        = 0;
-        vkCmdPushConstants(cmd, phys.collisionApplyPipelineLayout,
-                           VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(snappc), &snappc);
-
-        vkCmdDispatch(cmd, (phys.rigidCount + 255u) / 256u, 1, 1);
-
-        VkMemoryBarrier snapBarrier = {};
-        snapBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        snapBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        snapBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &snapBarrier, 0, nullptr, 0, nullptr);
-    }
-
-    /* ---- Pass 4: Constraint Solve (PBD distance constraints, 6-bucket GS)
-     * Dispatches the constraint solver when the rigid-body mode is enabled.
-     * Each outer iteration runs 6 vertex-disjoint bucket dispatches with a
-     * memory barrier between each bucket so later buckets see earlier writes
-     * to pos_x/y/z. The solver touches only positions (PBD style). After
-     * the solve, collision_sync incorporates the position corrections into
-     * velocity to maintain velocity-position consistency. */
+    /* ---- Pass 4: Constraint Solve (graded, Grade 1 only) ----
+     * No position snapshot or velocity sync needed — grade separation
+     * makes constraints and velocity independent by construction. */
     if (phys.constraintEnabled) {
         ConstraintPushConstants cpc = {};
         cpc.rigid_base  = phys.rigidBaseIndex;
@@ -1437,69 +1402,37 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
             if (phys.constraintBucketCounts[b] > 0) last_nonempty_bucket = b;
         }
 
-        if (phys.gradedEnabled) {
-            /* Phase 3.3: graded constraint solver — set 0 + set 1 + set 2 */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              phys.constraintGradedPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.constraintGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.constraintGradedPipelineLayout, 1, 1, &phys.constraintSet1, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.constraintGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.constraintGradedPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.constraintGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.constraintGradedPipelineLayout, 1, 1, &phys.constraintSet1, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.constraintGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
-            for (uint32_t it = 0; it < phys.constraintIterations; it++) {
-                for (int bucket = 0; bucket < 7; bucket++) {
-                    cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
-                    cpc.constraint_count  = phys.constraintBucketCounts[bucket];
-                    if (cpc.constraint_count == 0) continue;
+        for (uint32_t it = 0; it < phys.constraintIterations; it++) {
+            for (int bucket = 0; bucket < 7; bucket++) {
+                cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
+                cpc.constraint_count  = phys.constraintBucketCounts[bucket];
+                if (cpc.constraint_count == 0) continue;
 
-                    vkCmdPushConstants(cmd, phys.constraintGradedPipelineLayout,
-                                       VK_SHADER_STAGE_COMPUTE_BIT,
-                                       0, sizeof(cpc), &cpc);
-                    vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
+                vkCmdPushConstants(cmd, phys.constraintGradedPipelineLayout,
+                                   VK_SHADER_STAGE_COMPUTE_BIT,
+                                   0, sizeof(cpc), &cpc);
+                vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
 
-                    bool is_last = (it + 1 == phys.constraintIterations) &&
-                                   (bucket == last_nonempty_bucket);
-                    if (!is_last) {
-                        vkCmdPipelineBarrier(cmd,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
-                    }
-                }
-            }
-        } else {
-            /* Original Cartesian constraint solver */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.constraintPipeline);
-            VkDescriptorSet csets[2] = { phys.descSet, phys.constraintSet1 };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.constraintPipelineLayout, 0, 2, csets, 0, nullptr);
-
-            for (uint32_t it = 0; it < phys.constraintIterations; it++) {
-                for (int bucket = 0; bucket < 7; bucket++) {
-                    cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
-                    cpc.constraint_count  = phys.constraintBucketCounts[bucket];
-                    if (cpc.constraint_count == 0) continue;
-
-                    vkCmdPushConstants(cmd, phys.constraintPipelineLayout,
-                                       VK_SHADER_STAGE_COMPUTE_BIT,
-                                       0, sizeof(cpc), &cpc);
-                    vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
-
-                    bool is_last = (it + 1 == phys.constraintIterations) &&
-                                   (bucket == last_nonempty_bucket);
-                    if (!is_last) {
-                        vkCmdPipelineBarrier(cmd,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
-                    }
+                bool is_last = (it + 1 == phys.constraintIterations) &&
+                               (bucket == last_nonempty_bucket);
+                if (!is_last) {
+                    vkCmdPipelineBarrier(cmd,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
                 }
             }
         }
 
-        /* Final barrier: constraint writes → next pass reads */
         VkMemoryBarrier finalBarrier = {};
         finalBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         finalBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1510,41 +1443,8 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
             0, 1, &finalBarrier, 0, nullptr, 0, nullptr);
     }
 
-    /* Constraint end — written unconditionally so constraint_ms is always
-     * defined. When disabled, constraint_ms reads ≈ 0. */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 4);
-
-    /* ---- Phase 2.2: Velocity sync (after constraint solve) ----
-     * Only in Cartesian mode. In graded mode, constraints write Grade 1
-     * (delta_r/delta_y) independently from velocity — no sync needed. */
-    if (phys.collisionEnabled && !phys.gradedEnabled) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          phys.collisionSyncPipeline);
-        VkDescriptorSet syncsets[2] = { phys.descSet, phys.collisionSet1 };
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.collisionSyncPipelineLayout, 0, 2, syncsets, 0, nullptr);
-
-        CollisionApplyPushConstants syncpc = {};
-        syncpc.rigid_base  = phys.rigidBaseIndex;
-        syncpc.rigid_count = phys.rigidCount;
-        syncpc.dt          = dt;
-        syncpc._pad        = 0;
-        vkCmdPushConstants(cmd, phys.collisionSyncPipelineLayout,
-                           VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(syncpc), &syncpc);
-
-        vkCmdDispatch(cmd, (phys.rigidCount + 255u) / 256u, 1, 1);
-
-        VkMemoryBarrier syncBarrier = {};
-        syncBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        syncBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        syncBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &syncBarrier, 0, nullptr, 0, nullptr);
-    }
 
     /* ---- Phase 2.2: Collision pipeline (dynamic contact constraints) ----
      * C1 only ships the apply kernel + buffer reset. The fused
@@ -1583,43 +1483,24 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                 0, 1, &b, 0, nullptr, 0, nullptr);
         }
 
-        /* collision_resolve + collision_apply — dual path (graded / Cartesian) */
+        /* collision_resolve — graded (reads set 2, writes vel_delta set 1) */
         CollisionResolvePushConstants rpc = {};
         rpc.rigid_base    = phys.rigidBaseIndex;
         rpc.rigid_count   = phys.rigidCount;
         rpc.dt            = dt;
         rpc.frame_number  = (uint32_t)frame;
 
-        CollisionApplyPushConstants apc = {};
-        apc.rigid_base  = phys.rigidBaseIndex;
-        apc.rigid_count = phys.rigidCount;
-        apc.dt          = dt;
-        apc._pad        = 0;
-
-        if (phys.gradedEnabled) {
-            /* Phase 3.4: graded resolve — reads set 2, writes vel_delta (set 1) */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              phys.collisionResolveGradedPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionResolveGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionResolveGradedPipelineLayout, 1, 1, &phys.collisionSet1, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionResolveGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
-
-            vkCmdPushConstants(cmd, phys.collisionResolveGradedPipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
-            uint32_t groups = (phys.rigidCount + 15u) / 16u;
-            vkCmdDispatch(cmd, groups, groups, 1);
-        } else {
-            /* Cartesian resolve */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              phys.collisionResolvePipeline);
-            VkDescriptorSet rsets[2] = { phys.descSet, phys.collisionSet1 };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionResolvePipelineLayout, 0, 2, rsets, 0, nullptr);
-            vkCmdPushConstants(cmd, phys.collisionResolvePipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionResolveGradedPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionResolveGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionResolveGradedPipelineLayout, 1, 1, &phys.collisionSet1, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionResolveGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+        vkCmdPushConstants(cmd, phys.collisionResolveGradedPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
+        {
             uint32_t groups = (phys.rigidCount + 15u) / 16u;
             vkCmdDispatch(cmd, groups, groups, 1);
         }
@@ -1636,30 +1517,24 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                 0, 1, &b, 0, nullptr, 0, nullptr);
         }
 
-        if (phys.gradedEnabled) {
-            /* Phase 3.4: graded apply — decomposes Cartesian vel_delta → Grade 1 */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              phys.collisionApplyGradedPipeline);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionApplyGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionApplyGradedPipelineLayout, 1, 1, &phys.collisionSet1, 0, nullptr);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionApplyGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
-            vkCmdPushConstants(cmd, phys.collisionApplyGradedPipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(apc), &apc);
-            vkCmdDispatch(cmd, (phys.rigidCount + 63u) / 64u, 1, 1);
-        } else {
-            /* Cartesian apply */
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                              phys.collisionApplyPipeline);
-            VkDescriptorSet asets[2] = { phys.descSet, phys.collisionSet1 };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                phys.collisionApplyPipelineLayout, 0, 2, asets, 0, nullptr);
-            vkCmdPushConstants(cmd, phys.collisionApplyPipelineLayout,
-                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(apc), &apc);
-            vkCmdDispatch(cmd, (phys.rigidCount + 63u) / 64u, 1, 1);
-        }
+        /* collision_apply — graded (decomposes Cartesian vel_delta → Grade 1) */
+        CollisionApplyPushConstants apc = {};
+        apc.rigid_base  = phys.rigidBaseIndex;
+        apc.rigid_count = phys.rigidCount;
+        apc.dt          = dt;
+        apc._pad        = 0;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionApplyGradedPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionApplyGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionApplyGradedPipelineLayout, 1, 1, &phys.collisionSet1, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionApplyGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+        vkCmdPushConstants(cmd, phys.collisionApplyGradedPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(apc), &apc);
+        vkCmdDispatch(cmd, (phys.rigidCount + 63u) / 64u, 1, 1);
 
         /* Compute -> compute barrier so siphon sees vel writes. */
         {
@@ -1691,21 +1566,21 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     push.seam_bits = 0x03;  /* SEAM_FULL */
     push.bias = 0.75f;
 
-    if (phys.gradedEnabled) {
-        /* Phase 3.2: graded siphon — operates on set 0 (pump) + set 2 (graded) */
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                          phys.siphonGradedPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+    /* Graded siphon — operates on set 0 (pump) + set 2 (graded) */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      phys.siphonGradedPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
-        vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
-                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
 
-        /* Barrier: graded siphon writes must complete before graded_to_cartesian */
+    /* Barrier: graded siphon writes must complete before graded_to_cartesian */
+    {
         VkMemoryBarrier gbar = {};
         gbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         gbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1714,20 +1589,10 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &gbar, 0, nullptr, 0, nullptr);
-
-        /* Reconstruct Cartesian from graded for rendering + oracle */
-        dispatchGradedToCartesian(phys, cmd);
-    } else {
-        /* Original Cartesian siphon */
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.pipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-
-        vkCmdPushConstants(cmd, phys.pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(push), &push);
-
-        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
     }
+
+    /* Reconstruct Cartesian from graded for scatter/rendering/oracle */
+    dispatchGradedToCartesian(phys, cmd);
 
     /* Memory barrier: siphon (or graded_to_cartesian) writes must be visible
      * to the projection pass and transfer reads (oracle readback). */
@@ -2029,14 +1894,14 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         printf("[vk-compute] Graded collision pipelines created (resolve + apply)\n");
     }
 
-    phys.gradedEnabled = true;
+    /* graded is now the only path (Phase 3.5) */
     printf("[vk-compute] Grade-separated buffers initialized (%d bindings, %.1f MB)\n",
            VK_GRADED_NUM_BINDINGS,
            (float)VK_GRADED_NUM_BINDINGS * N * sizeof(float) / (1024.0f * 1024.0f));
 }
 
 void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd) {
-    if (!phys.gradedEnabled) return;
+
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                       phys.cartToGradedPipeline);
@@ -2068,7 +1933,7 @@ void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd) {
 }
 
 void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd) {
-    if (!phys.gradedEnabled) return;
+
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                       phys.gradedToCartPipeline);

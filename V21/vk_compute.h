@@ -312,7 +312,7 @@ struct PhysicsCompute {
      * Binding 7: theta[N]      (grade 2, Viviani phase)
      * Binding 8: omega_nat[N]  (grade 2, natural frequency)
      * Binding 9: L_tilt[N]     (grade 2, angular momentum tilt) */
-    bool                  gradedEnabled;
+    /* gradedEnabled removed in Phase 3.5 — graded is the only path */
     VkBuffer              graded_buffers[VK_GRADED_NUM_BINDINGS];
     VkDeviceMemory        graded_memory[VK_GRADED_NUM_BINDINGS];
     VkDescriptorSetLayout gradedSetLayout;
