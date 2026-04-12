@@ -1165,3 +1165,153 @@ No code changes beyond the Phase 2.3.1 commit. The `--spin-rate` flag
 was already added in the main Phase 2.3.1 edits. Stage 6 used the
 shipped binary with different CLI args. This addendum appends to the
 same doc section; the commit for Stage 6 is just the doc update.
+
+### Stage 6b — Beat pattern vs spin-rate sweep
+
+The Stage 6 single-point result left three open questions about the
+beat pattern structure (from the Phase 2.3.1 Stage 6b plan):
+
+> **Q1:** How does the beat period scale with spin rate? Linear
+> (harmonic oscillator), constant (mode-locked to orbital rotation),
+> or threshold-dependent (stability boundary)?
+>
+> **Q2:** How does the peak hinge stretch scale with spin rate?
+>
+> **Q3:** Is there a spin rate above which the solver can't keep up
+> and d_hinge drifts unbounded?
+
+Three additional 100K smoke runs (`-n 98000 --rigid-body cube2-hinge`)
+at `--spin-rate` = 0.005, 0.02, 0.05, combined with the existing
+Stage 6 data point at 0.01, give four points across a 10× range.
+
+#### Beat structure table
+
+| spin rate | 1st peak frame | 1st peak stretch | 1st trough frame | stretch ratio vs 0.005 | ω² ratio vs 0.005 |
+|---:|---:|---:|---:|---:|---:|
+| 0.005 | ~5500  | 0.0077 | ~15500 | 1.0× | 1.0× |
+| 0.01  | ~3500  | 0.0206 | ~11500 | 2.7× | 4.0× |
+| 0.02  | ~2500  | 0.0464 | ~8000  | 6.0× | 16.0× |
+| 0.05  | ~1000  | 0.1100 | ~6000  | 14.3× | 100.0× |
+
+All four runs stayed **bounded** across ~22000 frames — no blowup, no
+monotonic drift, no catastrophic failure at any spin rate tested.
+Q3's "stability ceiling" is above 0.05 rad/frame; the substrate
+comfortably absorbs rotational input up to 11% peak hinge stretch
+without losing coherence. (At the highest rate, d_hinge_A and
+d_hinge_B start diverging from each other — 0.020 gap at frame
+22000 — showing the first sign of asymmetric loading, but neither
+edge drifts unbounded.)
+
+#### Q1: beat period is weakly dependent on spin rate
+
+The first-peak frame drops sharply with increasing spin rate
+(5500 → 3500 → 2500 → 1000), but that's the *rise-time*, not the
+beat period. The full beat period (peak-to-peak) is roughly
+10000-15000 frames across the whole range:
+
+- spin=0.005: peak 5500, second peak begins ~20000+ → period ~15000 frames
+- spin=0.01:  peak 3500, period ~16000 frames (from Stage 6)
+- spin=0.02:  peak 2500, second rise starts ~17000 → period ~14500 frames
+- spin=0.05:  peak 1000, second rise starts ~13000 → period ~12000 frames
+
+**Period shrinks only modestly (~25%) across a 10× spin rate range.**
+A classical harmonic oscillator driven at frequency ω would have
+beat period scaling as 1/ω — so a 10× spin rate should give a 10×
+shorter period (from 15000 → 1500 frames). Observed: 15000 → 12000.
+
+**The beat period is NOT set by the spin rate.** It's set by something
+else — most plausibly a low-order commensurate ratio with the orbital
+period. At r=50 in V21 units with v_orbit = sqrt(1/50) ≈ 0.141, the
+angular orbital velocity is ω_orb ≈ 0.141/50 ≈ 2.82e-3 rad/frame, and
+the full orbital period is 2π/ω_orb ≈ 2227 frames. The observed beat
+periods (12000-15000 frames) are **5-7 orbital periods long**,
+suggesting the beat is a low-order commensurate resonance between the
+hinge rotation and the orbital rotation — *not* a free oscillation.
+
+#### Q2: peak stretch scales as ω^1.2, not ω²
+
+Centripetal force on the hinge anchor scales as ω² × r, so a naive
+prediction is that peak stretch should scale quadratically in spin
+rate. Log-log slope of the four measured points:
+
+```
+log(0.11) − log(0.0077)   −2.207 − (−4.866)   2.659
+───────────────────────── = ─────────────────── = ─────── ≈ 1.155
+log(0.05) − log(0.005)    −2.996 − (−5.298)   2.302
+```
+
+**Observed scaling: peak stretch ≈ ω^1.16**, about halfway between
+linear (n=1) and quadratic (n=2). The solver is absorbing the
+quadratic centripetal force with a response that grows faster than
+linear in stretch magnitude. This is consistent with 4-iteration
+Baumgarte PBD, where each iteration reduces the constraint residual
+multiplicatively — the effective restoring force stiffens as stretch
+grows, producing a sublinear-from-quadratic equilibrium.
+
+At spin=0.05, cube 1's internal lattice shows sustained ~1.9% stretch
+on d(0,10) and d(0,100), matching the centripetal force profile: the
+outer particles of cube 1 are being flung outward by the rotation
+and the Baumgarte correction holds them in a stretched equilibrium.
+Cube 0 stays at 0.5000 ± 0.0001 throughout (not rotating).
+
+#### Q3: no stability ceiling in the tested range
+
+At 0.05 rad/frame (5× the Stage 6 rate), the system still converges
+to a bounded oscillation after the initial transient. The peak
+stretch is 11% (well above the MVP's 10% tolerance, but still finite),
+and both d_hinge edges recover to near-rest within ~6000 frames of
+each peak. The only stress sign is the 2% gap between d_hinge_A and
+d_hinge_B that develops over time — the two hinge edges are loaded
+asymmetrically under heavy rotation, but neither fails.
+
+We did not push higher than 0.05 rad/frame. The stability ceiling
+(where the solver would fail to catch up) is above this range,
+perhaps around 0.1-0.2 rad/frame based on extrapolation. Not tested.
+
+#### Physical interpretation
+
+The data suggests the hinge-under-rotation system has three
+qualitative features that together explain the observations:
+
+1. **Centripetal stretch is quadratic in ω**, but the Baumgarte-PBD
+   solver responds superlinearly to stretch, yielding an equilibrium
+   stretch of ~ω^1.2. This is the per-frame force balance.
+2. **Beat period is set by the orbital rotation, not the spin rate.**
+   The cube pair sweeps through the Viviani field at ω_orbit ≈
+   0.00282 rad/frame, and the coupling between hinge rotation and
+   orbital rotation produces a low-order resonance at ~5-7 orbital
+   periods (~12000-15000 frames). The hinge rotation is phase-locked
+   to the orbital motion rather than evolving independently.
+3. **The Viviani field does NOT dissipate hinge angular momentum.**
+   At all four spin rates, the rotation continues past the end of
+   the observation window (~22000 frames). The substrate preserves
+   the injected angular momentum, only modulating its expression
+   through the hinge-stretch oscillation coupled to the orbit.
+
+Together these say the hinge-in-field is a **weakly-coupled
+Hamiltonian-like system** — energy is conserved (the spin doesn't
+damp), but the phase relationship between spin and orbit modulates
+the constraint stress. That's a substantially more interesting
+result than "the hinge works and nothing breaks."
+
+#### Scope limits
+
+Still not tested:
+- Rotation around y or z axes (the hinge should RESIST these since
+  it only allows rotation around x).
+- Very long time horizons (>22000 frames). The beat pattern might
+  eventually damp or shift if there are slow dissipation channels.
+- Larger spin rates (>0.05). The stability ceiling is unknown.
+- Other orbital radii. At r=50 the beat commensurability is 5-7
+  orbital periods; at other radii the ratio could differ.
+- The exact commensurate ratio. I estimated 5-7 orbital periods from
+  the beat-period range, but didn't directly measure the orbital
+  period in the probe. A more precise experiment would instrument
+  the cube pair's angular position relative to the BH.
+
+All of these are follow-up territory.
+
+### Files touched (Stage 6b)
+
+No code changes. Three additional binary runs at `--spin-rate`
+{0.005, 0.02, 0.05}, this doc subsection appended. Single commit.
