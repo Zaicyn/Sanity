@@ -376,10 +376,10 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     VkQueryPoolCreateInfo qpInfo = {};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    qpInfo.queryCount = 16;  /* 2 frames × 8 timestamps:
+    qpInfo.queryCount = 18;  /* 2 frames × 9 timestamps:
                               *   0 begin         1 scatter_end    2 stencil_end
-                              *   3 gather_end    4 constraint_end 5 siphon_end
-                              *   6 project_end   7 tonemap_end */
+                              *   3 gather_end    4 constraint_end 5 collision_end
+                              *   6 siphon_end    7 project_end    8 tonemap_end */
     if (vkCreateQueryPool(ctx.device, &qpInfo, nullptr, &phys.queryPool) != VK_SUCCESS)
         throw std::runtime_error("Failed to create timestamp query pool");
 
@@ -1103,6 +1103,42 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
         vkDestroyShaderModule(ctx.device, mod, nullptr);
     }
 
+    /* --- collision_resolve pipeline layout (larger push constants than apply) --- */
+    {
+        VkDescriptorSetLayout resolveLayouts[2] = { phys.descLayout, phys.collisionSet1Layout };
+        VkPushConstantRange resolvePushRange = {};
+        resolvePushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        resolvePushRange.size = sizeof(CollisionResolvePushConstants);
+
+        VkPipelineLayoutCreateInfo resolvePlInfo = {};
+        resolvePlInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        resolvePlInfo.setLayoutCount = 2;
+        resolvePlInfo.pSetLayouts = resolveLayouts;
+        resolvePlInfo.pushConstantRangeCount = 1;
+        resolvePlInfo.pPushConstantRanges = &resolvePushRange;
+        vkCreatePipelineLayout(ctx.device, &resolvePlInfo, nullptr,
+                               &phys.collisionResolvePipelineLayout);
+    }
+
+    /* --- collision_resolve pipeline --- */
+    {
+        auto code = readShaderFile("collision_resolve.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.collisionResolvePipelineLayout;
+
+        if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                      nullptr, &phys.collisionResolvePipeline) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create collision_resolve pipeline");
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
     /* --- Descriptor pool + set for set 1 --- */
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1156,8 +1192,8 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      *   +0 begin            +1 scatter_end      +2 stencil_end
      *   +3 gather_end       +4 constraint_end   +5 siphon_end
      *   +6 project_end      +7 tonemap_end (written from recordDensityRender) */
-    uint32_t base = phys.queryFrame * 8;
-    vkCmdResetQueryPool(cmd, phys.queryPool, base, 8);
+    uint32_t base = phys.queryFrame * 9;
+    vkCmdResetQueryPool(cmd, phys.queryPool, base, 9);
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                         phys.queryPool, base + 0);
 
@@ -1414,7 +1450,40 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                 0, 1, &b, 0, nullptr, 0, nullptr);
         }
 
-        /* C2 will dispatch collision_resolve here, between reset and apply. */
+        /* collision_resolve: fused broadphase + velocity impulse (Phase 2.2 C2).
+         * 2D dispatch over the upper triangle of (i_local, j_local) lattice space.
+         * Workgroups of (16, 16) = 256 threads, grid = (ceil(N_rigid/16))². */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionResolvePipeline);
+        {
+            VkDescriptorSet rsets[2] = { phys.descSet, phys.collisionSet1 };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                phys.collisionResolvePipelineLayout, 0, 2, rsets, 0, nullptr);
+
+            CollisionResolvePushConstants rpc = {};
+            rpc.rigid_base    = phys.rigidBaseIndex;
+            rpc.rigid_count   = phys.rigidCount;
+            rpc.dt            = dt;
+            rpc.frame_number  = (uint32_t)frame;
+            vkCmdPushConstants(cmd, phys.collisionResolvePipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT,
+                               0, sizeof(rpc), &rpc);
+
+            uint32_t groups = (phys.rigidCount + 15u) / 16u;
+            vkCmdDispatch(cmd, groups, groups, 1);
+        }
+
+        /* Barrier: resolve writes to vel_delta must be visible to apply. */
+        {
+            VkMemoryBarrier b = {};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &b, 0, nullptr, 0, nullptr);
+        }
 
         /* collision_apply: vel_delta -> vel_x/y/z */
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1426,6 +1495,8 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
         CollisionApplyPushConstants apc = {};
         apc.rigid_base  = phys.rigidBaseIndex;
         apc.rigid_count = phys.rigidCount;
+        apc.dt          = dt;
+        apc._pad        = 0;
         vkCmdPushConstants(cmd, phys.collisionApplyPipelineLayout,
                            VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(apc), &apc);
@@ -1444,6 +1515,11 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
                 0, 1, &b, 0, nullptr, 0, nullptr);
         }
     }
+
+    /* Collision end — written unconditionally so collision_ms is always
+     * defined. When collisionEnabled is false, collision_ms reads ≈ 0. */
+    vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        phys.queryPool, base + 5);
 
     /* ---- Siphon (physics) -------------------------------------------- */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
@@ -1481,9 +1557,9 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 
-    /* Siphon end — after the write-visibility barrier drains */
+    /* Siphon end */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        phys.queryPool, base + 5);
+                        phys.queryPool, base + 6);
 }
 
 /* ========================================================================
@@ -1874,11 +1950,11 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    /* Projection end — after compute work drains */
+    /* Projection end */
     {
-        uint32_t base = phys.queryFrame * 8;
+        uint32_t base = phys.queryFrame * 9;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            phys.queryPool, base + 6);
+                            phys.queryPool, base + 7);
     }
 
     /* Tone-map render pass */
@@ -1920,11 +1996,11 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
 
     vkCmdEndRenderPass(cmd);
 
-    /* Tone-map end — after color output drains */
+    /* Tone-map end */
     {
-        uint32_t base = phys.queryFrame * 8;
+        uint32_t base = phys.queryFrame * 9;
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                            phys.queryPool, base + 7);
+                            phys.queryPool, base + 8);
     }
 
     /* Mark this slot as written so the next readback can consume it */
@@ -1941,15 +2017,16 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_stencil_ms,
                     double* out_gather_ms,
                     double* out_constraint_ms,
+                    double* out_collision_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms) {
     uint32_t slot = phys.queryFrame ^ 1;
     if (!phys.queryValid[slot]) return false;
 
-    uint32_t base = slot * 8;
-    uint64_t ts[8];
-    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 8,
+    uint32_t base = slot * 9;
+    uint64_t ts[9];
+    VkResult r = vkGetQueryPoolResults(device, phys.queryPool, base, 9,
         sizeof(ts), ts, sizeof(uint64_t),
         VK_QUERY_RESULT_64_BIT);
     if (r != VK_SUCCESS) return false;
@@ -1959,9 +2036,10 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
     *out_stencil_ms    = (double)(ts[2] - ts[1]) * nsPerTick / 1.0e6;
     *out_gather_ms     = (double)(ts[3] - ts[2]) * nsPerTick / 1.0e6;
     *out_constraint_ms = (double)(ts[4] - ts[3]) * nsPerTick / 1.0e6;
-    *out_siphon_ms     = (double)(ts[5] - ts[4]) * nsPerTick / 1.0e6;
-    *out_project_ms    = (double)(ts[6] - ts[5]) * nsPerTick / 1.0e6;
-    *out_tonemap_ms    = (double)(ts[7] - ts[6]) * nsPerTick / 1.0e6;
+    *out_collision_ms  = (double)(ts[5] - ts[4]) * nsPerTick / 1.0e6;
+    *out_siphon_ms     = (double)(ts[6] - ts[5]) * nsPerTick / 1.0e6;
+    *out_project_ms    = (double)(ts[7] - ts[6]) * nsPerTick / 1.0e6;
+    *out_tonemap_ms    = (double)(ts[8] - ts[7]) * nsPerTick / 1.0e6;
     return true;
 }
 
@@ -2173,6 +2251,8 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
     if (phys.collisionEnabled) {
         vkDestroyPipeline(device, phys.collisionApplyPipeline, nullptr);
         vkDestroyPipelineLayout(device, phys.collisionApplyPipelineLayout, nullptr);
+        vkDestroyPipeline(device, phys.collisionResolvePipeline, nullptr);
+        vkDestroyPipelineLayout(device, phys.collisionResolvePipelineLayout, nullptr);
         vkDestroyDescriptorSetLayout(device, phys.collisionSet1Layout, nullptr);
         vkDestroyDescriptorPool(device, phys.collisionDescPool, nullptr);
         vkDestroyBuffer(device, phys.rigidBodyIdBuffer, nullptr);

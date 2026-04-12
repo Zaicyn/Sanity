@@ -790,8 +790,8 @@ static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
     const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
     const int   N_LATTICE_TOT = 2 * N_LATTICE;         /* 2000 */
     const float SPACING       = 0.5f;
-    const float R_ANTIPODE    = 50.0f;                 /* orbital radius */
-    const float V_DRIFT       = 0.01f;                 /* inward radial speed per frame */
+    const float R_ANTIPODE    = 10.0f;                  /* orbital radius (close for quick contact) */
+    const float V_DRIFT       = 0.5f;                  /* inward radial speed (units/sec, not /frame) */
 
     if (n_galaxy + N_LATTICE_TOT > ps.N) {
         fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
@@ -799,8 +799,10 @@ static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
         return ConstraintLattice{};
     }
 
-    /* Each cube gets the orbital tangent at its OWN location. */
-    const float v_orbit = sqrtf(BH_MASS / fmaxf(R_ANTIPODE, ISCO_R));
+    /* Pure head-on collision: no orbital tangent velocity, just inward drift.
+     * With in_active_region=0 the lattice is excluded from the Viviani field,
+     * so no orbit is needed. The cubes coast inertially along x. */
+    const float v_orbit = sqrtf(BH_MASS / fmaxf(R_ANTIPODE, ISCO_R));  /* for info only */
 
     const uint32_t base = (uint32_t)n_galaxy;
 
@@ -810,8 +812,8 @@ static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
 
     /* Per-cube center placement: cube 0 at +x, cube 1 at -x. */
     const float cube_centers_x[2] = { +R_ANTIPODE, -R_ANTIPODE };
-    /* Tangent z-component: +v at +x, -v at -x (consistent CCW orbit around y). */
-    const float cube_tangent_z[2] = { +v_orbit,    -v_orbit    };
+    /* No tangent: pure head-on collision along x. */
+    const float cube_tangent_z[2] = { 0.0f,         0.0f        };
     /* Inward drift x-component: -v at +x cube, +v at -x cube. */
     const float cube_drift_x[2]   = { -V_DRIFT,    +V_DRIFT    };
 
@@ -1228,14 +1230,69 @@ int main(int argc, char** argv) {
         }
 
         /* Phase 2.2 collision pipeline — only when the scenario populated
-         * lattice.rigid_body_id (currently only cube2-collide). C1 ships only
-         * the apply kernel + buffer infrastructure; C2 will add the fused
-         * broadphase+resolve kernel that actually generates contacts. */
+         * lattice.rigid_body_id (currently only cube2-collide). */
         if (!lattice.rigid_body_id.empty()) {
             initCollisionCompute(gpuPhys, vkCtx,
                                  lattice.rigid_body_id.data(),
                                  lattice.base_index,
                                  lattice.rigid_count);
+
+            /* Mark lattice particles as out-of-active-region so siphon skips
+             * them. Their position integration happens in collision_apply.comp
+             * instead (inertial, no Viviani field, no damping). This is
+             * necessary because the Viviani field's rotational steering +
+             * anisotropic radial damping would prevent inward radial motion,
+             * making it impossible for the cubes to approach each other. */
+            std::vector<uint32_t> zero_active(lattice.rigid_count, 0u);
+            VkBuffer stagingBuf;
+            VkDeviceMemory stagingMem;
+            size_t sz = lattice.rigid_count * sizeof(uint32_t);
+            VkBufferCreateInfo bi = {};
+            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bi.size = sz;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            vkCreateBuffer(vkCtx.device, &bi, nullptr, &stagingBuf);
+            VkMemoryRequirements mr;
+            vkGetBufferMemoryRequirements(vkCtx.device, stagingBuf, &mr);
+            VkMemoryAllocateInfo ai = {};
+            ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            ai.allocationSize = mr.size;
+            ai.memoryTypeIndex = findMemoryType(vkCtx.physicalDevice, mr.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(vkCtx.device, &ai, nullptr, &stagingMem);
+            vkBindBufferMemory(vkCtx.device, stagingBuf, stagingMem, 0);
+            void* mapped;
+            vkMapMemory(vkCtx.device, stagingMem, 0, sz, 0, &mapped);
+            memset(mapped, 0, sz);
+            vkUnmapMemory(vkCtx.device, stagingMem);
+
+            VkCommandBuffer ucmd;
+            VkCommandBufferAllocateInfo cba = {};
+            cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cba.commandPool = vkCtx.commandPool;
+            cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cba.commandBufferCount = 1;
+            vkAllocateCommandBuffers(vkCtx.device, &cba, &ucmd);
+            VkCommandBufferBeginInfo cbegin = {};
+            cbegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            cbegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(ucmd, &cbegin);
+            VkBufferCopy region = {0, lattice.base_index * sizeof(uint32_t), sz};
+            vkCmdCopyBuffer(ucmd, stagingBuf, gpuPhys.soa_buffers[15], 1, &region);
+            vkEndCommandBuffer(ucmd);
+            VkSubmitInfo usi = {};
+            usi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            usi.commandBufferCount = 1;
+            usi.pCommandBuffers = &ucmd;
+            vkQueueSubmit(vkCtx.graphicsQueue, 1, &usi, VK_NULL_HANDLE);
+            vkQueueWaitIdle(vkCtx.graphicsQueue);
+            vkFreeCommandBuffers(vkCtx.device, vkCtx.commandPool, 1, &ucmd);
+            vkDestroyBuffer(vkCtx.device, stagingBuf, nullptr);
+            vkFreeMemory(vkCtx.device, stagingMem, nullptr);
+
+            printf("[vk-compute] Lattice particles [%u, %u) marked in_active_region=0 "
+                   "(siphon skip; position integration in collision_apply)\n",
+                   lattice.base_index, lattice.base_index + lattice.rigid_count);
         }
 
         initDensityRender(gpuPhys, vkCtx);
@@ -1286,6 +1343,7 @@ int main(int argc, char** argv) {
     /* GPU timestamp accumulators for profiling */
     double gpu_scatter_sum = 0.0, gpu_stencil_sum = 0.0, gpu_gather_sum = 0.0;
     double gpu_constraint_sum = 0.0;
+    double gpu_collision_sum = 0.0;
     double gpu_siphon_sum = 0.0;
     double gpu_project_sum = 0.0, gpu_tonemap_sum = 0.0;
     int gpu_samples = 0;
@@ -1352,7 +1410,8 @@ int main(int argc, char** argv) {
              * no-ops — measurement runs are unaffected. */
             if ((rigid_body_mode == RIGID_BODY_CUBE1000 ||
                  rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET ||
-                 rigid_body_mode == RIGID_BODY_CUBE2_HINGE) &&
+                 rigid_body_mode == RIGID_BODY_CUBE2_HINGE ||
+                 rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) &&
                 (n_galaxy + n_rigid) <= oracle_count) {
                 int b = n_galaxy;
                 auto dist_idx = [&](int i, int j) -> float {
@@ -1411,6 +1470,23 @@ int main(int argc, char** argv) {
                            "d_hinge_A=%.4f d_hinge_B=%.4f (rest=1.0)\n",
                            frame, rb_px[b + 1000], rb_py[b + 1000], rb_pz[b + 1000],
                            d1_x, d1_y, d1_z, d_hinge_A, d_hinge_B);
+                } else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) {
+                    /* Cube 1 internal check + inter-cube center distance.
+                     * Cube center particle ≈ (5, 5, 5) in local indexing =
+                     * offset 5 + 5*10 + 5*100 = 555. */
+                    float d1_x = dist_idx(b + 1000, b + 1001);
+                    float d1_y = dist_idx(b + 1000, b + 1010);
+                    float d1_z = dist_idx(b + 1000, b + 1100);
+                    int center0 = b + 555;
+                    int center1 = b + 1000 + 555;
+                    float d_centers = dist_idx(center0, center1);
+                    printf("[rigid] frame=%d  cube0_ctr=(%.3f,%.3f,%.3f)  "
+                           "cube1_ctr=(%.3f,%.3f,%.3f)  d_centers=%.3f  "
+                           "d0(0,1)=%.4f d1(0,1)=%.4f (rest=0.5)\n",
+                           frame,
+                           rb_px[center0], rb_py[center0], rb_pz[center0],
+                           rb_px[center1], rb_py[center1], rb_pz[center1],
+                           d_centers, d0_x, d1_x);
                 }
             }
 
@@ -1577,14 +1653,15 @@ int main(int argc, char** argv) {
         /* Sample GPU timestamps (non-blocking; silently skipped if not ready) */
         if (use_gpu_physics) {
             double sc_ms = 0, st_ms = 0, g_ms = 0, c_ms = 0;
-            double s_ms = 0, p_ms = 0, t_ms = 0;
+            double col_ms = 0, s_ms = 0, p_ms = 0, t_ms = 0;
             if (readTimestamps(gpuPhys, vkCtx.device,
                                &sc_ms, &st_ms, &g_ms, &c_ms,
-                               &s_ms, &p_ms, &t_ms)) {
+                               &col_ms, &s_ms, &p_ms, &t_ms)) {
                 gpu_scatter_sum    += sc_ms;
                 gpu_stencil_sum    += st_ms;
                 gpu_gather_sum     += g_ms;
                 gpu_constraint_sum += c_ms;
+                gpu_collision_sum  += col_ms;
                 gpu_siphon_sum     += s_ms;
                 gpu_project_sum    += p_ms;
                 gpu_tonemap_sum    += t_ms;
@@ -1603,20 +1680,21 @@ int main(int argc, char** argv) {
         /* GPU breakdown — print every 500 frames */
         if (use_gpu_physics && frame % 500 == 0 && gpu_samples > 0) {
             double inv = 1.0 / (double)gpu_samples;
-            double sc = gpu_scatter_sum    * inv;
-            double st = gpu_stencil_sum    * inv;
-            double g  = gpu_gather_sum     * inv;
-            double c  = gpu_constraint_sum * inv;
-            double s  = gpu_siphon_sum     * inv;
-            double p  = gpu_project_sum    * inv;
-            double t  = gpu_tonemap_sum    * inv;
-            double total = sc + st + g + c + s + p + t;
+            double sc  = gpu_scatter_sum    * inv;
+            double st  = gpu_stencil_sum    * inv;
+            double g   = gpu_gather_sum     * inv;
+            double c   = gpu_constraint_sum * inv;
+            double col = gpu_collision_sum  * inv;
+            double s   = gpu_siphon_sum     * inv;
+            double p   = gpu_project_sum    * inv;
+            double t   = gpu_tonemap_sum    * inv;
+            double total = sc + st + g + c + col + s + p + t;
             printf("[gpu] scatter=%.3f stencil=%.3f gather=%.3f constraint=%.3f "
-                   "siphon=%.3f project=%.3f tonemap=%.3f  total=%.3f ms  "
-                   "(%d samples)\n",
-                   sc, st, g, c, s, p, t, total, gpu_samples);
+                   "collision=%.3f siphon=%.3f project=%.3f tonemap=%.3f  "
+                   "total=%.3f ms  (%d samples)\n",
+                   sc, st, g, c, col, s, p, t, total, gpu_samples);
             gpu_scatter_sum = gpu_stencil_sum = gpu_gather_sum = 0.0;
-            gpu_constraint_sum = 0.0;
+            gpu_constraint_sum = gpu_collision_sum = 0.0;
             gpu_siphon_sum = 0.0;
             gpu_project_sum = gpu_tonemap_sum = 0.0;
             gpu_samples = 0;

@@ -70,12 +70,20 @@ struct ConstraintPushConstants {
     uint32_t _pad;
 };
 
-/* Push constants for collision_apply.comp (Phase 2.2 C1 — int->float vel writeback).
- * Phase 2.2 C2 will introduce a separate ConstraintResolvePushConstants struct
- * for the fused broadphase+impulse kernel. */
+/* Push constants for collision_apply.comp (Phase 2.2 — velocity writeback + position integrate). */
 struct CollisionApplyPushConstants {
     uint32_t rigid_base;          /* = N_field, first lattice particle index */
     uint32_t rigid_count;         /* = N_rigid */
+    float    dt;                  /* timestep for position integration */
+    uint32_t _pad;
+};
+
+/* Push constants for collision_resolve.comp (Phase 2.2 C2 — fused broadphase + impulse). */
+struct CollisionResolvePushConstants {
+    uint32_t rigid_base;          /* = N_field, first lattice particle index */
+    uint32_t rigid_count;         /* = N_rigid */
+    float    dt;                  /* simulation timestep */
+    uint32_t frame_number;        /* for first_contact_frame probe */
 };
 
 /* Cell grid constants (must match scatter.comp) */
@@ -224,6 +232,8 @@ struct PhysicsCompute {
     VkDescriptorSetLayout collisionSet1Layout;      /* set 1: 4 SSBOs */
     VkPipelineLayout      collisionApplyPipelineLayout;
     VkPipeline            collisionApplyPipeline;
+    VkPipelineLayout      collisionResolvePipelineLayout;
+    VkPipeline            collisionResolvePipeline;
     VkDescriptorPool      collisionDescPool;
     VkDescriptorSet       collisionSet1;
 
@@ -364,6 +374,7 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
  *   stencil_ms    = Pass 2 (density → pressure gradient)
  *   gather_ms     = Pass 3 measurement-only gather
  *   constraint_ms = Pass 4 distance-constraint solver (0 if --rigid-body off)
+ *   collision_ms  = Phase 2.2 collision pipeline (0 if collisionEnabled false)
  *   siphon_ms     = main physics kernel
  *   project_ms    = density projection to screen
  *   tonemap_ms    = fragment shader tone mapping
@@ -373,6 +384,7 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
                     double* out_stencil_ms,
                     double* out_gather_ms,
                     double* out_constraint_ms,
+                    double* out_collision_ms,
                     double* out_siphon_ms,
                     double* out_project_ms,
                     double* out_tonemap_ms);

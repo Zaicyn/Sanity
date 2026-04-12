@@ -47,6 +47,7 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/gather_measure.comp
     ${KERNEL_DIR}/constraint_solve.comp
     ${KERNEL_DIR}/collision_apply.comp
+    ${KERNEL_DIR}/collision_resolve.comp
 )
 
 set(SPV_OUTPUTS)
