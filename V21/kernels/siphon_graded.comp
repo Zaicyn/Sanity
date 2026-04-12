@@ -444,24 +444,35 @@ void main() {
 
     regulate_scale(scale, coh_count);
 
-    // ----- Ejection check -----
+    // ----- Coherence memory (repurposed pump_history) -----
+    // Tracks sustained radial alignment over time. Builds when particle
+    // maintains consistent radial velocity direction; decays otherwise.
+    // Replaces the unreachable residual-based ejection threshold.
+    float alignment = abs(vel_r) / v_mag;
+    const float COH_MEM_BUILD  = 0.04;   // accumulation rate
+    const float COH_MEM_DECAY  = 0.01;   // passive decay
+    const float COH_MEM_MAX    = 4.0;    // saturation cap
+    const float COH_EJECT_THRESHOLD = 1.2;  // coherence needed to eject
+    history = history * (1.0 - COH_MEM_DECAY) + alignment * COH_MEM_BUILD;
+    history = min(history, COH_MEM_MAX);
+
+    // ----- Ejection check (coherence-driven) -----
     bool eject = false;
     {
-        float r_cyl = r_safe;
-        bool close_enough = (r_cyl < ISCO_R * 2.5);
+        bool close_enough = (r_safe < ISCO_R * 8.0);  // r < 48, covers inner disk
         bool phase_polarized = (phase_stress > 0.95);
-        eject = phase_polarized && close_enough
-            && (abs(residual) > PUMP_EJECT_THRESHOLD * 0.5);
+        eject = phase_polarized && close_enough && (history > COH_EJECT_THRESHOLD);
     }
 
     if (eject) {
-        // Ejection kick — in graded space, kick is a radial velocity impulse
-        // plus a vertical velocity impulse (the "jet" along L̂ ≈ ŷ)
-        float muzzle = residual * (1.0 + history * 0.5) * JET_SPEED;
+        // Ejection kick — radial velocity impulse + vertical jet.
+        // Muzzle velocity scales with accumulated coherence.
+        float muzzle = history * JET_SPEED;
         // Collimation: inner particles → more vertical, outer → more radial
         float collimation = clamp(1.0 - (r_safe - SCHW_R) / (ISCO_R * 2.0), 0.0, 1.0);
         vel_y += muzzle * collimation;        // vertical jet component
         vel_r += muzzle * (1.0 - collimation); // radial scatter component
+        history *= 0.3;  // partial reset — don't fully drain, allow re-firing
     }
 
     // ----- Grade 1: Anisotropic damping (radial, γ=0.02) -----
@@ -492,9 +503,8 @@ void main() {
                   | ((is_active & 0x01u) << 9);
     packed_meta[i] = meta_out;
 
-    // Pump history (exponential smoothing)
-    const float HISTORY_SMOOTH = 0.02;
-    pump_history[i] = history * (1.0 - HISTORY_SMOOTH) + scale * HISTORY_SMOOTH;
+    // Write coherence memory (replaces old scale-tracking history)
+    pump_history[i] = history;
 
     // ----- Fused Cartesian projection (replaces graded_to_cartesian dispatch) -----
     // phi's sin/cos are computed here once; the Viviani transport already computed
