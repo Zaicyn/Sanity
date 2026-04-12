@@ -323,9 +323,17 @@ void main() {
         return;
     }
 
-    // Integrate position
+    // Integrate position with angular momentum conservation.
+    // L = r² * omega_orb must be preserved when r changes.
+    // If r_old → r_new, then omega_new = omega_old * (r_old / r_new)².
+    // This is the Keplerian speedup/slowdown that Cartesian gets for free
+    // from conservation of v_tangential during radial motion.
+    float r_old = r;
     r       += vel_r * pc.dt;
-    r        = max(r, 0.01);  // clamp to avoid negative radius
+    r        = max(r, 0.01);
+    float r_ratio = r_old / r;
+    omega_orb *= r_ratio * r_ratio;  // conserve L = r² ω
+
     phi     += omega_orb * pc.dt;
     delta_y += vel_y * pc.dt;
 
