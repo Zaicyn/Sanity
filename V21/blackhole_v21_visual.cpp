@@ -154,7 +154,8 @@ enum RigidBodyMode {
     RIGID_BODY_CUBE1000         = 1,  /* 10×10×10 cube, 2700 distance constraints */
     RIGID_BODY_CUBE2_BALLSOCKET = 2,  /* 2 cubes + 1 ball-socket joint (Phase 2.3 MVP) */
     RIGID_BODY_CUBE2_HINGE      = 3,  /* 2 cubes + hinge (2 distance constraints along x-axis, Phase 2.3.1) */
-    RIGID_BODY_CUBE2_COLLIDE    = 4   /* 2 antipodal cubes drifting inward, dynamic contact (Phase 2.2) */
+    RIGID_BODY_CUBE2_COLLIDE    = 4,  /* 2 antipodal cubes drifting inward, dynamic contact (Phase 2.2) */
+    RIGID_BODY_CUBE3_HINGE_COLLIDE = 5  /* 2 hinged cubes + 1 free projectile (Phase 2.2 phase-coherent test) */
 };
 
 /* Lattice data computed on the host side and uploaded to the GPU constraint
@@ -174,6 +175,12 @@ struct ConstraintLattice {
      * Each entry is the rigid-body id: 0 for field particles, 1 for cube 0,
      * 2 for cube 1, etc. */
     std::vector<uint32_t> rigid_body_id;
+
+    /* Per-lattice-particle override for in_active_region. When non-empty
+     * (length = rigid_count), uploaded over the lattice range after init.
+     * 1 = siphon governs this particle (Viviani field active),
+     * 0 = siphon skips it (inertial, governed by collision_apply only). */
+    std::vector<uint32_t> active_override;
 };
 
 /* N          = total allocation size (galaxy + optional trailing lattice slots)
@@ -892,6 +899,9 @@ static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
         L.rigid_body_id[(size_t)base + (size_t)N_LATTICE + (size_t)k] = 2u;
     }
 
+    /* Both cubes are inertial (siphon-skipped). */
+    L.active_override.assign((size_t)N_LATTICE_TOT, 0u);
+
     printf("[rigid] cube2-collide: %d lattice particles, %u constraints "
            "(5400 lattice + 0 joint), buckets=[%u %u %u %u %u %u %u], "
            "base=%u, R_ANTIPODE=%.1f, v_orbit=%.4f, v_drift=%.4f, "
@@ -901,6 +911,210 @@ static ConstraintLattice init_rigid_body_cube2_collide(ParticleState& ps,
            L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5],
            L.bucket_counts[6], base, R_ANTIPODE, v_orbit, V_DRIFT,
            (int)((2.0f * R_ANTIPODE - (LX - 1) * SPACING) / (2.0f * V_DRIFT)));
+    return L;
+}
+
+/* Phase 2.2 phase-coherent test: two hinged cubes (orbiting, spinning) + one
+ * free cube (inertial projectile) that collides with the spinning cube.
+ *
+ * Tests whether the hinge beat pattern (ω^1.16 response, orbital-phase-locked
+ * period from Phase 2.3.1 Stage 6b) survives an external collision event.
+ *
+ * Geometry:
+ *   Cubes 0,1: y-stacked at (50, ±2.75, 0), hinged along x-axis (same as
+ *     cube2-hinge). Cube 1 has spin_rate around x-axis. Both orbit in the
+ *     Viviani field (in_active_region=1).
+ *   Cube 2: free projectile at (50, +2.75, Z_START) with zero tangent and
+ *     inward z-drift toward cube 1's orbital path. Siphon-skipped
+ *     (in_active_region=0), coasts inertially via collision_apply.
+ *
+ * The hinged pair orbits in xz, cube 1 spinning around the hinge. Cube 2
+ * is stationary in x/y but placed at +z of the pair's starting location,
+ * so as the pair orbits (moving +z initially), cube 1 collides with cube 2
+ * after ~2000 frames.
+ *
+ * 3 rigid bodies → rigid_body_id: 0=field, 1=cube0, 2=cube1, 3=cube2.
+ * active_override: cubes 0,1 = 1 (Viviani), cube 2 = 0 (inertial). */
+static ConstraintLattice init_rigid_body_cube3_hinge_collide(ParticleState& ps,
+                                                              int n_galaxy,
+                                                              float spin_rate) {
+    const int   LX = 10, LY = 10, LZ = 10;
+    const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
+    const int   N_LATTICE_TOT = 3 * N_LATTICE;         /* 3000 */
+    const float SPACING       = 0.5f;
+    const float R_ORBIT       = 50.0f;
+    const float Y_OFFSET      = 2.75f;
+    const float Z_PROJECTILE  = 7.0f;  /* cube 2 placed at z=+7, hit by pair moving +z */
+
+    if (n_galaxy + N_LATTICE_TOT > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
+                        "3 cubes (cube3-hinge-collide)\n", ps.N, n_galaxy);
+        return ConstraintLattice{};
+    }
+
+    const float v_orbit = sqrtf(BH_MASS / fmaxf(R_ORBIT, ISCO_R));
+    const uint32_t base = (uint32_t)n_galaxy;
+
+    /* 7 super-buckets: 0..5 lattice (all 3 cubes), 6 hinge (cubes 0,1 only). */
+    std::vector<std::pair<uint32_t, uint32_t>> super[7];
+    for (int k = 0; k < 6; k++) super[k].reserve(1350);
+    super[6].reserve(2);
+
+    /* Cubes 0 and 1: y-stacked at (R_ORBIT, ±Y_OFFSET, 0), same as cube2-hinge. */
+    const float cube01_centers_y[2] = { -Y_OFFSET, +Y_OFFSET };
+    uint32_t anchor_A[2] = { 0, 0 };
+    uint32_t anchor_B[2] = { 0, 0 };
+
+    for (int c = 0; c < 2; c++) {
+        const float cx = R_ORBIT;
+        const float cy = cube01_centers_y[c];
+        const float cz = 0.0f;
+        const uint32_t cube_base = base + (uint32_t)(c * N_LATTICE);
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            float px = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            float py = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            float pz = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.pos_x[p] = px;
+            ps.pos_y[p] = py;
+            ps.pos_z[p] = pz;
+
+            float vy_extra = 0.0f, vz_extra = 0.0f;
+            if (c == 1 && spin_rate != 0.0f) {
+                float dy = py - cy;
+                float dz = pz - cz;
+                vy_extra = -spin_rate * dz;
+                vz_extra =  spin_rate * dy;
+            }
+
+            ps.vel_x[p] = 0.0f;
+            ps.vel_y[p] = 0.0f + vy_extra;
+            ps.vel_z[p] = v_orbit + vz_extra;
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;
+        }
+
+        /* Build lattice buckets for this cube. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) local[0 + (ix & 1)].push_back({a, idx_of(ix + 1, iy, iz)});
+            if (iy + 1 < LY) local[2 + (iy & 1)].push_back({a, idx_of(ix, iy + 1, iz)});
+            if (iz + 1 < LZ) local[4 + (iz & 1)].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
+        }
+
+        /* Hinge anchors (same as cube2-hinge). */
+        int anchor_iy = (c == 0) ? (LY - 1) : 0;
+        anchor_A[c] = idx_of(0,      anchor_iy, LZ / 2);
+        anchor_B[c] = idx_of(LX - 1, anchor_iy, LZ / 2);
+    }
+
+    /* Cube 2: free projectile at (R_ORBIT, +Y_OFFSET, Z_PROJECTILE).
+     * Same y-level as cube 1 so they collide face-to-face in z.
+     * Zero velocity — it just waits for the orbiting pair to reach it. */
+    {
+        const float cx = R_ORBIT;
+        const float cy = +Y_OFFSET;
+        const float cz = Z_PROJECTILE;
+        const uint32_t cube_base = base + 2u * N_LATTICE;
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            ps.pos_x[p] = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            ps.pos_y[p] = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            ps.pos_z[p] = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.vel_x[p] = 0.0f;
+            ps.vel_y[p] = 0.0f;
+            ps.vel_z[p] = 0.0f;
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;
+        }
+
+        /* Build lattice buckets for cube 2. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) local[0 + (ix & 1)].push_back({a, idx_of(ix + 1, iy, iz)});
+            if (iy + 1 < LY) local[2 + (iy & 1)].push_back({a, idx_of(ix, iy + 1, iz)});
+            if (iz + 1 < LZ) local[4 + (iz & 1)].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
+        }
+    }
+
+    /* Hinge edges in bucket 6 (cubes 0,1 only). */
+    super[6].push_back({anchor_A[0], anchor_A[1]});
+    super[6].push_back({anchor_B[0], anchor_B[1]});
+
+    ConstraintLattice L = {};
+    L.base_index  = base;
+    L.rigid_count = (uint32_t)N_LATTICE_TOT;
+    L.inv_m.assign(N_LATTICE_TOT, 1.0f);
+
+    uint32_t running = 0;
+    for (int k = 0; k < 7; k++) {
+        L.bucket_offsets[k] = running;
+        L.bucket_counts[k]  = (uint32_t)super[k].size();
+        running += L.bucket_counts[k];
+    }
+    L.pairs.reserve(2u * running);
+    L.rest.reserve(running);
+    for (int k = 0; k < 6; k++) {
+        for (auto& pr : super[k]) {
+            L.pairs.push_back(pr.first);
+            L.pairs.push_back(pr.second);
+            L.rest.push_back(SPACING);
+        }
+    }
+    for (auto& pr : super[6]) {
+        L.pairs.push_back(pr.first);
+        L.pairs.push_back(pr.second);
+        L.rest.push_back(1.0f);  /* y-gap between cube faces */
+    }
+
+    /* rigid_body_id: 0=field, 1=cube0, 2=cube1, 3=cube2. */
+    L.rigid_body_id.assign((size_t)ps.N, 0u);
+    for (int k = 0; k < N_LATTICE; k++) {
+        L.rigid_body_id[(size_t)base + (size_t)k] = 1u;
+        L.rigid_body_id[(size_t)base + N_LATTICE + (size_t)k] = 2u;
+        L.rigid_body_id[(size_t)base + 2 * N_LATTICE + (size_t)k] = 3u;
+    }
+
+    /* active_override: cubes 0,1 = 1 (Viviani field), cube 2 = 0 (inertial). */
+    L.active_override.resize(N_LATTICE_TOT);
+    for (int k = 0; k < 2 * N_LATTICE; k++) L.active_override[k] = 1u;
+    for (int k = 2 * N_LATTICE; k < N_LATTICE_TOT; k++) L.active_override[k] = 0u;
+
+    printf("[rigid] cube3-hinge-collide: %d lattice particles (2 hinged + 1 free), "
+           "%u constraints (8100 lattice + %u hinge), "
+           "base=%u, spin=%.4f, z_projectile=%.1f, v_orbit=%.4f\n",
+           N_LATTICE_TOT, running, L.bucket_counts[6],
+           base, spin_rate, Z_PROJECTILE, v_orbit);
     return L;
 }
 
@@ -1083,9 +1297,9 @@ int main(int argc, char** argv) {
             else if (strcmp(m, "cube2-ballsocket") == 0) rigid_body_mode = RIGID_BODY_CUBE2_BALLSOCKET;
             else if (strcmp(m, "cube2-hinge")      == 0) rigid_body_mode = RIGID_BODY_CUBE2_HINGE;
             else if (strcmp(m, "cube2-collide")    == 0) rigid_body_mode = RIGID_BODY_CUBE2_COLLIDE;
+            else if (strcmp(m, "cube3-hinge-collide") == 0) rigid_body_mode = RIGID_BODY_CUBE3_HINGE_COLLIDE;
             else {
-                fprintf(stderr, "unknown --rigid-body '%s' "
-                                "(expected off, cube1000, cube2-ballsocket, cube2-hinge, or cube2-collide)\n", m);
+                fprintf(stderr, "unknown --rigid-body '%s'\n", m);
                 return 1;
             }
         }
@@ -1130,6 +1344,7 @@ int main(int argc, char** argv) {
     else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) n_rigid = 2000;
     else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE)      n_rigid = 2000;
     else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE)    n_rigid = 2000;
+    else if (rigid_body_mode == RIGID_BODY_CUBE3_HINGE_COLLIDE) n_rigid = 3000;
     num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
 
     /* Init particles — only [0, n_galaxy) gets generated and sorted;
@@ -1147,6 +1362,8 @@ int main(int argc, char** argv) {
         lattice = init_rigid_body_cube2_hinge(particles, n_galaxy, spin_rate);
     } else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) {
         lattice = init_rigid_body_cube2_collide(particles, n_galaxy);
+    } else if (rigid_body_mode == RIGID_BODY_CUBE3_HINGE_COLLIDE) {
+        lattice = init_rigid_body_cube3_hinge_collide(particles, n_galaxy, spin_rate);
     }
 
     /* Init validation oracle */
@@ -1237,62 +1454,64 @@ int main(int argc, char** argv) {
                                  lattice.base_index,
                                  lattice.rigid_count);
 
-            /* Mark lattice particles as out-of-active-region so siphon skips
-             * them. Their position integration happens in collision_apply.comp
-             * instead (inertial, no Viviani field, no damping). This is
-             * necessary because the Viviani field's rotational steering +
-             * anisotropic radial damping would prevent inward radial motion,
-             * making it impossible for the cubes to approach each other. */
-            std::vector<uint32_t> zero_active(lattice.rigid_count, 0u);
-            VkBuffer stagingBuf;
-            VkDeviceMemory stagingMem;
-            size_t sz = lattice.rigid_count * sizeof(uint32_t);
-            VkBufferCreateInfo bi = {};
-            bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            bi.size = sz;
-            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-            vkCreateBuffer(vkCtx.device, &bi, nullptr, &stagingBuf);
-            VkMemoryRequirements mr;
-            vkGetBufferMemoryRequirements(vkCtx.device, stagingBuf, &mr);
-            VkMemoryAllocateInfo ai = {};
-            ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            ai.allocationSize = mr.size;
-            ai.memoryTypeIndex = findMemoryType(vkCtx.physicalDevice, mr.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            vkAllocateMemory(vkCtx.device, &ai, nullptr, &stagingMem);
-            vkBindBufferMemory(vkCtx.device, stagingBuf, stagingMem, 0);
-            void* mapped;
-            vkMapMemory(vkCtx.device, stagingMem, 0, sz, 0, &mapped);
-            memset(mapped, 0, sz);
-            vkUnmapMemory(vkCtx.device, stagingMem);
+            /* Override in_active_region for lattice particles based on
+             * active_override[]. Particles with 0 are siphon-skipped (inertial,
+             * governed by collision_apply). Particles with 1 stay in the
+             * Viviani field (siphon governs them). */
+            if (!lattice.active_override.empty()) {
+                size_t sz = lattice.rigid_count * sizeof(uint32_t);
+                VkBuffer stagingBuf;
+                VkDeviceMemory stagingMem;
+                VkBufferCreateInfo bi = {};
+                bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bi.size = sz;
+                bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                vkCreateBuffer(vkCtx.device, &bi, nullptr, &stagingBuf);
+                VkMemoryRequirements mr;
+                vkGetBufferMemoryRequirements(vkCtx.device, stagingBuf, &mr);
+                VkMemoryAllocateInfo ai = {};
+                ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                ai.allocationSize = mr.size;
+                ai.memoryTypeIndex = findMemoryType(vkCtx.physicalDevice, mr.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                vkAllocateMemory(vkCtx.device, &ai, nullptr, &stagingMem);
+                vkBindBufferMemory(vkCtx.device, stagingBuf, stagingMem, 0);
+                void* mapped;
+                vkMapMemory(vkCtx.device, stagingMem, 0, sz, 0, &mapped);
+                memcpy(mapped, lattice.active_override.data(), sz);
+                vkUnmapMemory(vkCtx.device, stagingMem);
 
-            VkCommandBuffer ucmd;
-            VkCommandBufferAllocateInfo cba = {};
-            cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            cba.commandPool = vkCtx.commandPool;
-            cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cba.commandBufferCount = 1;
-            vkAllocateCommandBuffers(vkCtx.device, &cba, &ucmd);
-            VkCommandBufferBeginInfo cbegin = {};
-            cbegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            cbegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(ucmd, &cbegin);
-            VkBufferCopy region = {0, lattice.base_index * sizeof(uint32_t), sz};
-            vkCmdCopyBuffer(ucmd, stagingBuf, gpuPhys.soa_buffers[15], 1, &region);
-            vkEndCommandBuffer(ucmd);
-            VkSubmitInfo usi = {};
-            usi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-            usi.commandBufferCount = 1;
-            usi.pCommandBuffers = &ucmd;
-            vkQueueSubmit(vkCtx.graphicsQueue, 1, &usi, VK_NULL_HANDLE);
-            vkQueueWaitIdle(vkCtx.graphicsQueue);
-            vkFreeCommandBuffers(vkCtx.device, vkCtx.commandPool, 1, &ucmd);
-            vkDestroyBuffer(vkCtx.device, stagingBuf, nullptr);
-            vkFreeMemory(vkCtx.device, stagingMem, nullptr);
+                VkCommandBuffer ucmd;
+                VkCommandBufferAllocateInfo cba = {};
+                cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+                cba.commandPool = vkCtx.commandPool;
+                cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cba.commandBufferCount = 1;
+                vkAllocateCommandBuffers(vkCtx.device, &cba, &ucmd);
+                VkCommandBufferBeginInfo cbegin = {};
+                cbegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                cbegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(ucmd, &cbegin);
+                VkBufferCopy region = {0, lattice.base_index * sizeof(uint32_t), sz};
+                vkCmdCopyBuffer(ucmd, stagingBuf, gpuPhys.soa_buffers[15], 1, &region);
+                vkEndCommandBuffer(ucmd);
+                VkSubmitInfo usi = {};
+                usi.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                usi.commandBufferCount = 1;
+                usi.pCommandBuffers = &ucmd;
+                vkQueueSubmit(vkCtx.graphicsQueue, 1, &usi, VK_NULL_HANDLE);
+                vkQueueWaitIdle(vkCtx.graphicsQueue);
+                vkFreeCommandBuffers(vkCtx.device, vkCtx.commandPool, 1, &ucmd);
+                vkDestroyBuffer(vkCtx.device, stagingBuf, nullptr);
+                vkFreeMemory(vkCtx.device, stagingMem, nullptr);
 
-            printf("[vk-compute] Lattice particles [%u, %u) marked in_active_region=0 "
-                   "(siphon skip; position integration in collision_apply)\n",
-                   lattice.base_index, lattice.base_index + lattice.rigid_count);
+                int n_skipped = 0;
+                for (uint32_t v : lattice.active_override) if (v == 0) n_skipped++;
+                printf("[vk-compute] Lattice in_active_region override: %d skipped, "
+                       "%d active (of %u total lattice)\n",
+                       n_skipped, (int)lattice.rigid_count - n_skipped,
+                       lattice.rigid_count);
+            }
         }
 
         initDensityRender(gpuPhys, vkCtx);
@@ -1411,7 +1630,8 @@ int main(int argc, char** argv) {
             if ((rigid_body_mode == RIGID_BODY_CUBE1000 ||
                  rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET ||
                  rigid_body_mode == RIGID_BODY_CUBE2_HINGE ||
-                 rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) &&
+                 rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE ||
+                 rigid_body_mode == RIGID_BODY_CUBE3_HINGE_COLLIDE) &&
                 (n_galaxy + n_rigid) <= oracle_count) {
                 int b = n_galaxy;
                 auto dist_idx = [&](int i, int j) -> float {
@@ -1471,12 +1691,8 @@ int main(int argc, char** argv) {
                            frame, rb_px[b + 1000], rb_py[b + 1000], rb_pz[b + 1000],
                            d1_x, d1_y, d1_z, d_hinge_A, d_hinge_B);
                 } else if (rigid_body_mode == RIGID_BODY_CUBE2_COLLIDE) {
-                    /* Cube 1 internal check + inter-cube center distance.
-                     * Cube center particle ≈ (5, 5, 5) in local indexing =
-                     * offset 5 + 5*10 + 5*100 = 555. */
+                    /* Cube 1 internal check + inter-cube center distance. */
                     float d1_x = dist_idx(b + 1000, b + 1001);
-                    float d1_y = dist_idx(b + 1000, b + 1010);
-                    float d1_z = dist_idx(b + 1000, b + 1100);
                     int center0 = b + 555;
                     int center1 = b + 1000 + 555;
                     float d_centers = dist_idx(center0, center1);
@@ -1487,6 +1703,24 @@ int main(int argc, char** argv) {
                            rb_px[center0], rb_py[center0], rb_pz[center0],
                            rb_px[center1], rb_py[center1], rb_pz[center1],
                            d_centers, d0_x, d1_x);
+                } else if (rigid_body_mode == RIGID_BODY_CUBE3_HINGE_COLLIDE) {
+                    /* Hinge distances + cube 2 position + cube1-cube2 gap. */
+                    int A0 = b + 590;       /* cube 0, ix=0, iy=9, iz=5 */
+                    int A1 = b + 1000 + 500; /* cube 1, ix=0, iy=0, iz=5 */
+                    int B0 = b + 599;       /* cube 0, ix=9, iy=9, iz=5 */
+                    int B1 = b + 1000 + 509; /* cube 1, ix=9, iy=0, iz=5 */
+                    float d_hinge_A = dist_idx(A0, A1);
+                    float d_hinge_B = dist_idx(B0, B1);
+                    int center1 = b + 1000 + 555;
+                    int center2 = b + 2000 + 555;
+                    float d_12 = dist_idx(center1, center2);
+                    printf("[rigid] frame=%d  d_hinge_A=%.4f d_hinge_B=%.4f (rest=1.0)  "
+                           "cube1_ctr=(%.2f,%.2f,%.2f) cube2_ctr=(%.2f,%.2f,%.2f) "
+                           "d_12=%.3f  d0(0,1)=%.4f\n",
+                           frame, d_hinge_A, d_hinge_B,
+                           rb_px[center1], rb_py[center1], rb_pz[center1],
+                           rb_px[center2], rb_py[center2], rb_pz[center2],
+                           d_12, d0_x);
                 }
             }
 
