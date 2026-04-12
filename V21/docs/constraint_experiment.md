@@ -720,3 +720,269 @@ backend is still fully topology-agnostic.
 Plan file: `/home/zaiken/.claude/plans/wiggly-prancing-hamming.md`
 (overwritten in the same session for the Phase 2.3 plan; Phase 2.1 plan
 was superseded).
+
+---
+
+# Phase 2.3.1 — Hinge Joints (2026-04-11, same session)
+
+Extends Phase 2.3 from 1 joint edge (ball-socket, 3 DOF allowed) to
+**2 joint edges forming a hinge** (5 DOF locked, 1 rotational DOF
+allowed around the hinge axis). In the PBD substrate, a hinge is
+literally just two distance constraints placed at two points along the
+intended axis of rotation.
+
+## Question
+
+Two primary + one retroactive:
+
+> **Q1:** Do 2 joint edges in the same super-bucket (bucket 6) work
+> correctly? Vertex-disjointness is trivial for 1 edge; for 2 edges we
+> need the two edges to not share endpoints. The chosen pair
+> (ix=0 and ix=LX-1 endpoints of the hinge axis) trivially satisfies
+> this, but the solver's behavior on 2 simultaneous joint edges is
+> worth verifying.
+>
+> **Q2:** Does adding the second joint edge cost anything measurable?
+> Prediction: +0.004 ms relative to cube2-ballsocket, matching the
+> Phase 2.1 per-edge slope of ~1 µs/edge in regime 1 plus dispatch
+> overhead.
+>
+> **Q3 (retroactive):** Phase 2.3 reported a +3.3% `gather_ms` drift
+> vs Phase 2.1 N=2 and tentatively attributed it to cube co-location.
+> Phase 2.3.1 uses the same placement with 2 joint edges instead of 1.
+> If gather stays at +3.3%, the co-location attribution is confirmed.
+> If gather comes back to the Phase 2.1 baseline, the +3.3% was noise
+> and the attribution was wrong.
+
+## Experiment design
+
+- **Same cube placement as Phase 2.3:** two 10³ cubes at (x=50, z=0),
+  stacked in y at ±2.75, with a 0.5-unit gap between their facing
+  y-faces. Both cubes get the same circular-orbit velocity tangent to
+  r=50 (midpoint velocity, not per-cube).
+- **Hinge: 2 distance constraints along the x-axis.** Two anchor pairs
+  at iz=LZ/2=5 on the facing y-faces:
+  ```
+  edge A: cube0.(ix=0, iy=9, iz=5)  ↔  cube1.(ix=0, iy=0, iz=5)   rest = 1.0
+  edge B: cube0.(ix=9, iy=9, iz=5)  ↔  cube1.(ix=9, iy=0, iz=5)   rest = 1.0
+  ```
+  The hinge axis runs from (47.75, 0, 0) to (52.25, 0, 0) — parallel
+  to the disk-radial direction, at the midpoint y=0 between the cube
+  centers. This axis is also the natural rotation axis the Viviani
+  field's in-plane shear would try to rotate the pair around, so a
+  hinge here allows the rotation instead of fighting it.
+- **Solver unchanged.** Same 4-iter PBD, same Baumgarte β=0.2, same
+  6-bucket lattice coloring, same dispatch backend. Bucket 6 now
+  contains 2 edges instead of 1.
+- **Vertex-disjointness of bucket 6:** edge A endpoints are
+  `{cube0+590, cube1+500}`, edge B endpoints are `{cube0+599, cube1+509}`.
+  All four distinct. ✓
+- **New CLI mode `--rigid-body cube2-hinge`** and optional `--spin-rate R`
+  flag that gives cube 1 an initial angular velocity of R rad/frame
+  around the x-axis. `--spin-rate 0` reproduces the minimal test.
+
+## Joint stability (100K smoke, 18000 frames, --spin-rate 0)
+
+`-n 98000 --rigid-body cube2-hinge`, probe every 500 frames.
+
+### Hinge edge distances (rest length 1.0)
+
+| frame | d_hinge_A | d_hinge_B | drift A | drift B |
+|-----:|--------:|--------:|--------:|--------:|
+| 500 | 0.9998 | 0.9998 | −0.02% | −0.02% |
+| 1000 | 0.9996 | 0.9997 | −0.04% | −0.03% |
+| 2000 | 0.9989 | 0.9990 | −0.11% | −0.10% |
+| 3000 | 0.9980 | 0.9983 | −0.20% | −0.17% |
+| 4000 | 0.9958 | 0.9966 | −0.42% | −0.34% |
+| **5000** | **0.9928** | **0.9940** | **−0.72%** | **−0.60%** (min) |
+| 5500 | 0.9941 | 0.9952 | −0.59% | −0.48% |
+| 6000 | 0.9968 | 0.9974 | −0.32% | −0.26% |
+| 7000 | 0.9980 | 0.9983 | −0.20% | −0.17% |
+| 9000 | 0.9980 | 0.9981 | −0.20% | −0.19% |
+| 12000 | 0.9985 | 0.9980 | −0.15% | −0.20% |
+| 15000 | 0.9986 | 0.9980 | −0.14% | −0.20% |
+| 18000 | 0.9980 | 0.9970 | −0.20% | −0.30% |
+
+**Both edges behave nearly identically.** Maximum divergence between
+A and B is 0.0012 (at frame 18000). They track each other throughout
+the 18000-frame run, which is strong evidence that the coloring is
+correct — if either edge were racing the other, we'd see drift in
+opposite directions or differential stretching.
+
+**Oscillate-to-equilibrium pattern reproduces from Phase 2.3.** Both
+edges dip to their minimum around frame 5000 (0.9928, 0.9940), recover
+by frame 7000, settle into a slow oscillation band around 0.998 for
+the rest of the run. The hinge's transient drift (0.72%) is smaller
+than the ball-socket's (1.3%) — possibly because the second edge adds
+stiffness to the joint response.
+
+Max drift across all 18000 frames: **d_hinge_A 0.72%, d_hinge_B 0.60%**.
+Both well inside the ±10% pass bar and the ±1% ideal target.
+
+### Cube internal fidelity
+
+Both cubes' internal lattice edges held within ±0.0003 of 0.5 (0.06%
+max drift) across all 18000 frames — identical to Phase 2.3 ballsocket
+and the single-cube MVP. The hinge does NOT destabilize the per-cube
+solver.
+
+### Orbital motion
+
+The cube pair orbits together. cube0[0] moves from (47.8, -5.0, 0.1) at
+frame 500 to (approximately) (-18, -1.5, 50) by frame 18000 — tracing
+most of a half-orbit around the BH at r ≈ 50. The pair stays together
+throughout; the hinge coupling is behaving as a rigid connection (which
+makes sense since there's no differential torque trying to rotate cube
+1 around the x-axis in this geometry, so the hinge DOF isn't actually
+exercised — see Stage 6 below for the spinning stress test).
+
+## 20M measurement run (--spin-rate 0)
+
+Steady-state 8-sample means from the initial run:
+
+| metric | Phase 2.1 N=2 antipodal | Phase 2.3 ball-socket (orig) | Phase 2.3 ball-socket (recheck) | Phase 2.3.1 hinge (orig) | Phase 2.3.1 hinge (recheck) |
+|---|---:|---:|---:|---:|---:|
+| `scatter_ms` | 1.888 | 2.018 | 1.982 | 1.837 | 1.991 |
+| `gather_ms` | **1.386** | **1.432** | **1.390** | **1.341** | **1.381** |
+| `constraint_ms` | **0.061** | **0.065** | **0.065** | **0.097** | **0.065** |
+| `siphon_ms` | 8.069 | 8.174 | 8.043 | 8.007 | 8.053 |
+| `total_ms` | 13.103 | 13.492 | 13.194 | 13.024 | 13.244 |
+
+Five 20M runs now on the books (3 distinct configurations, 2 of them
+measured twice in the same session). **The run-to-run noise floor at
+this scale is ~3% on `gather_ms` and ~3% on `total_ms`.** The original
+Phase 2.3.1 hinge constraint_ms outlier (0.097) did not reproduce on
+recheck (0.065), confirming it was transient noise, not architecture.
+
+### Q1 — hinge correctness: PASS
+
+Both `d_hinge_A` and `d_hinge_B` bounded, tracking each other, same
+oscillate-to-equilibrium pattern as Phase 2.3's single d_joint. The
+2-edge bucket 6 works correctly under the true GPU Gauss-Seidel
+semantics.
+
+### Q2 — second edge cost: essentially free (when measured against noise)
+
+The **recheck** constraint_ms (0.065) is identical to cube2-ballsocket's
+constraint_ms (0.065). **Adding the second joint edge costs nothing
+measurable at this scale.** The original Phase 2.3.1 measurement showed
+0.097 which I initially interpreted as a real +0.032 ms delta; the
+recheck disconfirmed that. Lesson: at sub-millisecond constraint_ms,
+a single-run mean of 8 samples is not enough to resolve 30 µs effects
+— you need multi-run averaging or longer individual runs.
+
+The Phase 2.1 linear fit predicts 1.12 µs per cube edge in regime 1.
+For 1 vs 2 joint edges, the predicted delta is ~1 µs, which is deep
+below the measurement noise floor. The actual measurement confirms
+"no measurable delta" — consistent with the prediction.
+
+### Q3 — retroactive disconfirmation of the Phase 2.3 co-location claim
+
+**The Phase 2.3 writeup's tentative attribution of a +3.3% gather drift
+to cube co-location was wrong.** The evidence:
+
+- Phase 2.3 shipped with gather_ms = 1.432 (commit `1c76881`).
+- Phase 2.3.1 recheck of the same Phase 2.3 binary/geometry: **1.390**.
+- Phase 2.3.1 hinge (same placement, 2 joint edges): **1.381** (recheck).
+- Phase 2.1 N=2 antipodal (different placement, no joint): 1.386.
+
+All four numbers are within 3% of each other, and the variance is not
+correlated with geometry or joint count. The Phase 2.3 shipped 1.432
+was simply a high sample of the noise distribution. The "cache hotspot
+from cube co-location" story I constructed to explain it is not
+supported by any of the subsequent measurements.
+
+**What this means for the architectural claims:**
+
+1. The cache-separability claim from Phase 2.1 (Viviani sort and
+   constraint solver operate in orthogonal memory regions) holds
+   robustly. It was never perturbed by joint edges or by co-located
+   rigid bodies.
+2. The "co-located cubes create a cache hotspot in shared scatter
+   cells" story was a post-hoc rationalization of noise. It might
+   still be true at larger scales (1000 cubes in one scatter cell
+   would probably show real effects), but it's NOT visible in the
+   2-cube configurations tested so far.
+3. The Phase 2.3 writeup should be read with this correction in mind:
+   its "what this does NOT answer" list included a "co-located
+   control" follow-up; Phase 2.3.1 is that control, and the answer is
+   "there was nothing to control for."
+
+### Q1 + Q2 summary (decision criteria)
+
+- **Joint stability:** ✓ Both edges bounded, max drift 0.72% over
+  18000 frames. Well under the ±10% pass bar.
+- **Lattice fidelity:** ✓ Both cubes within 0.06% of rest. Same as
+  single-cube MVP and Phase 2.3 ballsocket.
+- **`gather_ms` invariance:** ✓ Within run-to-run noise (3%) of
+  every previous 20M baseline.
+- **`constraint_ms` cost:** ✓ 0.065 ms, identical to ballsocket.
+  Bucket 6 of size 2 has the same measured cost as bucket 6 of size 1
+  at regime 1 constraint counts.
+
+## Prediction reconciliation
+
+- **Joint stability: within ±1%.** Actual: ±0.72% transient, ±0.2%
+  stabilized. ✓ Prediction held and was actually slightly conservative.
+- **`constraint_ms`: +0.004 ms vs ballsocket.** Actual (recheck):
+  +0.000 ms within noise. Ballsocket delta was also noise. The per-edge
+  cost in regime 1 is below the noise floor for the 1→2 edge step.
+- **`gather_ms`: within ±1% of Phase 2.1 N=2.** Actual: within ±3.3%
+  at any single run, within ±0.4% across multi-run means. Noise is the
+  dominant effect at this scale — my ±1% single-run prediction was
+  tighter than the instrument can resolve.
+- **Q3 co-location attribution disconfirmed.** See above.
+
+## Methodological lesson
+
+Single-run means of 8 samples at sub-millisecond GPU timings have
+~3% run-to-run variance. For comparing two configurations within 3% of
+each other, a single comparison is not conclusive — you need either
+(a) multi-run averaging, (b) longer individual runs, or (c) direct A/B
+scaffolding that measures both configurations in the same process
+invocation. The Phase 2.3 "+3.3% co-location attribution" was an
+artifact of trying to resolve a noise-floor effect with single-run
+data.
+
+**This affects the architectural memory's cache-separability claim
+only at the level of phrasing:** "the two subsystems do not interact
+detectably in gather_ms within run-to-run noise" is the rigorous
+version, vs "gather_ms stays exactly flat across joint configurations"
+which was my earlier framing.
+
+## What this does NOT answer
+
+- **Hinge DOF stress test.** In the current y-stacked placement with
+  no differential velocity between cubes, the hinge axis is not
+  actively rotated. A ball-socket and a hinge behave identically
+  because nothing is trying to use the 1 rotational DOF that
+  distinguishes them. Stage 6 of the Phase 2.3.1 plan addresses this
+  with an optional `--spin-rate` flag that gives cube 1 an initial
+  angular velocity around the hinge axis. Results of that experiment
+  are in the "Stage 6" addendum below (if present).
+- **Multi-hinge chains** (A–B–C linked). Same substrate extension
+  (more joint edges in bucket 6), but convergence behavior unknown.
+- **Fixed joints.** 3 non-collinear ball-sockets → 0 DOF. Phase 2.3.2.
+- **Joints under collision.** Phase 2.2 prerequisite.
+
+## Files touched (for archaeology)
+
+- `blackhole_v21_visual.cpp`:
+  - `RigidBodyMode::CUBE2_HINGE = 3` added.
+  - `--rigid-body cube2-hinge` CLI parser arm.
+  - `--spin-rate R` CLI parser arm (default 0, used by Stage 6).
+  - `n_rigid` branch for CUBE2_HINGE.
+  - Call-site branch for CUBE2_HINGE.
+  - New `init_rigid_body_cube2_hinge` function (~140 lines, sibling
+    to `init_rigid_body_cube2_ballsocket`).
+  - Oracle probe extended to print `d_hinge_A` and `d_hinge_B` when
+    mode is CUBE2_HINGE.
+- `docs/constraint_experiment.md`: this appended section.
+
+No changes to `vk_compute.cpp`, `vk_compute.h`, or any kernel. The
+backend continues to be topology-agnostic. The 7-bucket dispatch loop
+shipped in Phase 2.3 already handles bucket 6 with any number of
+vertex-disjoint edges.
+
+Plan file: `/home/zaiken/.claude/plans/wiggly-prancing-hamming.md`
+(overwritten for the Phase 2.3.1 plan).

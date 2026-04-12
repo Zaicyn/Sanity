@@ -152,7 +152,8 @@ enum InitSortMode {
 enum RigidBodyMode {
     RIGID_BODY_OFF              = 0,  /* no lattice (default) */
     RIGID_BODY_CUBE1000         = 1,  /* 10×10×10 cube, 2700 distance constraints */
-    RIGID_BODY_CUBE2_BALLSOCKET = 2   /* 2 cubes + 1 ball-socket joint (Phase 2.3 MVP) */
+    RIGID_BODY_CUBE2_BALLSOCKET = 2,  /* 2 cubes + 1 ball-socket joint (Phase 2.3 MVP) */
+    RIGID_BODY_CUBE2_HINGE      = 3   /* 2 cubes + hinge (2 distance constraints along x-axis, Phase 2.3.1) */
 };
 
 /* Lattice data computed on the host side and uploaded to the GPU constraint
@@ -585,6 +586,169 @@ static ConstraintLattice init_rigid_body_cube2_ballsocket(ParticleState& ps,
     return L;
 }
 
+/* Phase 2.3.1: two cubes + one hinge joint (2 distance constraints along
+ * the x-axis). Same y-stacked placement as cube2-ballsocket: cubes at
+ * (50, ±2.75, 0) with a 0.5-unit gap. The hinge has two anchor pairs,
+ * one at each end of the desired rotation axis, both at iz=LZ/2:
+ *   edge A: cube0.(ix=0,      iy=LY-1, iz=LZ/2) ↔ cube1.(ix=0,      iy=0, iz=LZ/2)
+ *   edge B: cube0.(ix=LX-1,   iy=LY-1, iz=LZ/2) ↔ cube1.(ix=LX-1,   iy=0, iz=LZ/2)
+ *
+ * The two edges span the x-axis at y=0 between the cube centers, so the
+ * hinge allows rotation around x while locking translation along y, z,
+ * and x, plus rotation around y and z. Both edges go into super-bucket 6
+ * and are vertex-disjoint (different ix values, different particle IDs).
+ *
+ * Optional spin_rate: if non-zero, cube 1 gets an initial angular velocity
+ * of spin_rate rad/frame around the x-axis (the hinge axis). Applied as
+ * omega × (p − cube1_center) where omega = (spin_rate, 0, 0). This
+ * exercises the hinge's rotational DOF — a ball-socket couldn't absorb
+ * this input, a hinge should. spin_rate=0 reproduces the minimal test. */
+static ConstraintLattice init_rigid_body_cube2_hinge(ParticleState& ps,
+                                                     int n_galaxy,
+                                                     float spin_rate) {
+    const int   LX = 10, LY = 10, LZ = 10;
+    const int   N_LATTICE     = LX * LY * LZ;          /* 1000 per cube */
+    const int   N_LATTICE_TOT = 2 * N_LATTICE;         /* 2000 */
+    const float SPACING       = 0.5f;
+    const float R_MIDPOINT    = 50.0f;
+    const float Y_OFFSET      = 2.75f;                 /* half-gap between cube centers */
+
+    if (n_galaxy + N_LATTICE_TOT > ps.N) {
+        fprintf(stderr, "[rigid] ERROR: ps.N=%d insufficient for n_galaxy=%d + "
+                        "2 cubes + hinge\n", ps.N, n_galaxy);
+        return ConstraintLattice{};
+    }
+
+    /* Shared orbital velocity, computed at the midpoint. Same as cube2-ballsocket. */
+    const float r_center = R_MIDPOINT;
+    const float v_orbit  = sqrtf(BH_MASS / fmaxf(r_center, ISCO_R));
+    const float vx0      = 0.0f;
+    const float vz0      = v_orbit;
+
+    const uint32_t base = (uint32_t)n_galaxy;
+
+    /* 7 super-buckets: 0..5 lattice, 6 joint (2 hinge edges). */
+    std::vector<std::pair<uint32_t, uint32_t>> super[7];
+    for (int k = 0; k < 6; k++) super[k].reserve(900);
+    super[6].reserve(2);
+
+    const float cube_centers_y[2] = { -Y_OFFSET, +Y_OFFSET };
+    uint32_t anchor_A[2] = { 0, 0 };   /* cube 0/1 anchor at ix=0 end of hinge axis */
+    uint32_t anchor_B[2] = { 0, 0 };   /* cube 0/1 anchor at ix=LX-1 end of hinge axis */
+
+    for (int c = 0; c < 2; c++) {
+        const float cx = R_MIDPOINT;
+        const float cy = cube_centers_y[c];
+        const float cz = 0.0f;
+
+        const uint32_t cube_base = base + (uint32_t)(c * N_LATTICE);
+        auto idx_of = [&](int ix, int iy, int iz) -> uint32_t {
+            return cube_base + (uint32_t)(ix + iy * LX + iz * LX * LY);
+        };
+
+        /* Place particles. For cube 1, optionally add omega × r angular
+         * velocity around the x-axis (the hinge axis). omega = (R, 0, 0),
+         *   omega × (dx, dy, dz) = (0, -R·dz, R·dy)
+         * where (dx, dy, dz) is the offset from cube 1's center. Cube 0
+         * is unspun so cube 1's rotation is a *relative* motion across
+         * the hinge. */
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t p = idx_of(ix, iy, iz);
+            float px = cx + (ix - (LX - 1) * 0.5f) * SPACING;
+            float py = cy + (iy - (LY - 1) * 0.5f) * SPACING;
+            float pz = cz + (iz - (LZ - 1) * 0.5f) * SPACING;
+            ps.pos_x[p] = px;
+            ps.pos_y[p] = py;
+            ps.pos_z[p] = pz;
+
+            float vy_extra = 0.0f, vz_extra = 0.0f;
+            if (c == 1 && spin_rate != 0.0f) {
+                float dy = py - cy;
+                float dz = pz - cz;
+                vy_extra = -spin_rate * dz;
+                vz_extra =  spin_rate * dy;
+            }
+
+            ps.vel_x[p] = vx0;
+            ps.vel_y[p] = 0.0f + vy_extra;
+            ps.vel_z[p] = vz0  + vz_extra;
+            ps.theta[p] = 0.0f;
+            ps.omega_nat[p] = 0.1f;
+            ps.flags[p] = 0x01;             /* PFLAG_ACTIVE */
+            ps.pump_scale[p] = 1.0f;
+            ps.topo_state[p] = 0x01;
+        }
+
+        /* Build this cube's 6 local lattice buckets — same coloring as
+         * cube2-ballsocket. */
+        std::vector<std::pair<uint32_t, uint32_t>> local[6];
+        for (int iz = 0; iz < LZ; iz++)
+        for (int iy = 0; iy < LY; iy++)
+        for (int ix = 0; ix < LX; ix++) {
+            uint32_t a = idx_of(ix, iy, iz);
+            if (ix + 1 < LX) local[0 + (ix & 1)].push_back({a, idx_of(ix + 1, iy, iz)});
+            if (iy + 1 < LY) local[2 + (iy & 1)].push_back({a, idx_of(ix, iy + 1, iz)});
+            if (iz + 1 < LZ) local[4 + (iz & 1)].push_back({a, idx_of(ix, iy, iz + 1)});
+        }
+        for (int k = 0; k < 6; k++) {
+            super[k].insert(super[k].end(), local[k].begin(), local[k].end());
+        }
+
+        /* Record this cube's two hinge anchors. For cube 0 use the top
+         * face (iy = LY - 1); for cube 1 the bottom face (iy = 0). Both
+         * at iz = LZ/2 (the midpoint of the z range), with ix = 0 and
+         * ix = LX - 1 as the two ends of the hinge axis. */
+        int anchor_iy = (c == 0) ? (LY - 1) : 0;
+        anchor_A[c] = idx_of(0,          anchor_iy, LZ / 2);
+        anchor_B[c] = idx_of(LX - 1,     anchor_iy, LZ / 2);
+    }
+
+    /* Two hinge edges in bucket 6. Vertex-disjoint by construction:
+     * anchor_A uses ix=0, anchor_B uses ix=LX-1, so no shared endpoints. */
+    super[6].push_back({anchor_A[0], anchor_A[1]});
+    super[6].push_back({anchor_B[0], anchor_B[1]});
+
+    ConstraintLattice L = {};
+    L.base_index  = base;
+    L.rigid_count = (uint32_t)N_LATTICE_TOT;
+    L.inv_m.assign(N_LATTICE_TOT, 1.0f);
+
+    uint32_t running = 0;
+    for (int k = 0; k < 7; k++) {
+        L.bucket_offsets[k] = running;
+        L.bucket_counts[k]  = (uint32_t)super[k].size();
+        running += L.bucket_counts[k];
+    }
+    L.pairs.reserve(2u * running);
+    L.rest.reserve(running);
+    for (int k = 0; k < 6; k++) {
+        for (auto& pr : super[k]) {
+            L.pairs.push_back(pr.first);
+            L.pairs.push_back(pr.second);
+            L.rest.push_back(SPACING);
+        }
+    }
+    for (auto& pr : super[6]) {
+        L.pairs.push_back(pr.first);
+        L.pairs.push_back(pr.second);
+        L.rest.push_back(1.0f);   /* same y-gap as ball-socket */
+    }
+
+    printf("[rigid] cube2-hinge: %d lattice particles, %u constraints "
+           "(5400 lattice + %u joint), buckets=[%u %u %u %u %u %u %u], "
+           "base=%u, hinge_A=(%u, %u), hinge_B=(%u, %u), spin_rate=%.4f rad/frame\n",
+           N_LATTICE_TOT, running, L.bucket_counts[6],
+           L.bucket_counts[0], L.bucket_counts[1], L.bucket_counts[2],
+           L.bucket_counts[3], L.bucket_counts[4], L.bucket_counts[5],
+           L.bucket_counts[6], base,
+           anchor_A[0], anchor_A[1],
+           anchor_B[0], anchor_B[1],
+           spin_rate);
+    return L;
+}
+
 /* ========================================================================
  * VIVIANI FIELD (same as blackhole_v21.c)
  * ======================================================================== */
@@ -722,7 +886,8 @@ int main(int argc, char** argv) {
     ScatterMode scatter_mode = SCATTER_MODE_BASELINE;
     InitSortMode init_sort = INIT_SORT_NONE;
     RigidBodyMode rigid_body_mode = RIGID_BODY_OFF;
-    int rigid_count = 1;   /* number of cubes; only meaningful when --rigid-body cube1000 */
+    int   rigid_count = 1;      /* number of cubes; only meaningful when --rigid-body cube1000 */
+    float spin_rate   = 0.0f;   /* cube 1 angular velocity around hinge axis (rad/frame); cube2-hinge only */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -760,9 +925,10 @@ int main(int argc, char** argv) {
             if      (strcmp(m, "off")              == 0) rigid_body_mode = RIGID_BODY_OFF;
             else if (strcmp(m, "cube1000")         == 0) rigid_body_mode = RIGID_BODY_CUBE1000;
             else if (strcmp(m, "cube2-ballsocket") == 0) rigid_body_mode = RIGID_BODY_CUBE2_BALLSOCKET;
+            else if (strcmp(m, "cube2-hinge")      == 0) rigid_body_mode = RIGID_BODY_CUBE2_HINGE;
             else {
                 fprintf(stderr, "unknown --rigid-body '%s' "
-                                "(expected off, cube1000, or cube2-ballsocket)\n", m);
+                                "(expected off, cube1000, cube2-ballsocket, or cube2-hinge)\n", m);
                 return 1;
             }
         }
@@ -773,12 +939,16 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
+        else if (strcmp(argv[i], "--spin-rate") == 0 && i+1 < argc) {
+            spin_rate = (float)atof(argv[++i]);
+        }
         else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: blackhole_v21_visual [-n particles] [--rng-seed S] "
                    "[--gpu-physics] [--project-only] "
                    "[--scatter-mode baseline|uniform|squaragon] "
                    "[--init-sort none|cell|viviani] "
-                   "[--rigid-body off|cube1000|cube2-ballsocket] [--rigid-count N]\n");
+                   "[--rigid-body off|cube1000|cube2-ballsocket|cube2-hinge] "
+                   "[--rigid-count N] [--spin-rate R]\n");
             return 0;
         }
     }
@@ -797,6 +967,7 @@ int main(int argc, char** argv) {
     int n_rigid = 0;
     if      (rigid_body_mode == RIGID_BODY_CUBE1000)         n_rigid = rigid_count * 1000;
     else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) n_rigid = 2000;
+    else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE)      n_rigid = 2000;
     num_particles = n_galaxy + n_rigid;   /* total allocation from here on */
 
     /* Init particles — only [0, n_galaxy) gets generated and sorted;
@@ -810,6 +981,8 @@ int main(int argc, char** argv) {
         lattice = init_rigid_body_cube(particles, n_galaxy, rigid_count);
     } else if (rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) {
         lattice = init_rigid_body_cube2_ballsocket(particles, n_galaxy);
+    } else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE) {
+        lattice = init_rigid_body_cube2_hinge(particles, n_galaxy, spin_rate);
     }
 
     /* Init validation oracle */
@@ -1004,7 +1177,8 @@ int main(int argc, char** argv) {
              * outside the first 100K oracle window, so the probe silently
              * no-ops — measurement runs are unaffected. */
             if ((rigid_body_mode == RIGID_BODY_CUBE1000 ||
-                 rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET) &&
+                 rigid_body_mode == RIGID_BODY_CUBE2_BALLSOCKET ||
+                 rigid_body_mode == RIGID_BODY_CUBE2_HINGE) &&
                 (n_galaxy + n_rigid) <= oracle_count) {
                 int b = n_galaxy;
                 auto dist_idx = [&](int i, int j) -> float {
@@ -1040,6 +1214,29 @@ int main(int argc, char** argv) {
                            "d_joint=%.4f (rest=1.0)\n",
                            frame, rb_px[b + 1000], rb_py[b + 1000], rb_pz[b + 1000],
                            d1_x, d1_y, d1_z, d_joint);
+                } else if (rigid_body_mode == RIGID_BODY_CUBE2_HINGE) {
+                    /* Hinge anchor A: cube 0 (ix=0, iy=9, iz=5) → offset
+                     *   0 + 9*10 + 5*100 = 590. Cube 1 (ix=0, iy=0, iz=5)
+                     *   → offset 0 + 0 + 500 = 500.
+                     * Hinge anchor B: cube 0 (ix=9, iy=9, iz=5) → offset
+                     *   9 + 90 + 500 = 599. Cube 1 (ix=9, iy=0, iz=5) →
+                     *   offset 9 + 0 + 500 = 509. Cube 1 base = b+1000. */
+                    int A0 = b + 590;
+                    int A1 = b + 1000 + 500;
+                    int B0 = b + 599;
+                    int B1 = b + 1000 + 509;
+                    float d_hinge_A = dist_idx(A0, A1);
+                    float d_hinge_B = dist_idx(B0, B1);
+                    /* Cube 1 internal check: particle at b+1000 is its
+                     * (0,0,0) corner. */
+                    float d1_x = dist_idx(b + 1000, b + 1001);
+                    float d1_y = dist_idx(b + 1000, b + 1010);
+                    float d1_z = dist_idx(b + 1000, b + 1100);
+                    printf("[rigid] frame=%d  cube1[0]=(%.3f,%.3f,%.3f)  "
+                           "d(0,1)=%.4f d(0,10)=%.4f d(0,100)=%.4f  "
+                           "d_hinge_A=%.4f d_hinge_B=%.4f (rest=1.0)\n",
+                           frame, rb_px[b + 1000], rb_py[b + 1000], rb_pz[b + 1000],
+                           d1_x, d1_y, d1_z, d_hinge_A, d_hinge_B);
                 }
             }
 
