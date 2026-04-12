@@ -326,6 +326,10 @@ struct PhysicsCompute {
     /* Graded siphon pipeline (Phase 3.2) — reads set 0 (pump) + set 2 (graded) */
     VkPipelineLayout      siphonGradedPipelineLayout;
     VkPipeline            siphonGradedPipeline;
+
+    /* Graded constraint pipeline (Phase 3.3) — set 0 (compat) + set 1 (pairs) + set 2 (graded) */
+    VkPipelineLayout      constraintGradedPipelineLayout;
+    VkPipeline            constraintGradedPipeline;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.

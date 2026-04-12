@@ -1422,11 +1422,6 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      * the solve, collision_sync incorporates the position corrections into
      * velocity to maintain velocity-position consistency. */
     if (phys.constraintEnabled) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.constraintPipeline);
-        VkDescriptorSet csets[2] = { phys.descSet, phys.constraintSet1 };
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            phys.constraintPipelineLayout, 0, 2, csets, 0, nullptr);
-
         ConstraintPushConstants cpc = {};
         cpc.rigid_base  = phys.rigidBaseIndex;
         cpc.rigid_count = phys.rigidCount;
@@ -1440,42 +1435,74 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
         colorBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         colorBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-        /* Precompute the last bucket index that has nonzero work so the
-         * "skip the final barrier" optimization still applies when trailing
-         * buckets are empty (e.g. cube1000 mode with no joints → bucket 6
-         * is empty, last nonempty bucket is 5). */
         int last_nonempty_bucket = -1;
         for (int b = 0; b < 7; b++) {
             if (phys.constraintBucketCounts[b] > 0) last_nonempty_bucket = b;
         }
 
-        for (uint32_t it = 0; it < phys.constraintIterations; it++) {
-            for (int bucket = 0; bucket < 7; bucket++) {
-                cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
-                cpc.constraint_count  = phys.constraintBucketCounts[bucket];
-                if (cpc.constraint_count == 0) continue;
+        if (phys.gradedEnabled) {
+            /* Phase 3.3: graded constraint solver — set 0 + set 1 + set 2 */
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              phys.constraintGradedPipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                phys.constraintGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                phys.constraintGradedPipelineLayout, 1, 1, &phys.constraintSet1, 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                phys.constraintGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
-                vkCmdPushConstants(cmd, phys.constraintPipelineLayout,
-                                   VK_SHADER_STAGE_COMPUTE_BIT,
-                                   0, sizeof(cpc), &cpc);
-                vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
+            for (uint32_t it = 0; it < phys.constraintIterations; it++) {
+                for (int bucket = 0; bucket < 7; bucket++) {
+                    cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
+                    cpc.constraint_count  = phys.constraintBucketCounts[bucket];
+                    if (cpc.constraint_count == 0) continue;
 
-                /* Barrier between buckets (and between iterations): pos writes
-                 * must be visible to the next bucket's reads. Skip the final
-                 * barrier after the last nonempty bucket of the last iteration
-                 * — the final visibility barrier to siphon is emitted below. */
-                bool is_last = (it + 1 == phys.constraintIterations) &&
-                               (bucket == last_nonempty_bucket);
-                if (!is_last) {
-                    vkCmdPipelineBarrier(cmd,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
+                    vkCmdPushConstants(cmd, phys.constraintGradedPipelineLayout,
+                                       VK_SHADER_STAGE_COMPUTE_BIT,
+                                       0, sizeof(cpc), &cpc);
+                    vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
+
+                    bool is_last = (it + 1 == phys.constraintIterations) &&
+                                   (bucket == last_nonempty_bucket);
+                    if (!is_last) {
+                        vkCmdPipelineBarrier(cmd,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
+                    }
+                }
+            }
+        } else {
+            /* Original Cartesian constraint solver */
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.constraintPipeline);
+            VkDescriptorSet csets[2] = { phys.descSet, phys.constraintSet1 };
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                phys.constraintPipelineLayout, 0, 2, csets, 0, nullptr);
+
+            for (uint32_t it = 0; it < phys.constraintIterations; it++) {
+                for (int bucket = 0; bucket < 7; bucket++) {
+                    cpc.constraint_offset = phys.constraintBucketOffsets[bucket];
+                    cpc.constraint_count  = phys.constraintBucketCounts[bucket];
+                    if (cpc.constraint_count == 0) continue;
+
+                    vkCmdPushConstants(cmd, phys.constraintPipelineLayout,
+                                       VK_SHADER_STAGE_COMPUTE_BIT,
+                                       0, sizeof(cpc), &cpc);
+                    vkCmdDispatch(cmd, (cpc.constraint_count + 63) / 64, 1, 1);
+
+                    bool is_last = (it + 1 == phys.constraintIterations) &&
+                                   (bucket == last_nonempty_bucket);
+                    if (!is_last) {
+                        vkCmdPipelineBarrier(cmd,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            0, 1, &colorBarrier, 0, nullptr, 0, nullptr);
+                    }
                 }
             }
         }
 
-        /* Final barrier: constraint pos writes → siphon reads */
+        /* Final barrier: constraint writes → next pass reads */
         VkMemoryBarrier finalBarrier = {};
         finalBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
         finalBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -1875,6 +1902,42 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         vkDestroyShaderModule(ctx.device, mod, nullptr);
         vkDestroyDescriptorSetLayout(ctx.device, emptyLayout, nullptr);
         printf("[vk-compute] Graded siphon pipeline created\n");
+    }
+
+    /* --- Graded constraint pipeline (Phase 3.3): set 0 + set 1 + set 2 ---
+     * Only created if constraints are enabled (initConstraintCompute already ran). */
+    if (phys.constraintEnabled) {
+        VkDescriptorSetLayout allSets[3] = {
+            phys.descLayout,           /* set 0: siphon particle layout (compat) */
+            phys.constraintSet1Layout, /* set 1: pairs + rest + inv_m */
+            phys.gradedSetLayout       /* set 2: graded particle state */
+        };
+        VkPushConstantRange pcRange = {};
+        pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcRange.offset = 0;
+        pcRange.size = sizeof(ConstraintPushConstants);
+        VkPipelineLayoutCreateInfo plInfo = {};
+        plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        plInfo.setLayoutCount = 3;
+        plInfo.pSetLayouts = allSets;
+        plInfo.pushConstantRangeCount = 1;
+        plInfo.pPushConstantRanges = &pcRange;
+        vkCreatePipelineLayout(ctx.device, &plInfo, nullptr,
+                               &phys.constraintGradedPipelineLayout);
+
+        auto code = readShaderFile("constraint_solve_graded.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.constraintGradedPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr,
+                                 &phys.constraintGradedPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+        printf("[vk-compute] Graded constraint pipeline created\n");
     }
 
     phys.gradedEnabled = true;
