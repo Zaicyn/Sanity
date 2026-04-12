@@ -134,8 +134,8 @@ const uint PFLAG_EJECTED = 0x02u;
 
 void apply_viviani_transport(
     float r, float phi, float theta_i,
-    float vel_r_in, float omega_orb_in,
-    out float d_vel_r, out float d_omega_orb)
+    float vel_r_in, float omega_orb_in, float vel_y_in,
+    out float d_vel_r, out float d_omega_orb, out float d_vel_y)
 {
     // Viviani curve point (same as Cartesian siphon)
     float s1 = sin(theta_i);
@@ -149,38 +149,37 @@ void apply_viviani_transport(
 
     // Normalize to get unit Viviani normal
     float inv_c = inversesqrt(cx*cx + cy*cy + cz*cz + 1e-8);
-    float nx = cx * inv_c;
-    float ny = cy * inv_c;
-    float nz = cz * inv_c;
+    float nhx = cx * inv_c;
+    float nhy = cy * inv_c;
+    float nhz = cz * inv_c;
 
-    // Project Viviani normal onto the radial direction (cos phi, 0, sin phi)
+    // Reconstruct full 3D velocity from graded components
     float cp = cos(phi);
     float sp = sin(phi);
-    float n_radial = nx * cp + nz * sp;
-
-    // Project onto tangential direction (-sin phi, 0, cos phi)
-    float n_tangential = -nx * sp + nz * cp;
-
-    // The Cartesian transport was: dv = FIELD_STRENGTH * (n̂×v)×v
-    // In the (r̂, t̂) plane, this is a rotation whose rate depends on
-    // the angle between n̂ and the velocity direction.
-    // Decompose: the component of n̂ perpendicular to v in the (r̂, t̂) plane
-    // drives the rotation.
     float v_t = r * omega_orb_in;
-    float v_mag_sq = vel_r_in * vel_r_in + v_t * v_t;
+    float vx = vel_r_in * cp - v_t * sp;
+    float vy = vel_y_in;
+    float vz = vel_r_in * sp + v_t * cp;
 
-    // Cross product magnitude in 2D: |n̂_xz × v̂_xz| = n_r * v_t/|v| - n_t * v_r/|v|
-    // This gives the "torque" that rotates velocity.
-    float inv_vmag = inversesqrt(v_mag_sq + 1e-8);
+    // Full 3D double cross product: dv = (n̂×v)×v
+    // axis = n̂ × v
+    float axisx = nhy * vz - nhz * vy;
+    float axisy = nhz * vx - nhx * vz;
+    float axisz = nhx * vy - nhy * vx;
+    // dv = axis × v
+    float dvx = axisy * vz - axisz * vy;
+    float dvy = axisz * vx - axisx * vz;
+    float dvz = axisx * vy - axisy * vx;
 
-    // The rotation transfers velocity between radial and tangential:
-    //   dv_r = -strength * (n_r * v_t - n_t * v_r) * v_t
-    //   dv_t = +strength * (n_r * v_t - n_t * v_r) * v_r
-    // (This is the double cross product expanded in cylindrical coords)
-    float cross_2d = n_radial * v_t - n_tangential * vel_r_in;
+    // Decompose Cartesian dv back into graded components
+    // Radial: dv · r̂ = dvx * cos(phi) + dvz * sin(phi)
+    // Tangential: dv · t̂ = -dvx * sin(phi) + dvz * cos(phi)
+    float dv_radial     = dvx * cp + dvz * sp;
+    float dv_tangential = -dvx * sp + dvz * cp;
 
-    d_vel_r    = -pc.FIELD_STRENGTH * cross_2d * v_t * inv_vmag * inv_vmag;
-    d_omega_orb = pc.FIELD_STRENGTH * cross_2d * vel_r_in * inv_vmag * inv_vmag / max(r, 1e-6);
+    d_vel_r     = pc.FIELD_STRENGTH * dv_radial;
+    d_omega_orb = pc.FIELD_STRENGTH * dv_tangential / max(r, 1e-6);
+    d_vel_y     = pc.FIELD_STRENGTH * dvy;
 }
 
 // ============================================================================
@@ -290,17 +289,21 @@ void main() {
     if (theta_i >= TWO_PI) theta_i -= TWO_PI;
     if (theta_i < 0.0)     theta_i += TWO_PI;
 
-    // ----- Grade 2: Viviani rotational transport -----
-    // Couples theta → (vel_r, omega_orb) via the Viviani normal projection
+    // ----- Viviani rotational transport -----
+    // Full 3D double cross product decomposed into graded components.
+    // Couples all three velocity grades: vel_r, omega_orb, AND vel_y.
+    // The y-component coupling is critical — without it, orbital-plane
+    // damping drains vertical motion with nothing to replenish it.
     float r_eff = r + delta_r;
     float r_safe = max(r_eff, SCHW_R * 0.5);
 
-    float d_vel_r, d_omega_orb;
-    apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb,
-                            d_vel_r, d_omega_orb);
+    float d_vel_r, d_omega_orb, d_vel_y;
+    apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb, vel_y,
+                            d_vel_r, d_omega_orb, d_vel_y);
 
     vel_r     += d_vel_r;
     omega_orb += d_omega_orb;
+    vel_y     += d_vel_y;
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
     if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
