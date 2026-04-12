@@ -33,16 +33,13 @@ layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z
 layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
 layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
 layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
-layout(std430, set = 0, binding = 6)  readonly buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 6)  readonly buffer PackedMeta   { uint  packed_meta[];    };
 layout(std430, set = 0, binding = 7)  readonly buffer PumpScale    { float pump_scale[];     };
-layout(std430, set = 0, binding = 8)  readonly buffer PumpCoherent { int   pump_coherent[];  };
 layout(std430, set = 0, binding = 9)  readonly buffer PumpResidual { float pump_residual[];  };
 layout(std430, set = 0, binding = 10) readonly buffer PumpWork     { float pump_work[];      };
 layout(std430, set = 0, binding = 11) readonly buffer PumpHistory  { float pump_history[];   };
 layout(std430, set = 0, binding = 12) readonly buffer Theta        { float theta[];          };
 layout(std430, set = 0, binding = 13) readonly buffer OmegaNat     { float omega_nat[];      };
-layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
-layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion { uint  in_active_region[]; };
 
 // ----------------------------------------------------------------------------
 // Set 1 — scatter output buffers
@@ -104,10 +101,11 @@ void main() {
     int i = int(gl_GlobalInvocationID.x);
     if (i >= pc.N) return;
 
-    uint f = flags[i];
+    uint meta = packed_meta[i];
+    uint f = (meta >> 5) & 0x0Fu;
     if ((f & PFLAG_ACTIVE) == 0u) return;
     if ((f & PFLAG_EJECTED) != 0u) return;
-    if (in_active_region[i] == 0u) return;
+    if (((meta >> 9) & 0x01u) == 0u) return;
 
     float px = pos_x[i];
     float py = pos_y[i];

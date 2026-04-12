@@ -16,14 +16,11 @@ struct Particle {
 };
 
 // Set 0 — pump state (read)
-layout(std430, set = 0, binding = 6)  readonly buffer PumpState   { int   pump_state[];   };
+layout(std430, set = 0, binding = 6)  readonly buffer PackedMeta  { uint  packed_meta[];  };
 layout(std430, set = 0, binding = 7)  readonly buffer PumpScale   { float pump_scale[];   };
-layout(std430, set = 0, binding = 8)  readonly buffer PumpCoherent{ int   pump_coherent[];};
 layout(std430, set = 0, binding = 9)  readonly buffer PumpResidual{ float pump_residual[];};
 layout(std430, set = 0, binding = 10) readonly buffer PumpWork    { float pump_work[];    };
 layout(std430, set = 0, binding = 11) readonly buffer PumpHistory { float pump_history[]; };
-layout(std430, set = 0, binding = 14) readonly buffer Flags       { uint  flags[];        };
-layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion{ uint in_active_region[]; };
 
 // Set 2 — graded state (read)
 layout(std430, set = 2, binding = 0)  readonly buffer GR       { float g_r[];         };
@@ -54,10 +51,12 @@ void main() {
     p.k2 = vec4(pump_scale[i], pump_residual[i], pump_work[i], pump_history[i]);
     p.k3 = vec4(g_omega_nat[i], 0.0, 0.0, 0.0);
 
-    uint ps_val = uint(pump_state[i]) & 0x7u;
-    uint co_val = uint(pump_coherent[i]) & 0x1u;
-    uint fl_val = flags[i] & 0xFu;
-    uint ar_val = in_active_region[i] & 0x1u;
+    // Repack from siphon's packed_meta layout to Particle.meta layout
+    uint meta = packed_meta[i];
+    uint ps_val = meta & 0x07u;           // bits 0-2: pump_state
+    uint co_val = (meta >> 3) & 0x01u;    // bit 3 (truncated from 2-bit field)
+    uint fl_val = (meta >> 5) & 0x0Fu;    // bits 5-8: flags
+    uint ar_val = (meta >> 9) & 0x01u;    // bit 9: in_active_region
     p.meta = ps_val | (co_val << 3u) | (fl_val << 4u) | (ar_val << 8u);
 
     packed_out[i] = p;

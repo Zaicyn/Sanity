@@ -9,10 +9,9 @@ layout(local_size_x = 256) in;
 layout(std430, set = 0, binding = 0) readonly buffer PosX  { float pos_x[]; };
 layout(std430, set = 0, binding = 1) readonly buffer PosY  { float pos_y[]; };
 layout(std430, set = 0, binding = 2) readonly buffer PosZ  { float pos_z[]; };
-layout(std430, set = 0, binding = 6) readonly buffer PumpS { int   pump_state[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PackedMeta { uint  packed_meta[]; };
 layout(std430, set = 0, binding = 7) readonly buffer Scale { float pump_scale[]; };
 layout(std430, set = 0, binding = 9) readonly buffer Resid { float pump_residual[]; };
-layout(std430, set = 0, binding = 14) readonly buffer Flags { uint  flags[]; };
 
 // Density accumulation buffer — R32_UINT, cleared each frame
 layout(set = 0, binding = 16, r32ui) uniform uimage2D density_buf;
@@ -52,8 +51,10 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (int(gid) >= pc.particle_count) return;
 
-    // Skip inactive
-    if ((flags[gid] & 0x01u) == 0u) return;
+    // Skip inactive (unpack flags from packed_meta)
+    uint meta = packed_meta[gid];
+    uint f = (meta >> 5) & 0x0Fu;
+    if ((f & 0x01u) == 0u) return;
 
     // Skip dissolving
     if (pump_residual[gid] > 0.95) return;

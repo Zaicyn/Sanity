@@ -223,12 +223,19 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     memcpy(staging_base + offsets[12], theta, float_sz);
     memcpy(staging_base + offsets[13], omega_nat, float_sz);
 
-    /* Pad uint8 flags to uint32 for SSBO */
+    /* Pack pump_state, pump_coherent, flags, in_active_region into packed_meta (binding 6).
+     * Layout: bits 0-2 = pump_state, bits 3-4 = pump_coherent, bits 5-8 = flags, bit 9 = active */
+    uint32_t* meta_s = (uint32_t*)(staging_base + offsets[6]);
     uint32_t* flags_s = (uint32_t*)(staging_base + offsets[14]);
     uint32_t* active_s = (uint32_t*)(staging_base + offsets[15]);
     for (int i = 0; i < N; i++) {
+        uint32_t ps = pump_state ? (uint32_t)(pump_state[i] & 0x07) : 0u;
+        uint32_t fl = (uint32_t)(flags[i] & 0x0F);
+        meta_s[i] = ps | (0u << 3) | (fl << 5) | (1u << 9);  /* coherent=0, active=1 */
+        /* Also populate legacy bindings 14/15 — cartesian_to_graded.comp reads binding 14
+         * during the one-shot init conversion. After that, only packed_meta is live. */
         flags_s[i] = flags[i];
-        active_s[i] = 1;  /* All active initially */
+        active_s[i] = 1;
     }
     vkUnmapMemory(ctx.device, stagingMem);
 
@@ -2912,13 +2919,10 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 
     size_t sz = (size_t)count * sizeof(float);
 
-    /* Source bindings for the 9 values we copy (8 floats + 1 uint32 for flags).
-     * Binding layout from siphon.comp:
-     *   0..5 = pos_xyz, vel_xyz     6 = pump_state   7 = pump_scale
-     *   8 = pump_coherent           9 = pump_residual  10 = pump_work
-     *   11 = pump_history          12 = theta        13 = omega_nat
-     *   14 = flags (uint32-padded) 15 = in_active_region */
-    const int src_bindings[9] = {0, 1, 2, 3, 4, 5, 12, 7, 14};
+    /* Source bindings for the 9 values we copy (8 floats + 1 uint32 packed_meta).
+     * Binding 6 = packed_meta (contains pump_state, pump_coherent, flags, active).
+     * Flags are unpacked from packed_meta after readback. */
+    const int src_bindings[9] = {0, 1, 2, 3, 4, 5, 12, 7, 6};
 
     VkCommandBuffer cmd;
     VkCommandBufferAllocateInfo cba = {};
@@ -2972,10 +2976,10 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     memcpy(out_theta,      mapped + 6 * sz, sz);
     memcpy(out_pump_scale, mapped + 7 * sz, sz);
 
-    /* Flags are stored as uint32 in the SSBO, narrow back to uint8 */
-    const uint32_t* flags32 = (const uint32_t*)(mapped + 8 * sz);
+    /* Unpack flags from packed_meta (bits 5-8) → uint8 */
+    const uint32_t* meta32 = (const uint32_t*)(mapped + 8 * sz);
     for (int i = 0; i < count; i++) {
-        out_flags[i] = (uint8_t)(flags32[i] & 0xFF);
+        out_flags[i] = (uint8_t)((meta32[i] >> 5) & 0x0F);
     }
 
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
@@ -3005,7 +3009,7 @@ void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
 
-    /* Copy pump_state (binding 6) into the first `sz` bytes of staging */
+    /* Copy packed_meta (binding 6) into the first `sz` bytes of staging */
     VkBufferCopy region = {0, 0, sz};
     vkCmdCopyBuffer(cmd, phys.soa_buffers[6], phys.staging, 1, &region);
 
@@ -3024,7 +3028,11 @@ void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
     vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
     vkDestroyFence(ctx.device, fence, nullptr);
 
-    memcpy(out_states, phys.stagingMapped, sz);
+    /* Unpack pump_state (bits 0-2) from packed_meta */
+    const uint32_t* meta = (const uint32_t*)phys.stagingMapped;
+    for (int i = 0; i < count; i++) {
+        out_states[i] = (int)(meta[i] & 0x07);
+    }
 
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
 }

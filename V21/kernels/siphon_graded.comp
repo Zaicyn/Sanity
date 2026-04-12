@@ -31,14 +31,17 @@ layout(std430, set = 0, binding = 3)  writeonly buffer OutVelX { float out_vel_x
 layout(std430, set = 0, binding = 4)  writeonly buffer OutVelY { float out_vel_y[]; };
 layout(std430, set = 0, binding = 5)  writeonly buffer OutVelZ { float out_vel_z[]; };
 
-layout(std430, set = 0, binding = 6)  buffer PumpState   { int   pump_state[];   };
+// Packed meta — replaces 4 separate SSBOs (pump_state, pump_coherent, flags, in_active_region)
+//   bits  0-2:  pump_state (0-7)
+//   bits  3-4:  pump_coherent (0-3)
+//   bits  5-8:  flags (up to 16 values)
+//   bit   9:    in_active_region
+//   bits 10-31: reserved
+layout(std430, set = 0, binding = 6)  buffer PackedMeta  { uint  packed_meta[];  };
 layout(std430, set = 0, binding = 7)  buffer PumpScale   { float pump_scale[];   };
-layout(std430, set = 0, binding = 8)  buffer PumpCoherent{ int   pump_coherent[];};
 layout(std430, set = 0, binding = 9)  buffer PumpResidual{ float pump_residual[];};
 layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];    };
 layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
-layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
-layout(std430, set = 0, binding = 15) buffer ActiveRegion{ uint in_active_region[]; };
 
 // ============================================================================
 // Set 2 — Grade-separated particle state
@@ -268,10 +271,16 @@ void main() {
     int i = int(gl_GlobalInvocationID.x);
     if (i >= pc.N) return;
 
-    uint f = flags[i];
+    // ----- Unpack meta (1 uint read replaces 4 SSBO reads) -----
+    uint meta = packed_meta[i];
+    int  state     = int(meta & 0x07u);
+    int  coh_count = int((meta >> 3) & 0x03u);
+    uint f         = (meta >> 5) & 0x0Fu;
+    uint is_active = (meta >> 9) & 0x01u;
+
     if ((f & PFLAG_ACTIVE) == 0u) return;
     if ((f & PFLAG_EJECTED) != 0u) return;
-    if (in_active_region[i] == 0u) return;
+    if (is_active == 0u) return;
 
     // ----- Load graded state -----
     float r         = g_r[i];
@@ -285,9 +294,7 @@ void main() {
     float omega_i   = g_omega_nat[i];
 
     // ----- Load pump state (grade 0) -----
-    int   state     = pump_state[i];
     float scale     = pump_scale[i];
-    int   coh_count = pump_coherent[i];
     float residual  = pump_residual[i];
     float work      = pump_work[i];
     float history   = pump_history[i];
@@ -302,8 +309,8 @@ void main() {
     g_r[i] = r; g_delta_y[i] = delta_y;
     g_vel_r[i] = vel_r; g_vel_y[i] = vel_y;
     g_phi[i] = phi; g_omega_orb[i] = omega_orb; g_theta[i] = theta_i;
-    pump_state[i] = state; pump_scale[i] = scale;
-    pump_coherent[i] = coh_count; pump_residual[i] = residual;
+    packed_meta[i] = meta; pump_scale[i] = scale;
+    pump_residual[i] = residual;
     pump_work[i] = work; pump_history[i] = history;
     return;
     #endif
@@ -451,18 +458,19 @@ void main() {
     g_theta[i]     = theta_i;
 
     // ----- Write back pump state (grade 0) -----
-    pump_state[i]    = state;
     pump_scale[i]    = scale;
     pump_residual[i] = residual;
 
-    // Conditional writes — these fields change rarely, elide when unchanged
-    // saves ~8B/particle on most frames (pump_coherent + pump_work)
-    if (coh_count != coh_count_orig) pump_coherent[i] = coh_count;
-    if (work      != work_orig)      pump_work[i]     = work;
+    // Conditional pump_work write elision (from Task 1)
+    if (work != work_orig) pump_work[i] = work;
 
-    if (eject) {
-        flags[i] = f | PFLAG_EJECTED;
-    }
+    // ----- Pack and write meta (1 uint write replaces 4 SSBO writes) -----
+    if (eject) f = f | PFLAG_EJECTED;
+    uint meta_out = (uint(state) & 0x07u)
+                  | ((uint(coh_count) & 0x03u) << 3)
+                  | ((f & 0x0Fu) << 5)
+                  | ((is_active & 0x01u) << 9);
+    packed_meta[i] = meta_out;
 
     // Pump history (exponential smoothing)
     const float HISTORY_SMOOTH = 0.02;
