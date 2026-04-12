@@ -85,6 +85,7 @@ const float ISCO_R           = 6.0;
 const float PHI_CONST        = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float COHERENCE_GAMMA  = 0.02;
+const float ARM_M3_EPSILON   = 0.05;     // m=3 density wave amplitude (radial kick)
 const float JET_SPEED        = 0.4;
 const float PUMP_EJECT_THRESHOLD = 0.88;
 const int   PUMP_COHERENT_MAX    = 3;
@@ -337,6 +338,18 @@ void main() {
     vel_r     += d_vel_r * pc.dt;
     omega_orb += d_omega_orb * pc.dt;
     vel_y     += d_vel_y * pc.dt;
+
+    // ----- m=3 density wave (Lin-Shu spiral arm mechanism) -----
+    // A rotating m=3 potential perturbation at pattern speed omega_p.
+    // Particles feel a small radial kick at phi_corotating = phi - omega_p * t.
+    // Where particles pile up (density wave crests), arms form.
+    // Pattern speed chosen so corotation radius ~ 40 (inner disk).
+    // omega_p = sqrt(BH_MASS / r_corot^3) = sqrt(1/40^3) ≈ 0.004
+    {
+        const float OMEGA_PATTERN = 0.004;
+        float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time);
+        vel_r += ARM_M3_EPSILON * cos(phi_pattern) * pc.dt;
+    }
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
     if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {

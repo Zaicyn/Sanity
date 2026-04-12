@@ -1926,6 +1926,94 @@ int main(int argc, char** argv) {
             printf("[diag ] frame=%d  scale: mean=%.3f max=%.3f  ejected=%d/%d (%.1f%%)\n",
                    frame, scale_sum*inv_n, scale_max,
                    ejected, oracle_count, 100.0 * ejected * inv_n);
+
+            /* Harmonic structure probe — azimuthal Fourier decomposition.
+             * Decomposes particle density into m=0,1,2,3,4 modes per radial shell.
+             * Measures whether secondary structures (arms, streams) exist. */
+            {
+                const int N_SHELLS = 4;
+                const double shell_edges[N_SHELLS + 1] = {0.0, 15.0, 50.0, 120.0, 250.0};
+                const char* shell_names[N_SHELLS] = {"core", "inner", "mid", "outer"};
+                const int N_MODES = 5;  /* m = 0,1,2,3,4 */
+
+                /* Fourier accumulators: cos and sin components per shell per mode */
+                double fc[N_SHELLS][N_MODES] = {};  /* cos(m*phi) */
+                double fs[N_SHELLS][N_MODES] = {};  /* sin(m*phi) */
+                int shell_count[N_SHELLS] = {};
+
+                /* Also measure Viviani phase coherence per shell:
+                 * R_theta = |<exp(i*m*theta)>| — Kuramoto-like order parameter */
+                double tc[N_SHELLS][N_MODES] = {};
+                double ts[N_SHELLS][N_MODES] = {};
+
+                for (int p = 0; p < oracle_count; p++) {
+                    if (rb_flags[p] & 0x02) continue;  /* skip ejected */
+                    double px = rb_px[p], py = rb_py[p], pz = rb_pz[p];
+                    double r_cyl = sqrt(px*px + pz*pz);
+                    double phi_p = atan2(pz, px);
+                    double theta_p = rb_theta[p];
+
+                    /* Find shell */
+                    int sh = -1;
+                    for (int s = 0; s < N_SHELLS; s++) {
+                        if (r_cyl >= shell_edges[s] && r_cyl < shell_edges[s+1]) { sh = s; break; }
+                    }
+                    if (sh < 0) continue;
+                    shell_count[sh]++;
+
+                    for (int m = 0; m < N_MODES; m++) {
+                        double angle = m * phi_p;
+                        fc[sh][m] += cos(angle);
+                        fs[sh][m] += sin(angle);
+                        double tangle = m * theta_p;
+                        tc[sh][m] += cos(tangle);
+                        ts[sh][m] += sin(tangle);
+                    }
+                }
+
+                /* Print azimuthal mode amplitudes (normalized: 0 = uniform, 1 = perfect arm) */
+                printf("[harmonic] frame=%d  azimuthal density modes |A_m| / N_shell:\n", frame);
+                for (int s = 0; s < N_SHELLS; s++) {
+                    if (shell_count[s] < 10) continue;
+                    double inv = 1.0 / shell_count[s];
+                    printf("[harmonic]   %5s (N=%6d, r=[%3.0f,%3.0f)):  ",
+                           shell_names[s], shell_count[s],
+                           shell_edges[s], shell_edges[s+1]);
+                    for (int m = 0; m < N_MODES; m++) {
+                        double amp = sqrt(fc[s][m]*fc[s][m] + fs[s][m]*fs[s][m]) * inv;
+                        printf("m%d=%.4f ", m, amp);
+                    }
+                    printf("\n");
+                }
+
+                /* Print Viviani phase coherence (Kuramoto R per mode) */
+                printf("[harmonic] frame=%d  Viviani phase coherence R_theta:\n", frame);
+                for (int s = 0; s < N_SHELLS; s++) {
+                    if (shell_count[s] < 10) continue;
+                    double inv = 1.0 / shell_count[s];
+                    printf("[harmonic]   %5s:  ", shell_names[s]);
+                    for (int m = 0; m < N_MODES; m++) {
+                        double R = sqrt(tc[s][m]*tc[s][m] + ts[s][m]*ts[s][m]) * inv;
+                        printf("m%d=%.4f ", m, R);
+                    }
+                    printf("\n");
+                }
+
+                /* Compact summary line — track m=3 growth curve */
+                double m3_inner = 0.0, m3_mid = 0.0, m3_core = 0.0;
+                double R3_inner = 0.0;
+                for (int s = 0; s < N_SHELLS; s++) {
+                    if (shell_count[s] < 10) continue;
+                    double inv = 1.0 / shell_count[s];
+                    double a3 = sqrt(fc[s][3]*fc[s][3] + fs[s][3]*fs[s][3]) * inv;
+                    double r3 = sqrt(tc[s][3]*tc[s][3] + ts[s][3]*ts[s][3]) * inv;
+                    if (s == 0) m3_core = a3;
+                    if (s == 1) { m3_inner = a3; R3_inner = r3; }
+                    if (s == 2) m3_mid = a3;
+                }
+                printf("[m3-track] frame=%d  A3: core=%.5f inner=%.5f mid=%.5f  R3_inner=%.5f\n",
+                       frame, m3_core, m3_inner, m3_mid, R3_inner);
+            }
         }
 
         if (!use_gpu_physics) {
