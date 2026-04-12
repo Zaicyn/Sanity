@@ -457,11 +457,13 @@ void main() {
     history = min(history, COH_MEM_MAX);
 
     // ----- Ejection check (coherence-driven) -----
+    // Removed phase_stress gate — it imposed m=2/m=4 azimuthal structure on
+    // ejection (cos²/sin² peaks at 4 phi positions), masking the m=3 density
+    // wave. Coherence memory alone is sufficient selectivity.
     bool eject = false;
     {
         bool close_enough = (r_safe < ISCO_R * 8.0);  // r < 48, covers inner disk
-        bool phase_polarized = (phase_stress > 0.95);
-        eject = phase_polarized && close_enough && (history > COH_EJECT_THRESHOLD);
+        eject = close_enough && (history > COH_EJECT_THRESHOLD);
     }
 
     if (eject) {

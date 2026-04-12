@@ -1927,6 +1927,30 @@ int main(int argc, char** argv) {
                    frame, scale_sum*inv_n, scale_max,
                    ejected, oracle_count, 100.0 * ejected * inv_n);
 
+            /* Ejection azimuthal probe — are ejected particles bunched at m=3? */
+            if (ejected > 10) {
+                double ej_fc[5] = {}, ej_fs[5] = {};
+                int ej_n = 0;
+                for (int p = 0; p < oracle_count; p++) {
+                    if (!(rb_flags[p] & 0x02)) continue;
+                    double phi_ej = atan2((double)rb_pz[p], (double)rb_px[p]);
+                    for (int m = 0; m < 5; m++) {
+                        ej_fc[m] += cos(m * phi_ej);
+                        ej_fs[m] += sin(m * phi_ej);
+                    }
+                    ej_n++;
+                }
+                if (ej_n > 0) {
+                    double ej_inv = 1.0 / ej_n;
+                    printf("[eject] frame=%d  N=%d  azimuthal modes: ", frame, ej_n);
+                    for (int m = 0; m < 5; m++) {
+                        double amp = sqrt(ej_fc[m]*ej_fc[m] + ej_fs[m]*ej_fs[m]) * ej_inv;
+                        printf("m%d=%.4f ", m, amp);
+                    }
+                    printf("\n");
+                }
+            }
+
             /* Harmonic structure probe — azimuthal Fourier decomposition.
              * Decomposes particle density into m=0,1,2,3,4 modes per radial shell.
              * Measures whether secondary structures (arms, streams) exist. */
