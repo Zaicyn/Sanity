@@ -301,9 +301,11 @@ void main() {
     apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb, vel_y,
                             d_vel_r, d_omega_orb, d_vel_y);
 
-    vel_r     += d_vel_r;
-    omega_orb += d_omega_orb;
-    vel_y     += d_vel_y;
+    // Transport is an acceleration (like the Cartesian siphon), integrate with dt.
+    // Without * dt, the transport is ~60× too strong and feeds the damping.
+    vel_r     += d_vel_r * pc.dt;
+    omega_orb += d_omega_orb * pc.dt;
+    vel_y     += d_vel_y * pc.dt;
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
     if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
