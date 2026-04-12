@@ -52,8 +52,8 @@ layout(std430, set = 2, binding = 4)  buffer GVelY    { float g_vel_y[];     };
 layout(std430, set = 2, binding = 5)  buffer GPhi     { float g_phi[];       };
 layout(std430, set = 2, binding = 6)  buffer GOmegaOrb{ float g_omega_orb[]; };
 layout(std430, set = 2, binding = 7)  buffer GTheta   { float g_theta[];     };
-layout(std430, set = 2, binding = 8)  buffer GOmegaNat{ float g_omega_nat[]; };
-layout(std430, set = 2, binding = 9)  buffer GLTilt   { float g_L_tilt[];    };
+layout(std430, set = 2, binding = 8)  readonly buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9)  readonly buffer GLTilt   { float g_L_tilt[];    };
 
 // ============================================================================
 // Push constants
@@ -292,15 +292,19 @@ void main() {
     float work      = pump_work[i];
     float history   = pump_history[i];
 
+    // Snapshot for write elision — these fields change rarely
+    int   coh_count_orig = coh_count;
+    float work_orig      = work;
+
     // ----- Profiling gate: uncomment to measure load/store only -----
     // #define SIPHON_LOAD_STORE_ONLY
     #ifdef SIPHON_LOAD_STORE_ONLY
-    g_r[i] = r; g_delta_r[i] = delta_r; g_delta_y[i] = delta_y;
+    g_r[i] = r; g_delta_y[i] = delta_y;
     g_vel_r[i] = vel_r; g_vel_y[i] = vel_y;
     g_phi[i] = phi; g_omega_orb[i] = omega_orb; g_theta[i] = theta_i;
-    pump_state[i] = state; pump_scale[i] = scale; pump_coherent[i] = coh_count;
-    pump_residual[i] = residual; pump_work[i] = work;
-    pump_history[i] = history;
+    pump_state[i] = state; pump_scale[i] = scale;
+    pump_coherent[i] = coh_count; pump_residual[i] = residual;
+    pump_work[i] = work; pump_history[i] = history;
     return;
     #endif
 
@@ -437,8 +441,8 @@ void main() {
     vel_r *= (1.0 - COHERENCE_GAMMA);
 
     // ----- Write back graded state -----
+    // g_delta_r: loaded but never modified by siphon — write elided (saves 4B/particle)
     g_r[i]         = r;
-    g_delta_r[i]   = delta_r;
     g_delta_y[i]   = delta_y;
     g_vel_r[i]     = vel_r;
     g_vel_y[i]     = vel_y;
@@ -449,9 +453,12 @@ void main() {
     // ----- Write back pump state (grade 0) -----
     pump_state[i]    = state;
     pump_scale[i]    = scale;
-    pump_coherent[i] = coh_count;
     pump_residual[i] = residual;
-    pump_work[i]     = work;
+
+    // Conditional writes — these fields change rarely, elide when unchanged
+    // saves ~8B/particle on most frames (pump_coherent + pump_work)
+    if (coh_count != coh_count_orig) pump_coherent[i] = coh_count;
+    if (work      != work_orig)      pump_work[i]     = work;
 
     if (eject) {
         flags[i] = f | PFLAG_EJECTED;
