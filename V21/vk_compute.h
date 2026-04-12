@@ -374,6 +374,17 @@ struct PhysicsCompute {
     VkPipeline            reorderPipeline;
     VkDescriptorPool      countingSortDescPool;
     bool                  countingSortEnabled;
+
+    /* Packed siphon (bandwidth optimization) — single AoS struct buffer
+     * + fused Cartesian projection. Eliminates graded_to_cartesian dispatch. */
+    VkBuffer              packedParticleBuffer;     /* Particle[N], 80 bytes each */
+    VkDeviceMemory        packedParticleMemory;
+    VkDescriptorSetLayout packedSiphonSetLayout;    /* set 0: packed + Cartesian out */
+    VkDescriptorSet       packedSiphonSet;
+    VkPipelineLayout      packedSiphonPipelineLayout;
+    VkPipeline            packedSiphonPipeline;
+    VkDescriptorPool      packedSiphonDescPool;
+    bool                  packedSiphonEnabled;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.
@@ -507,6 +518,9 @@ bool readTimestamps(PhysicsCompute& phys, VkDevice device,
  * states. out_states must have at least `count` int slots. */
 void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
                              int* out_states, int count);
+
+/* Upload data to a device-local SSBO via temporary staging buffer */
+void uploadToSSBO(VulkanContext& ctx, VkBuffer dst, const void* src, size_t size);
 
 /* Cleanup */
 void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device);

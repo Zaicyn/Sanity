@@ -284,6 +284,18 @@ void main() {
     float work      = pump_work[i];
     float history   = pump_history[i];
 
+    // ----- Profiling gate: uncomment to measure load/store only -----
+    // #define SIPHON_LOAD_STORE_ONLY
+    #ifdef SIPHON_LOAD_STORE_ONLY
+    g_r[i] = r; g_delta_r[i] = delta_r; g_delta_y[i] = delta_y;
+    g_vel_r[i] = vel_r; g_vel_y[i] = vel_y;
+    g_phi[i] = phi; g_omega_orb[i] = omega_orb; g_theta[i] = theta_i;
+    pump_state[i] = state; pump_scale[i] = scale; pump_coherent[i] = coh_count;
+    pump_residual[i] = residual; pump_work[i] = work;
+    pump_history[i] = history;
+    return;
+    #endif
+
     // ----- Grade 2: Viviani phase advance -----
     theta_i += omega_i * pc.dt;
     if (theta_i >= TWO_PI) theta_i -= TWO_PI;

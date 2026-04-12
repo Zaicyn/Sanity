@@ -59,6 +59,8 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/scatter_scan.comp
     ${KERNEL_DIR}/scatter_histogram.comp
     ${KERNEL_DIR}/scatter_reorder.comp
+    ${KERNEL_DIR}/siphon_packed.comp
+    ${KERNEL_DIR}/graded_to_packed.comp
 )
 
 set(SPV_OUTPUTS)

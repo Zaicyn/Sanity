@@ -85,7 +85,7 @@ static void createSSBO(VkDevice dev, VkPhysicalDevice pd,
     vkBindBufferMemory(dev, buf, mem, 0);
 }
 
-static void uploadToSSBO(VulkanContext& ctx, VkBuffer dst, const void* src, size_t size) {
+void uploadToSSBO(VulkanContext& ctx, VkBuffer dst, const void* src, size_t size) {
     /* Create temp staging buffer */
     VkBuffer staging;
     VkDeviceMemory stagingMem;
@@ -1706,33 +1706,44 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     push.seam_bits = 0x03;  /* SEAM_FULL */
     push.bias = 0.75f;
 
-    /* Graded siphon — operates on set 0 (pump) + set 2 (graded) */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      phys.siphonGradedPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
+    if (phys.packedSiphonEnabled) {
+        /* Packed siphon — single AoS struct, fused Cartesian projection.
+         * Reads/writes Particle[N] + writes Cartesian pos/vel for scatter/rendering. */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.packedSiphonPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.packedSiphonPipelineLayout, 0, 1, &phys.packedSiphonSet, 0, nullptr);
 
-    vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
-                       VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdPushConstants(cmd, phys.packedSiphonPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
 
-    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+    } else {
+        /* Graded siphon fallback — separate SoA buffers */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.siphonGradedPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
-    /* Barrier: graded siphon writes must complete before graded_to_cartesian */
-    {
-        VkMemoryBarrier gbar = {};
-        gbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-        gbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        gbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            0, 1, &gbar, 0, nullptr, 0, nullptr);
+        vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+        /* Barrier + Cartesian reconstruction (graded path only) */
+        {
+            VkMemoryBarrier gbar = {};
+            gbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            gbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            gbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &gbar, 0, nullptr, 0, nullptr);
+        }
+        dispatchGradedToCartesian(phys, cmd);
     }
-
-    /* Reconstruct Cartesian from graded for scatter/rendering/oracle */
-    dispatchGradedToCartesian(phys, cmd);
 
     /* Memory barrier: siphon (or graded_to_cartesian) writes must be visible
      * to the projection pass and transfer reads (oracle readback). */
@@ -2254,6 +2265,97 @@ void initCountingSortCompute(PhysicsCompute& phys, VulkanContext& ctx) {
             writes[i].pBufferInfo = &bufs[i];
         }
         vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
+    }
+
+    /* --- Packed siphon pipeline: single AoS struct + fused Cartesian projection ---
+     * Descriptor set 0 layout:
+     *   binding 0: Particle[N] (packed struct, 80 bytes each)
+     *   binding 1-6: pos_x, pos_y, pos_z, vel_x, vel_y, vel_z (Cartesian output)
+     * Uses the same SiphonPushConstants as the graded siphon. */
+    {
+        size_t packed_size = (size_t)phys.N * 80;  /* 80 bytes per particle (std430 padded) */
+        createSSBO(ctx.device, ctx.physicalDevice,
+                   phys.packedParticleBuffer, phys.packedParticleMemory, packed_size);
+
+        /* Descriptor set layout: 7 bindings (1 packed + 6 Cartesian out) */
+        VkDescriptorSetLayoutBinding bindings[7] = {};
+        for (int b = 0; b < 7; b++) {
+            bindings[b].binding = b;
+            bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[b].descriptorCount = 1;
+            bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 7;
+        li.pBindings = bindings;
+        vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.packedSiphonSetLayout);
+
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(SiphonPushConstants)};
+        VkPipelineLayoutCreateInfo pli = {};
+        pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &phys.packedSiphonSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(ctx.device, &pli, nullptr, &phys.packedSiphonPipelineLayout);
+
+        auto code = readShaderFile("siphon_packed.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = phys.packedSiphonPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                 &phys.packedSiphonPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+        /* Descriptor pool */
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 7};
+        VkDescriptorPoolCreateInfo pi = {};
+        pi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        pi.maxSets = 1;
+        pi.poolSizeCount = 1;
+        pi.pPoolSizes = &ps;
+        vkCreateDescriptorPool(ctx.device, &pi, nullptr, &phys.packedSiphonDescPool);
+
+        VkDescriptorSetAllocateInfo dsai = {};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = phys.packedSiphonDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &phys.packedSiphonSetLayout;
+        vkAllocateDescriptorSets(ctx.device, &dsai, &phys.packedSiphonSet);
+
+        /* Write descriptors: binding 0 = packed, binding 1-6 = Cartesian pos/vel */
+        VkDescriptorBufferInfo bufInfos[7] = {
+            { phys.packedParticleBuffer, 0, VK_WHOLE_SIZE },
+            { phys.soa_buffers[0], 0, VK_WHOLE_SIZE },  /* pos_x */
+            { phys.soa_buffers[1], 0, VK_WHOLE_SIZE },  /* pos_y */
+            { phys.soa_buffers[2], 0, VK_WHOLE_SIZE },  /* pos_z */
+            { phys.soa_buffers[3], 0, VK_WHOLE_SIZE },  /* vel_x */
+            { phys.soa_buffers[4], 0, VK_WHOLE_SIZE },  /* vel_y */
+            { phys.soa_buffers[5], 0, VK_WHOLE_SIZE },  /* vel_z */
+        };
+        VkWriteDescriptorSet writes[7] = {};
+        for (int b = 0; b < 7; b++) {
+            writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[b].dstSet = phys.packedSiphonSet;
+            writes[b].dstBinding = b;
+            writes[b].descriptorCount = 1;
+            writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[b].pBufferInfo = &bufInfos[b];
+        }
+        vkUpdateDescriptorSets(ctx.device, 7, writes, 0, nullptr);
+
+        /* AoS packing is SLOWER than SoA on GPU (breaks warp coalescing).
+         * Packed siphon measured 13.44 ms vs SoA 12.08 ms at 20M particles.
+         * Keep infrastructure for reference but disable by default. */
+        phys.packedSiphonEnabled = false;
+        printf("[vk-compute] Packed siphon pipeline created (%.1f MB packed buffer)\n",
+               (float)packed_size / (1024.0f * 1024.0f));
     }
 
     /* Counting sort is slower than atomic scatter at ≤20M particles on Turing.

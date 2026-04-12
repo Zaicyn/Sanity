@@ -1544,6 +1544,49 @@ int main(int argc, char** argv) {
             vkFreeCommandBuffers(vkCtx.device, vkCtx.commandPool, 1, &ucmd);
             printf("[vk-compute] Cartesian → graded initial conversion complete\n");
 
+            /* Pack graded state into AoS struct for packed siphon.
+             * CPU-side pack from host particle data, uploaded via staging. */
+            if (gpuPhys.packedSiphonEnabled) {
+                struct PackedParticle { float k0[4]; float k1[4]; float k2[4]; float k3[4]; uint32_t meta; uint32_t _pad[3]; };
+                /* 80 bytes: 4×vec4(64) + uint(4) + pad(12) = 80 */
+                size_t packed_size = (size_t)num_particles * 80;
+                std::vector<uint8_t> packed(packed_size, 0);
+                PackedParticle* pp = (PackedParticle*)packed.data();
+                for (int k = 0; k < num_particles; k++) {
+                    float r_cyl = sqrtf(particles.pos_x[k]*particles.pos_x[k] + particles.pos_z[k]*particles.pos_z[k]);
+                    float phi = atan2f(particles.pos_z[k], particles.pos_x[k]);
+                    if (phi < 0) phi += 6.28318530718f;
+                    float r_safe = fmaxf(r_cyl, 1e-6f);
+                    float cp = particles.pos_x[k] / r_safe;
+                    float sp = particles.pos_z[k] / r_safe;
+                    float vr = particles.vel_x[k] * cp + particles.vel_z[k] * sp;
+                    float vt = -particles.vel_x[k] * sp + particles.vel_z[k] * cp;
+                    float omega = vt / r_safe;
+
+                    pp[k].k0[0] = r_cyl;
+                    pp[k].k0[1] = 0.0f;  /* delta_r */
+                    pp[k].k0[2] = particles.pos_y[k];
+                    pp[k].k0[3] = vr;
+                    pp[k].k1[0] = particles.vel_y[k];
+                    pp[k].k1[1] = phi;
+                    pp[k].k1[2] = omega;
+                    pp[k].k1[3] = particles.theta[k];
+                    pp[k].k2[0] = particles.pump_scale[k];
+                    pp[k].k2[1] = particles.pump_residual[k];
+                    pp[k].k2[2] = 0.0f;  /* pump_work */
+                    pp[k].k2[3] = particles.pump_history[k];
+                    pp[k].k3[0] = particles.omega_nat[k];
+                    pp[k].k3[1] = pp[k].k3[2] = pp[k].k3[3] = 0.0f;
+
+                    uint32_t ps = (uint32_t)particles.pump_state[k] & 0x7u;
+                    uint32_t fl = (uint32_t)particles.flags[k] & 0xFu;
+                    pp[k].meta = ps | (0u << 3) | (fl << 4) | (1u << 8);
+                }
+                uploadToSSBO(vkCtx, gpuPhys.packedParticleBuffer, packed.data(), packed_size);
+                printf("[vk-compute] Packed particle buffer uploaded (%.1f MB)\n",
+                       (float)packed_size / (1024.0f * 1024.0f));
+            }
+
             /* Round-trip validation: graded → Cartesian, compare with original.
              * Save original pos/vel, run graded_to_cartesian, readback, diff. */
             {
