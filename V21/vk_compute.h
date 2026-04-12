@@ -229,11 +229,16 @@ struct PhysicsCompute {
     VkDeviceMemory        contactCountMemory;
     VkBuffer              firstContactFrameBuffer;  /* uint32[1] */
     VkDeviceMemory        firstContactFrameMemory;
-    VkDescriptorSetLayout collisionSet1Layout;      /* set 1: 4 SSBOs */
+    VkBuffer              posPrevBuffer;            /* float[N_rigid * 3], position snapshot */
+    VkDeviceMemory        posPrevMemory;
+    VkDescriptorSetLayout collisionSet1Layout;      /* set 1: 5 SSBOs */
     VkPipelineLayout      collisionApplyPipelineLayout;
     VkPipeline            collisionApplyPipeline;
     VkPipelineLayout      collisionResolvePipelineLayout;
     VkPipeline            collisionResolvePipeline;
+    VkPipelineLayout      collisionSyncPipelineLayout;
+    VkPipeline            collisionSyncPipeline;
+    VkPipeline            collisionSnapshotPipeline;
     VkDescriptorPool      collisionDescPool;
     VkDescriptorSet       collisionSet1;
 

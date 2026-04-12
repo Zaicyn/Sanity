@@ -1047,18 +1047,23 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
     createSSBO(ctx.device, ctx.physicalDevice,
                phys.firstContactFrameBuffer, phys.firstContactFrameMemory, counter_bytes);
 
+    size_t pos_prev_bytes = (size_t)rigid_count * 3 * sizeof(float);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.posPrevBuffer, phys.posPrevMemory, pos_prev_bytes);
+
     printf("[vk-compute] Collision pipeline: N=%d, rigid_base=%u, rigid_count=%u, "
-           "vel_delta=%.1f KB, rigid_body_id=%.1f KB\n",
+           "vel_delta=%.1f KB, pos_prev=%.1f KB, rigid_body_id=%.1f KB\n",
            phys.N, rigid_base, rigid_count,
            (double)vdelta_bytes / 1024.0,
+           (double)pos_prev_bytes / 1024.0,
            (double)rbid_bytes / 1024.0);
 
     /* --- Stage + upload rigid_body_id once --- */
     uploadToSSBO(ctx, phys.rigidBodyIdBuffer, rigid_body_ids, rbid_bytes);
 
-    /* --- Descriptor set layout for set 1: 4 SSBOs --- */
-    VkDescriptorSetLayoutBinding set1Bindings[4] = {};
-    for (int i = 0; i < 4; i++) {
+    /* --- Descriptor set layout for set 1: 5 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[5] = {};
+    for (int i = 0; i < 5; i++) {
         set1Bindings[i].binding = i;
         set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         set1Bindings[i].descriptorCount = 1;
@@ -1066,7 +1071,7 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
     }
     VkDescriptorSetLayoutCreateInfo set1Info = {};
     set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set1Info.bindingCount = 4;
+    set1Info.bindingCount = 5;
     set1Info.pBindings = set1Bindings;
     vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.collisionSet1Layout);
 
@@ -1139,10 +1144,49 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
         vkDestroyShaderModule(ctx.device, mod, nullptr);
     }
 
+    /* --- collision_sync pipeline (shares apply's pipeline layout) --- */
+    phys.collisionSyncPipelineLayout = phys.collisionApplyPipelineLayout;  /* same push constants */
+    {
+        auto code = readShaderFile("collision_sync.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.collisionSyncPipelineLayout;
+
+        if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                      nullptr, &phys.collisionSyncPipeline) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create collision_sync pipeline");
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
+    /* --- collision_snapshot pipeline (shares apply's pipeline layout) --- */
+    {
+        auto code = readShaderFile("collision_snapshot.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+
+        VkComputePipelineCreateInfo cpInfo = {};
+        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpInfo.stage.module = mod;
+        cpInfo.stage.pName = "main";
+        cpInfo.layout = phys.collisionApplyPipelineLayout;  /* same layout */
+
+        if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo,
+                                      nullptr, &phys.collisionSnapshotPipeline) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create collision_snapshot pipeline");
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
     /* --- Descriptor pool + set for set 1 --- */
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 4;
+    poolSize.descriptorCount = 5;
 
     VkDescriptorPoolCreateInfo dpInfo = {};
     dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1159,14 +1203,15 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
     vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.collisionSet1);
 
     /* --- Write descriptors for set 1 --- */
-    VkDescriptorBufferInfo bufInfos[4] = {
+    VkDescriptorBufferInfo bufInfos[5] = {
         { phys.rigidBodyIdBuffer,       0, VK_WHOLE_SIZE },
         { phys.velDeltaBuffer,          0, VK_WHOLE_SIZE },
         { phys.contactCountBuffer,      0, VK_WHOLE_SIZE },
         { phys.firstContactFrameBuffer, 0, VK_WHOLE_SIZE },
+        { phys.posPrevBuffer,           0, VK_WHOLE_SIZE },
     };
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
+    VkWriteDescriptorSet writes[5] = {};
+    for (int i = 0; i < 5; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = phys.collisionSet1;
         writes[i].dstBinding = i;
@@ -1174,7 +1219,7 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 5, writes, 0, nullptr);
 
     phys.collisionEnabled = true;
     printf("[vk-compute] Collision apply pipeline created (base=%u count=%u)\n",
@@ -1335,14 +1380,47 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 3);
 
+    /* ---- Phase 2.2: Position snapshot (before constraint solve) ----
+     * Captures lattice positions into pos_prev so that after constraint
+     * solve moves them, the sync pass can incorporate the displacement
+     * into velocity. This eliminates the PBD velocity-position feedback
+     * instability discovered in the Phase 2.2 iteration sweep. */
+    if (phys.collisionEnabled) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionSnapshotPipeline);
+        VkDescriptorSet snapsets[2] = { phys.descSet, phys.collisionSet1 };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionApplyPipelineLayout, 0, 2, snapsets, 0, nullptr);
+
+        CollisionApplyPushConstants snappc = {};
+        snappc.rigid_base  = phys.rigidBaseIndex;
+        snappc.rigid_count = phys.rigidCount;
+        snappc.dt          = dt;
+        snappc._pad        = 0;
+        vkCmdPushConstants(cmd, phys.collisionApplyPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(snappc), &snappc);
+
+        vkCmdDispatch(cmd, (phys.rigidCount + 255u) / 256u, 1, 1);
+
+        /* Barrier: snapshot writes to pos_prev must be visible. */
+        VkMemoryBarrier snapBarrier = {};
+        snapBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        snapBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        snapBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &snapBarrier, 0, nullptr, 0, nullptr);
+    }
+
     /* ---- Pass 4: Constraint Solve (PBD distance constraints, 6-bucket GS)
      * Dispatches the constraint solver when the rigid-body mode is enabled.
      * Each outer iteration runs 6 vertex-disjoint bucket dispatches with a
      * memory barrier between each bucket so later buckets see earlier writes
-     * to pos_x/y/z. The solver touches only positions (PBD style); siphon's
-     * next integration step will feel the new positions via gravitational
-     * pull. When disabled, constraint_ms ≈ 0 from the two adjacent timestamp
-     * writes. */
+     * to pos_x/y/z. The solver touches only positions (PBD style). After
+     * the solve, collision_sync incorporates the position corrections into
+     * velocity to maintain velocity-position consistency. */
     if (phys.constraintEnabled) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.constraintPipeline);
         VkDescriptorSet csets[2] = { phys.descSet, phys.constraintSet1 };
@@ -1412,6 +1490,39 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      * defined. When disabled, constraint_ms reads ≈ 0. */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 4);
+
+    /* ---- Phase 2.2: Velocity sync (after constraint solve) ----
+     * Incorporates constraint position corrections into velocity:
+     *   vel += (pos_corrected - pos_prev) / dt
+     * This eliminates the PBD velocity-position feedback instability. */
+    if (phys.collisionEnabled) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          phys.collisionSyncPipeline);
+        VkDescriptorSet syncsets[2] = { phys.descSet, phys.collisionSet1 };
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.collisionSyncPipelineLayout, 0, 2, syncsets, 0, nullptr);
+
+        CollisionApplyPushConstants syncpc = {};
+        syncpc.rigid_base  = phys.rigidBaseIndex;
+        syncpc.rigid_count = phys.rigidCount;
+        syncpc.dt          = dt;
+        syncpc._pad        = 0;
+        vkCmdPushConstants(cmd, phys.collisionSyncPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(syncpc), &syncpc);
+
+        vkCmdDispatch(cmd, (phys.rigidCount + 255u) / 256u, 1, 1);
+
+        /* Barrier: sync writes to vel must be visible to collision_resolve. */
+        VkMemoryBarrier syncBarrier = {};
+        syncBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        syncBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        syncBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &syncBarrier, 0, nullptr, 0, nullptr);
+    }
 
     /* ---- Phase 2.2: Collision pipeline (dynamic contact constraints) ----
      * C1 only ships the apply kernel + buffer reset. The fused
@@ -2253,6 +2364,9 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
         vkDestroyPipelineLayout(device, phys.collisionApplyPipelineLayout, nullptr);
         vkDestroyPipeline(device, phys.collisionResolvePipeline, nullptr);
         vkDestroyPipelineLayout(device, phys.collisionResolvePipelineLayout, nullptr);
+        vkDestroyPipeline(device, phys.collisionSyncPipeline, nullptr);
+        vkDestroyPipeline(device, phys.collisionSnapshotPipeline, nullptr);
+        /* collisionSyncPipelineLayout is shared with apply — don't double-destroy */
         vkDestroyDescriptorSetLayout(device, phys.collisionSet1Layout, nullptr);
         vkDestroyDescriptorPool(device, phys.collisionDescPool, nullptr);
         vkDestroyBuffer(device, phys.rigidBodyIdBuffer, nullptr);
@@ -2263,6 +2377,8 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
         vkFreeMemory(device, phys.contactCountMemory, nullptr);
         vkDestroyBuffer(device, phys.firstContactFrameBuffer, nullptr);
         vkFreeMemory(device, phys.firstContactFrameMemory, nullptr);
+        vkDestroyBuffer(device, phys.posPrevBuffer, nullptr);
+        vkFreeMemory(device, phys.posPrevMemory, nullptr);
     }
 
     /* Projection pipeline */
