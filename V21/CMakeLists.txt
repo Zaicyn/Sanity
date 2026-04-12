@@ -56,6 +56,9 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/constraint_solve_graded.comp
     ${KERNEL_DIR}/collision_resolve_graded.comp
     ${KERNEL_DIR}/collision_apply_graded.comp
+    ${KERNEL_DIR}/scatter_scan.comp
+    ${KERNEL_DIR}/scatter_histogram.comp
+    ${KERNEL_DIR}/scatter_reorder.comp
 )
 
 set(SPV_OUTPUTS)
