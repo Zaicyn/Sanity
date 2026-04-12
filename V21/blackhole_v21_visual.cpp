@@ -1520,6 +1520,7 @@ int main(int argc, char** argv) {
          * Allocate graded buffers and run one-shot Cartesian → graded conversion
          * so the graded buffers mirror the Cartesian initial state. */
         initGradedCompute(gpuPhys, vkCtx);
+        initCountingSortCompute(gpuPhys, vkCtx);
         {
             VkCommandBuffer ucmd;
             VkCommandBufferAllocateInfo cba = {};

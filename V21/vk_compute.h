@@ -86,6 +86,22 @@ struct CollisionResolvePushConstants {
     uint32_t frame_number;        /* for first_contact_frame probe */
 };
 
+/* Push constants for scatter_scan.comp */
+struct ScanPushConstants {
+    uint32_t N;
+    uint32_t mode;   /* 0=local, 1=block, 2=propagate */
+};
+
+/* Push constants for scatter_histogram.comp */
+struct HistogramPushConstants {
+    uint32_t N;
+};
+
+/* Push constants for scatter_reorder.comp */
+struct ReorderPushConstants {
+    uint32_t N;
+};
+
 /* Cell grid constants (must match scatter.comp) */
 #define V21_GRID_DIM          64
 #define V21_GRID_CELLS        (V21_GRID_DIM * V21_GRID_DIM * V21_GRID_DIM)
@@ -336,6 +352,28 @@ struct PhysicsCompute {
     VkPipeline            collisionResolveGradedPipeline;
     VkPipelineLayout      collisionApplyGradedPipelineLayout;
     VkPipeline            collisionApplyGradedPipeline;
+
+    /* Counting sort infrastructure (replaces shard-based atomic scatter) */
+    VkBuffer              cellOffsetBuffer;         /* uint[GRID_CELLS] — prefix sum of cell counts */
+    VkDeviceMemory        cellOffsetMemory;
+    VkBuffer              scanBlockSumsBuffer;      /* uint[1024] — temp for hierarchical scan */
+    VkDeviceMemory        scanBlockSumsMemory;
+    VkBuffer              writeCounterBuffer;       /* uint[GRID_CELLS] — per-cell atomic for reorder */
+    VkDeviceMemory        writeCounterMemory;
+    VkDescriptorSetLayout scanSetLayout;            /* scan: data + block_sums */
+    VkDescriptorSet       scanSet;
+    VkPipelineLayout      scanPipelineLayout;
+    VkPipeline            scanPipeline;
+    VkDescriptorSetLayout histogramSetLayout;       /* histogram: particle_cell + cell_count */
+    VkDescriptorSet       histogramSet;
+    VkPipelineLayout      histogramPipelineLayout;
+    VkPipeline            histogramPipeline;
+    VkDescriptorSetLayout reorderSetLayout;         /* reorder: sort buffers (set 3) */
+    VkDescriptorSet       reorderSet;
+    VkPipelineLayout      reorderPipelineLayout;
+    VkPipeline            reorderPipeline;
+    VkDescriptorPool      countingSortDescPool;
+    bool                  countingSortEnabled;
 };
 
 /* Initialize compute pipeline + SSBOs, upload initial particle state.
@@ -414,6 +452,11 @@ void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd);
 /* Per-frame: reconstruct Cartesian set 0 from graded set 2.
  * Run each frame before oracle readback / rendering. */
 void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd);
+
+/* Initialize counting sort infrastructure (histogram + Blelloch scan + reorder).
+ * Replaces the shard-based atomic scatter for the density grid.
+ * Must be called after initGradedCompute (uses graded set 2). */
+void initCountingSortCompute(PhysicsCompute& phys, VulkanContext& ctx);
 
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);
