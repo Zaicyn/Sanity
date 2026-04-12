@@ -1730,19 +1730,7 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
         vkCmdPushConstants(cmd, phys.siphonGradedPipelineLayout,
                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
         vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
-
-        /* Barrier + Cartesian reconstruction (graded path only) */
-        {
-            VkMemoryBarrier gbar = {};
-            gbar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            gbar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            gbar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, &gbar, 0, nullptr, 0, nullptr);
-        }
-        dispatchGradedToCartesian(phys, cmd);
+        /* Cartesian projection is fused into siphon — no separate dispatch needed */
     }
 
     /* Memory barrier: siphon (or graded_to_cartesian) writes must be visible

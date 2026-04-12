@@ -23,6 +23,14 @@ layout(local_size_x = 256) in;
 // Only the pump-related bindings are touched. pos/vel bindings are NOT read.
 // ============================================================================
 
+// Cartesian output (fused projection — eliminates graded_to_cartesian dispatch)
+layout(std430, set = 0, binding = 0)  writeonly buffer OutPosX { float out_pos_x[]; };
+layout(std430, set = 0, binding = 1)  writeonly buffer OutPosY { float out_pos_y[]; };
+layout(std430, set = 0, binding = 2)  writeonly buffer OutPosZ { float out_pos_z[]; };
+layout(std430, set = 0, binding = 3)  writeonly buffer OutVelX { float out_vel_x[]; };
+layout(std430, set = 0, binding = 4)  writeonly buffer OutVelY { float out_vel_y[]; };
+layout(std430, set = 0, binding = 5)  writeonly buffer OutVelZ { float out_vel_z[]; };
+
 layout(std430, set = 0, binding = 6)  buffer PumpState   { int   pump_state[];   };
 layout(std430, set = 0, binding = 7)  buffer PumpScale   { float pump_scale[];   };
 layout(std430, set = 0, binding = 8)  buffer PumpCoherent{ int   pump_coherent[];};
@@ -452,4 +460,20 @@ void main() {
     // Pump history (exponential smoothing)
     const float HISTORY_SMOOTH = 0.02;
     pump_history[i] = history * (1.0 - HISTORY_SMOOTH) + scale * HISTORY_SMOOTH;
+
+    // ----- Fused Cartesian projection (replaces graded_to_cartesian dispatch) -----
+    // phi's sin/cos are computed here once; the Viviani transport already computed
+    // them but they're stale (phi was updated since). Recompute for final values.
+    float cp_out = cos(phi);
+    float sp_out = sin(phi);
+    float r_proj = r + delta_r;
+
+    out_pos_x[i] = r_proj * cp_out;
+    out_pos_y[i] = delta_y;
+    out_pos_z[i] = r_proj * sp_out;
+
+    float v_t_out = r_proj * omega_orb;
+    out_vel_x[i] = vel_r * cp_out - v_t_out * sp_out;
+    out_vel_y[i] = vel_y;
+    out_vel_z[i] = vel_r * sp_out + v_t_out * cp_out;
 }
