@@ -297,7 +297,6 @@ void main() {
     float scale     = pump_scale[i];
     float residual  = pump_residual[i];
     float work      = pump_work[i];
-    float history   = pump_history[i];
 
     // Snapshot for write elision — these fields change rarely
     int   coh_count_orig = coh_count;
@@ -306,6 +305,7 @@ void main() {
     // ----- Profiling gate: uncomment to measure load/store only -----
     // #define SIPHON_LOAD_STORE_ONLY
     #ifdef SIPHON_LOAD_STORE_ONLY
+    float history = pump_history[i];
     g_r[i] = r; g_delta_y[i] = delta_y;
     g_vel_r[i] = vel_r; g_vel_y[i] = vel_y;
     g_phi[i] = phi; g_omega_orb[i] = omega_orb; g_theta[i] = theta_i;
@@ -346,11 +346,6 @@ void main() {
         vel_y *= (1.0 - damping);
     }
 
-    // ----- Grade 1: Integration -----
-    // vel_r and omega_orb already include transport corrections
-    vel_r += 0.0;  // no additional radial force in current model
-    // (centripetal is implicit in cylindrical coords — omega_orb² * r)
-
     // NaN guard
     if (isinf(vel_r) || isnan(vel_r) || isinf(omega_orb) || isnan(omega_orb)) {
         return;
@@ -380,7 +375,6 @@ void main() {
 
     // ----- Grade 0: Harmonic terms for pump -----
     // orb_phi in Cartesian was atan2(pz, px) — which IS phi in graded space
-    float heartbeat = cos(phi) * cos(3.0 * phi);  // z-axis mixer
     float phase_stress = max(cos(phi)*cos(phi), sin(phi)*sin(phi));
 
     // Coupling (circularity) — in cylindrical, v_tangential / v_total
@@ -402,6 +396,11 @@ void main() {
         tidal_radial = pc.BH_MASS / r3 * sqrt(scale);
     }
     float tidal_stress = max(shear, tidal_radial);
+
+    // Deferred load — history not needed until pump state machine and ejection.
+    // Loading here instead of with the other pump fields reduces live register
+    // count through the Viviani transport section (~15 fewer cycles at peak).
+    float history = pump_history[i];
 
     // ----- Grade 0: Pump state machine -----
     if (state == PUMP_UPSTROKE_COHERENT) {
