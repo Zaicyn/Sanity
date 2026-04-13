@@ -94,7 +94,7 @@ const float ISCO_R           = 6.0;
 const float PHI_CONST        = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float COHERENCE_GAMMA  = 0.02;
-const float DENSITY_GAIN     = 0.3;      // density feedback strength (self-gravity analog)
+const float DENSITY_GAIN     = 3.0;      // density feedback strength (self-gravity analog)
 const float JET_SPEED        = 0.4;
 
 // Grid constants (must match V21_GRID_* in vk_compute.h)
@@ -353,23 +353,9 @@ void main() {
     // 2. Density gradient feedback (self-gravity analog) amplifies and sustains it
     // The seed is temporary — once arms form, the feedback maintains them.
     {
-        // Seed: rectified m=3 density wave. Fades to zero by frame ~10000.
-        // Breaks azimuthal symmetry so the density feedback loop can amplify
-        // and sustain m=3 structure. Without the seed, the system is subcritically
-        // stable — the feedback sustains existing structure but cannot nucleate
-        // new structure from noise at DENSITY_GAIN=0.3. This is a subcritical
-        // bifurcation: two stable states (featureless vs structured), and the
-        // seed provides the finite perturbation to reach the structured basin.
-        // Analogous to primordial density fluctuations seeding galactic structure.
-        const float SEED_EPSILON = 0.02;
-        const float OMEGA_PATTERN = 0.004;
-        const float SEED_FADE_START = 165.0;  // ~frame 5000
-        const float SEED_FADE_END   = 330.0;  // ~frame 10000
-        float seed_strength = 1.0 - clamp((pc.time - SEED_FADE_START)
-                                         / (SEED_FADE_END - SEED_FADE_START), 0.0, 1.0);
-        float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time);
-        float seed_wave = max(cos(phi_pattern), 0.0);
-        vel_r += SEED_EPSILON * seed_strength * seed_wave * pc.dt;
+        // No external seed. The Viviani transport's natural m=3 asymmetry
+        // provides the perturbation. The density feedback gain must be high
+        // enough to amplify this past the shearing threshold (critical gain).
 
         // Sustainer: density gradient feedback (self-gravity analog)
         uint cell = particle_cell[i];
