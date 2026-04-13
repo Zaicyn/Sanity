@@ -339,21 +339,26 @@ void main() {
     omega_orb += d_omega_orb * pc.dt;
     vel_y     += d_vel_y * pc.dt;
 
-    // ----- m=3 density wave (asymmetric — compressive only) -----
-    // Rectified cosine: only the compressive (outward) phase creates density
-    // enhancement. The rarefactive phase is suppressed. This produces 3 arms
-    // instead of 6 (the symmetric cosine creates both compression and
-    // rarefaction peaks, each visible as a blade).
+    // ----- m=3 density wave (asymmetric — closed transport loop) -----
+    // Outward push at arm crests (compressive), weaker inward pull between
+    // arms (replenishment). The asymmetry ratio controls arm contrast vs
+    // sustainability: 1.0/0.3 means outward kick is 3.3× stronger than
+    // inward return flow. This closes the mass transport loop so the inner
+    // disk doesn't deplete, while maintaining the 3-fold structure.
+    // Also fixes DC radial drift: net force = epsilon*(1.0 - 0.3)/pi ≈ 0.011
+    // (much smaller than pure rectification's 0.016).
     {
         const float OMEGA_PATTERN = 0.004;
         const float ARM_SCALE_HEIGHT = 10.0;
         const float ARM_VERT_TWIST  = 0.01;
+        const float RETURN_RATIO    = 0.3;   // inward return strength relative to outward
         float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time)
                           + 3.0 * ARM_VERT_TWIST * delta_y;
         float vert_atten = exp(-(delta_y * delta_y) / (2.0 * ARM_SCALE_HEIGHT * ARM_SCALE_HEIGHT));
         float wave = cos(phi_pattern);
-        float compressive = max(wave, 0.0);  // only outward push at 3 azimuthal peaks
-        vel_r += ARM_M3_EPSILON * compressive * vert_atten * pc.dt;
+        // Asymmetric wave: full strength outward, RETURN_RATIO strength inward
+        float asym_wave = (wave > 0.0) ? wave : wave * RETURN_RATIO;
+        vel_r += ARM_M3_EPSILON * asym_wave * vert_atten * pc.dt;
     }
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
