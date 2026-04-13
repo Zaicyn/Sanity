@@ -96,6 +96,11 @@ const float COHERENCE_GAMMA  = 0.02;
 const float DENSITY_GAIN     = 3.0;      // Viviani m=3 transport modulation amplitude
 const float BOND_GAMMA       = 0.003;    // density-dependent phase locking (neighbor bonding)
 const float JET_SPEED        = 0.4;
+const float R_SCALE          = 30.0;     // transport envelope reference radius
+const float L_RETURN         = 0.85;     // fraction of damped radial KE returned to tangential
+                                          // 1.0 = perfect L conservation (no arms)
+                                          // 0.0 = full dissipation (trough)
+                                          // sweet spot: Viviani asymmetry catches without L drain
 
 // Cylindrical grid constants (must match V21_CYL_* in vk_compute.h)
 const int   CYL_NR           = 64;
@@ -348,36 +353,40 @@ void main() {
     float r_eff = r + delta_r;
     float r_safe = max(r_eff, SCHW_R * 0.5);
 
+    // Transport envelope: matches orbital velocity scaling (1/sqrt(r)).
+    // Flat inside R_SCALE, falls as sqrt(R_SCALE/r) outside.
+    // This couples transport to the local dynamical timescale, not raw radius.
+    float r_envelope = sqrt(R_SCALE / max(r_safe, R_SCALE));
+
+    // ----- Viviani m=3 geometric dressing -----
+    // Modulate the Viviani phase θ (not omega_orb) by the m=3 pattern.
+    // This tilts the transport normal n̂ at arm locations, breaking the
+    // ⟨m,n⟩ = 0 orthogonality that halts dynamics (Schrödinger's Fallacy
+    // Part IV). Where ⟨m,n⟩ ≠ 0, transport is active → density bunches.
+    // Where ⟨m,n⟩ ≈ 0, dynamics freeze → inter-arm regions stay quiet.
+    //
+    // Purely geometric: no energy injection, no torque, no L violation.
+    // The modulation shifts WHERE on the Viviani curve the particle samples
+    // its transport direction, not HOW FAST it orbits.
+    // ----- Viviani m=3 geometric dressing (DISABLED — orbit-averages out) -----
+    // theta_transport offset approach confirmed inert at any amplitude.
+    // The pair-wise DDS approach (from viviani_forces.c) works because it
+    // modulates interaction strength, not single-particle transport.
+    // In V21, the density grid serves as the collective pair correlation.
+
     float d_vel_r, d_omega_orb, d_vel_y;
     apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb, vel_y,
                             d_vel_r, d_omega_orb, d_vel_y);
 
-    // ----- Viviani m=3 transport modulation (V8 analytic approach) -----
-    // The Viviani curve's 3-fold symmetry modulates transport strength
-    // as a function of orbital phase and radius. This is not an external
-    // seed — it's the geometry expressing its own structure.
-    //
-    // The modulation is multiplicative on the transport (no energy injection),
-    // with a radial winding term (r*0.04) that creates trailing spiral geometry.
-    // Differential rotation does the rest.
-    //
-    // The cylindrical grid (cyl_scatter + cyl_stencil) remains for diagnostics.
-    {
-        const float OMEGA_PATTERN = 0.004;
-        float m3_phase = 3.0 * phi - r_safe * 0.04 - 3.0 * OMEGA_PATTERN * pc.time;
-        // Modulate orbital angular velocity directly — this is the dominant
-        // motion, so even a small perturbation creates density bunching.
-        // Particles in the "fast" phase advance azimuthally, creating a gap
-        // behind them; particles in the "slow" phase pile up. Differential
-        // rotation winds this into trailing spirals.
-        omega_orb += DENSITY_GAIN * 0.00001 * sin(m3_phase) * pc.dt;
-    }
+    // [DISABLED] Previous direct omega perturbation (conservation-violating):
+    // omega_orb += DENSITY_GAIN * 0.00001 * sin(m3_phase) * r_envelope * pc.dt;
 
     // Transport is an acceleration (like the Cartesian siphon), integrate with dt.
     // Without * dt, the transport is ~60× too strong and feeds the damping.
-    vel_r     += d_vel_r * pc.dt;
-    omega_orb += d_omega_orb * pc.dt;
-    vel_y     += d_vel_y * pc.dt;
+    // r_envelope scales transport to local dynamical timescale (sqrt falloff).
+    vel_r     += d_vel_r * r_envelope * pc.dt;
+    omega_orb += d_omega_orb * r_envelope * pc.dt;
+    vel_y     += d_vel_y * r_envelope * pc.dt;
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
     if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
@@ -497,17 +506,46 @@ void main() {
         history *= 0.3;  // partial reset — don't fully drain, allow re-firing
     }
 
-    // ----- Grade 1: Anisotropic damping (radial, γ=0.02) -----
-    vel_r *= (1.0 - COHERENCE_GAMMA);
+    // ----- Grade 1: m=3 phase-selective damping (DDS-inspired) -----
+    // Instead of uniform radial damping + torque-based arm formation,
+    // modulate the damping coefficient by the m=3 pattern phase.
+    //
+    // At arm locations (sin(m3_phase) > 0): stronger damping → particles settle
+    // Between arms (sin(m3_phase) < 0): weaker damping → particles flow freely
+    //
+    // This is the pair-correlation approach from viviani_forces.c translated
+    // to a single-particle framework via the density grid. The density grid
+    // IS the collective phase correlation — overdensity at arm locations means
+    // many particles share the same m=3 phase, equivalent to cos(delta_phase)≈1.
+    //
+    // No torque, no L injection. Structure forms because particles lose radial
+    // energy selectively at arm positions, creating a potential well.
+    // Partially L-conserving (L_RETURN) to prevent global trough.
+    {
+        const float OMEGA_PATTERN = 0.004;
+        float m3_phase = 3.0 * phi - r_safe * 0.04 - 3.0 * OMEGA_PATTERN * pc.time;
 
-    // ----- Neighbor bonding: density-weighted phase locking -----
-    // Two mechanisms using the cylindrical density grid:
-    // 1. Phase correction: particles in overdense cells lock their orbital
-    //    frequency to the analytic m=3 pattern phase (Kuramoto-style).
-    //    This is the primary bonding — particles in arms synchronize
-    //    to the same angular velocity, keeping the arm coherent.
-    // 2. Radial damping: reduce vel_r dispersion at arm centers,
-    //    preventing particles from scattering out of the arm.
+        // Phase-modulated damping: base γ=0.02, boosted at arm locations
+        // gate = 0 between arms, up to 1 at arm centers
+        float gate = max(0.0, sin(m3_phase));
+        float gamma = COHERENCE_GAMMA * (1.0 + DENSITY_GAIN * gate * r_envelope);
+
+        float vr_before = vel_r;
+        vel_r *= (1.0 - gamma);
+        float vr_removed = vr_before - vel_r;
+
+        // Partially return to tangential (L-conservation)
+        float vr_return = vr_removed * L_RETURN;
+        float v_phi = r_safe * omega_orb;
+        float v_phi_sq_new = v_phi * v_phi + vr_return * vr_return;
+        float v_phi_new = sqrt(v_phi_sq_new);
+        if (v_phi < 0.0) v_phi_new = -v_phi_new;
+        omega_orb = v_phi_new / max(r_safe, 1e-6);
+    }
+
+    // ----- Neighbor bonding: density-weighted radial cohesion -----
+    // Additional dissipation at overdense cells (arm capture well).
+    // No phase locking torque — just selective viscosity.
     {
         int ir   = int(r_safe / CYL_DR);
         int iphi = int(phi / CYL_DPHI);
@@ -521,15 +559,10 @@ void main() {
             float overdensity = clamp(rho / max(rho_avg, 1.0) - 1.0, 0.0, 5.0);
             float lock = BOND_GAMMA * overdensity;
 
-            // Phase locking: align omega_orb to the m=3 pattern phase.
-            // The analytic phase field IS the collective phase — no need
-            // to measure neighbors when you already know the pattern.
+            // Radial cohesion at overdense cells — the "well" that holds the arm.
             const float OMEGA_PATTERN = 0.004;
             float phase = 3.0 * phi - r_safe * 0.04 - 3.0 * OMEGA_PATTERN * pc.time;
-            float dphi = sin(phase);  // smooth wrapped phase error
-            omega_orb += lock * dphi * pc.dt;
-
-            // Radial cohesion: damp vel_r at arm centers (where |sin(phase)| is small)
+            float dphi = sin(phase);
             vel_r *= (1.0 - lock * abs(dphi));
         }
     }

@@ -525,7 +525,9 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
                        float* out_vel_x, float* out_vel_y, float* out_vel_z,
                        float* out_theta, float* out_pump_scale,
                        uint8_t* out_flags,
-                       int count);
+                       int count,
+                       float* out_r = nullptr, float* out_vel_r = nullptr,
+                       float* out_phi = nullptr, float* out_omega_orb = nullptr);
 
 /* Read back GPU timestamps from the previous frame (non-blocking).
  * Breakdown:

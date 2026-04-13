@@ -352,11 +352,12 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     }
     vkUpdateDescriptorSets(ctx.device, VK_COMPUTE_NUM_BINDINGS, writes, 0, nullptr);
 
-    /* Staging buffer for readback — capped at ORACLE_SUBSET_SIZE × 9 floats.
+    /* Staging buffer for readback — capped at ORACLE_SUBSET_SIZE × 13 floats.
      * Layout: [pos_x][pos_y][pos_z][vel_x][vel_y][vel_z][theta][pump_scale][flags]
-     * 9 arrays × 100K × 4 bytes = 3.6 MB. Stays small even at 80M particles. */
+     *         [r][vel_r][phi][omega_orb]  (graded state for physics diagnostics)
+     * 13 arrays × 100K × 4 bytes = 5.2 MB. Stays small even at 80M particles. */
     int subset_cap = N < ORACLE_SUBSET_SIZE ? N : ORACLE_SUBSET_SIZE;
-    size_t readback_sz = (size_t)subset_cap * 9 * sizeof(float);
+    size_t readback_sz = (size_t)subset_cap * 13 * sizeof(float);
     VkBufferCreateInfo sbi = {};
     sbi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     sbi.size = readback_sz;
@@ -3169,7 +3170,9 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
                        float* out_vel_x, float* out_vel_y, float* out_vel_z,
                        float* out_theta, float* out_pump_scale,
                        uint8_t* out_flags,
-                       int count) {
+                       int count,
+                       float* out_r, float* out_vel_r,
+                       float* out_phi, float* out_omega_orb) {
     if (count <= 0) return;
     if (count > ORACLE_SUBSET_SIZE) count = ORACLE_SUBSET_SIZE;
 
@@ -3204,6 +3207,23 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
         offset += sz;
     }
 
+    /* Optional graded-state readback for physics diagnostics.
+     * Copies r, vel_r, phi, omega_orb from graded_buffers (set 2)
+     * into staging offsets 9*sz..12*sz. */
+    bool do_graded = (out_r && out_vel_r && out_phi && out_omega_orb);
+    if (do_graded) {
+        const int graded_bindings[4] = {0, 3, 5, 6};  /* r, vel_r, phi, omega_orb */
+        for (int i = 0; i < 4; i++) {
+            VkBufferCopy region = {};
+            region.srcOffset = 0;
+            region.dstOffset = offset;
+            region.size = sz;
+            vkCmdCopyBuffer(cmd, phys.graded_buffers[graded_bindings[i]],
+                            phys.staging, 1, &region);
+            offset += sz;
+        }
+    }
+
     vkEndCommandBuffer(cmd);
 
     /* Dedicated fence — only wait for this submission, not the whole queue */
@@ -3236,6 +3256,14 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     const uint32_t* meta32 = (const uint32_t*)(mapped + 8 * sz);
     for (int i = 0; i < count; i++) {
         out_flags[i] = (uint8_t)((meta32[i] >> 5) & 0x0F);
+    }
+
+    /* Copy graded-state arrays if requested */
+    if (do_graded) {
+        memcpy(out_r,         mapped +  9 * sz, sz);
+        memcpy(out_vel_r,     mapped + 10 * sz, sz);
+        memcpy(out_phi,       mapped + 11 * sz, sz);
+        memcpy(out_omega_orb, mapped + 12 * sz, sz);
     }
 
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);

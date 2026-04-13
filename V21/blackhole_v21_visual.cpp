@@ -109,6 +109,7 @@ extern "C" {
 #include "core/v21_types.h"
 #include "core/v21_vertex_pack.h"
 #include "core/v21_oracle.h"
+#include "core/v21_physics_diag.h"
 }
 #include "vk_compute.h"
 
@@ -1370,6 +1371,10 @@ int main(int argc, char** argv) {
     v21_oracle_t oracle;
     v21_oracle_init(&oracle);
 
+    /* Init physics diagnostics */
+    v21_physics_diag_t phys_diag;
+    v21_physics_diag_init(&phys_diag);
+
     /* Allocate vertex pack buffer */
     v21_packed_vertex_t* vertex_data = (v21_packed_vertex_t*)malloc(
         num_particles * sizeof(v21_packed_vertex_t));
@@ -1690,6 +1695,7 @@ int main(int argc, char** argv) {
     float *rb_theta = NULL, *rb_scale = NULL;
     uint8_t *rb_flags = NULL;
     int *rb_pump_state = NULL;
+    float *rb_r = NULL, *rb_vel_r = NULL, *rb_phi = NULL, *rb_omega_orb = NULL;
     if (use_gpu_physics) {
         size_t bf = oracle_count * sizeof(float);
         rb_px    = (float*)malloc(bf);
@@ -1702,6 +1708,10 @@ int main(int argc, char** argv) {
         rb_scale = (float*)malloc(bf);
         rb_flags = (uint8_t*)malloc(oracle_count * sizeof(uint8_t));
         rb_pump_state = (int*)malloc(oracle_count * sizeof(int));
+        rb_r         = (float*)malloc(bf);
+        rb_vel_r     = (float*)malloc(bf);
+        rb_phi       = (float*)malloc(bf);
+        rb_omega_orb = (float*)malloc(bf);
     }
 
     /* Pack initial frame so there's something to render immediately */
@@ -1755,7 +1765,8 @@ int main(int argc, char** argv) {
                 rb_px, rb_py, rb_pz,
                 rb_vx, rb_vy, rb_vz,
                 rb_theta, rb_scale, rb_flags,
-                oracle_count);
+                oracle_count,
+                rb_r, rb_vel_r, rb_phi, rb_omega_orb);
             auto rb_end = std::chrono::steady_clock::now();
             double rb_ms = std::chrono::duration<double, std::milli>(rb_end - rb_start).count();
 
@@ -2038,6 +2049,15 @@ int main(int argc, char** argv) {
                 printf("[m3-track] frame=%d  A3: core=%.5f inner=%.5f mid=%.5f  R3_inner=%.5f\n",
                        frame, m3_core, m3_inner, m3_mid, R3_inner);
             }
+
+            /* Physics diagnostics — rotation curve, Toomre Q, energy budget,
+             * pattern speed, pitch angle, Reynolds stress */
+            v21_physics_diag_compute(&phys_diag,
+                rb_r, rb_vel_r, rb_phi, rb_omega_orb,
+                rb_px, rb_py, rb_pz,
+                rb_vx, rb_vy, rb_vz,
+                rb_flags,
+                oracle_count, frame);
         }
 
         if (!use_gpu_physics) {
@@ -2215,8 +2235,10 @@ int main(int argc, char** argv) {
         free(rb_px); free(rb_py); free(rb_pz);
         free(rb_vx); free(rb_vy); free(rb_vz);
         free(rb_theta); free(rb_scale); free(rb_flags); free(rb_pump_state);
+        free(rb_r); free(rb_vel_r); free(rb_phi); free(rb_omega_orb);
     }
     v21_oracle_summary(&oracle);
+    v21_physics_diag_summary(&phys_diag);
 
     /* Destroy our vertex buffer before vk::cleanup touches the context */
     if (vertexBuf.buffer != VK_NULL_HANDLE) {
