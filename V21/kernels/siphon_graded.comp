@@ -353,12 +353,18 @@ void main() {
     // 2. Density gradient feedback (self-gravity analog) amplifies and sustains it
     // The seed is temporary — once arms form, the feedback maintains them.
     {
-        // Seed: weak rectified m=3 density wave (compressive only)
+        // Seed: weak rectified m=3 density wave (compressive only).
+        // Fades out linearly between frame 5000-10000 (dt≈0.033, so
+        // time 5000*0.033≈165, 10000*0.033≈330). After fade, pure feedback.
         const float SEED_EPSILON = 0.02;
         const float OMEGA_PATTERN = 0.004;
+        const float SEED_FADE_START = 165.0;  // ~frame 5000
+        const float SEED_FADE_END   = 330.0;  // ~frame 10000
+        float seed_strength = 1.0 - clamp((pc.time - SEED_FADE_START)
+                                         / (SEED_FADE_END - SEED_FADE_START), 0.0, 1.0);
         float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time);
         float seed_wave = max(cos(phi_pattern), 0.0);
-        vel_r += SEED_EPSILON * seed_wave * pc.dt;
+        vel_r += SEED_EPSILON * seed_strength * seed_wave * pc.dt;
 
         // Sustainer: density gradient feedback (self-gravity analog)
         uint cell = particle_cell[i];
