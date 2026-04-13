@@ -61,6 +61,8 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/scatter_reorder.comp
     ${KERNEL_DIR}/siphon_packed.comp
     ${KERNEL_DIR}/graded_to_packed.comp
+    ${KERNEL_DIR}/cyl_scatter.comp
+    ${KERNEL_DIR}/cyl_stencil.comp
 )
 
 set(SPV_OUTPUTS)

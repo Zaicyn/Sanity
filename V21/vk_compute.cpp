@@ -1701,6 +1701,56 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 5);
 
+    /* ---- Cylindrical density grid (before siphon) ---------------------- */
+    /* Clear cylindrical density grid */
+    vkCmdFillBuffer(cmd, phys.cylDensityBuffer, 0,
+                    V21_CYL_CELLS * sizeof(uint32_t), 0);
+    {
+        VkMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+
+    /* Cylindrical scatter: particles → (r, phi, y) bins */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.cylScatterPipeline);
+    VkDescriptorSet cylScSets[2] = { phys.descSet, phys.cylScatterSet };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.cylScatterPipelineLayout, 0, 2, cylScSets, 0, nullptr);
+    int cylScN = phys.N;
+    vkCmdPushConstants(cmd, phys.cylScatterPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int), &cylScN);
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    {
+        VkMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+
+    /* Cylindrical stencil: density → pressure gradients in (r, phi, y) */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.cylStencilPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.cylStencilPipelineLayout, 0, 1, &phys.cylStencilSet, 0, nullptr);
+    float cylPressureK = 0.01f;
+    vkCmdPushConstants(cmd, phys.cylStencilPipelineLayout,
+        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float), &cylPressureK);
+    vkCmdDispatch(cmd, (V21_CYL_CELLS + 255) / 256, 1, 1);
+
+    {
+        VkMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    }
+
     /* ---- Siphon (physics) -------------------------------------------- */
     SiphonPushConstants push = {};
     push.N = phys.N;
@@ -1898,10 +1948,165 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     }
     vkUpdateDescriptorSets(ctx.device, VK_GRADED_NUM_BINDINGS, writes, 0, nullptr);
 
-    /* --- Siphon density feedback set 1: grid_density + particle_cell + pressure_xyz --- */
+    /* --- Cylindrical density grid: allocate buffers --- */
     {
-        VkDescriptorSetLayoutBinding densBindings[5] = {};
-        for (int b = 0; b < 5; b++) {
+        size_t cyl_uint_sz  = V21_CYL_CELLS * sizeof(uint32_t);
+        size_t cyl_float_sz = V21_CYL_CELLS * sizeof(float);
+        createSSBO(ctx.device, ctx.physicalDevice, phys.cylDensityBuffer,
+                   phys.cylDensityMemory, cyl_uint_sz);
+        createSSBO(ctx.device, ctx.physicalDevice, phys.cylPressureRBuffer,
+                   phys.cylPressureRMemory, cyl_float_sz);
+        createSSBO(ctx.device, ctx.physicalDevice, phys.cylPressurePhiBuffer,
+                   phys.cylPressurePhiMemory, cyl_float_sz);
+        createSSBO(ctx.device, ctx.physicalDevice, phys.cylPressureYBuffer,
+                   phys.cylPressureYMemory, cyl_float_sz);
+        printf("[vk-compute] Cylindrical grid: %d×%d×%d = %d cells (%.1f MB)\n",
+               V21_CYL_NR, V21_CYL_NPHI, V21_CYL_NY, V21_CYL_CELLS,
+               (float)(cyl_uint_sz + 3*cyl_float_sz) / (1024*1024));
+    }
+
+    /* --- Cylindrical scatter pipeline: set 0 (particles) + set 1 (cyl_density) --- */
+    {
+        VkDescriptorSetLayoutBinding b = {};
+        b.binding = 0;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 1;
+        li.pBindings = &b;
+        vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.cylScatterSetLayout);
+
+        VkDescriptorSetLayout sets[2] = { phys.descLayout, phys.cylScatterSetLayout };
+        VkPushConstantRange pcr = {};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.size = sizeof(int);  /* just N */
+        VkPipelineLayoutCreateInfo pl = {};
+        pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl.setLayoutCount = 2;
+        pl.pSetLayouts = sets;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(ctx.device, &pl, nullptr, &phys.cylScatterPipelineLayout);
+
+        auto code = readShaderFile("cyl_scatter.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = phys.cylScatterPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                 &phys.cylScatterPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1};
+        VkDescriptorPoolCreateInfo dpi = {};
+        dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = 1;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &ps;
+        vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &phys.cylScatterDescPool);
+
+        VkDescriptorSetAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = phys.cylScatterDescPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &phys.cylScatterSetLayout;
+        vkAllocateDescriptorSets(ctx.device, &ai, &phys.cylScatterSet);
+
+        VkDescriptorBufferInfo bi = {phys.cylDensityBuffer, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = phys.cylScatterSet;
+        w.dstBinding = 0;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+        printf("[vk-compute] Cylindrical scatter pipeline created\n");
+    }
+
+    /* --- Cylindrical stencil pipeline: set 0 (density + pressure_r/phi/y) --- */
+    {
+        VkDescriptorSetLayoutBinding binds[4] = {};
+        for (int b = 0; b < 4; b++) {
+            binds[b].binding = b;
+            binds[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            binds[b].descriptorCount = 1;
+            binds[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 4;
+        li.pBindings = binds;
+        vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.cylStencilSetLayout);
+
+        VkPushConstantRange pcr = {};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.size = sizeof(float);  /* pressure_k */
+        VkPipelineLayoutCreateInfo pl = {};
+        pl.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pl.setLayoutCount = 1;
+        pl.pSetLayouts = &phys.cylStencilSetLayout;
+        pl.pushConstantRangeCount = 1;
+        pl.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(ctx.device, &pl, nullptr, &phys.cylStencilPipelineLayout);
+
+        auto code = readShaderFile("cyl_stencil.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = phys.cylStencilPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                 &phys.cylStencilPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+        VkDescriptorPoolCreateInfo dpi = {};
+        dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = 1;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes = &ps;
+        vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &phys.cylStencilDescPool);
+
+        VkDescriptorSetAllocateInfo ai = {};
+        ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool = phys.cylStencilDescPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &phys.cylStencilSetLayout;
+        vkAllocateDescriptorSets(ctx.device, &ai, &phys.cylStencilSet);
+
+        VkDescriptorBufferInfo bis[4] = {
+            {phys.cylDensityBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressureRBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressurePhiBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressureYBuffer, 0, VK_WHOLE_SIZE}
+        };
+        VkWriteDescriptorSet ws[4] = {};
+        for (int i = 0; i < 4; i++) {
+            ws[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ws[i].dstSet = phys.cylStencilSet;
+            ws[i].dstBinding = i;
+            ws[i].descriptorCount = 1;
+            ws[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            ws[i].pBufferInfo = &bis[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 4, ws, 0, nullptr);
+        printf("[vk-compute] Cylindrical stencil pipeline created\n");
+    }
+
+    /* --- Siphon density feedback set 1: cyl_density + pressure_r/phi/y --- */
+    {
+        VkDescriptorSetLayoutBinding densBindings[4] = {};
+        for (int b = 0; b < 4; b++) {
             densBindings[b].binding = b;
             densBindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             densBindings[b].descriptorCount = 1;
@@ -1910,13 +2115,12 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
 
         VkDescriptorSetLayoutCreateInfo densLayoutInfo = {};
         densLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        densLayoutInfo.bindingCount = 5;
+        densLayoutInfo.bindingCount = 4;
         densLayoutInfo.pBindings = densBindings;
         vkCreateDescriptorSetLayout(ctx.device, &densLayoutInfo, nullptr,
                                     &phys.siphonDensitySetLayout);
 
-        /* Pool + set */
-        VkDescriptorPoolSize densPoolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
+        VkDescriptorPoolSize densPoolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
         VkDescriptorPoolCreateInfo densPoolInfo = {};
         densPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         densPoolInfo.maxSets = 1;
@@ -1932,16 +2136,14 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         densAllocInfo.pSetLayouts = &phys.siphonDensitySetLayout;
         vkAllocateDescriptorSets(ctx.device, &densAllocInfo, &phys.siphonDensitySet);
 
-        /* Write descriptors: 0=density, 1=particle_cell, 2=pressure_x, 3=pressure_y, 4=pressure_z */
-        VkDescriptorBufferInfo densBufInfos[5] = {
-            {phys.gridDensityBuffer, 0, VK_WHOLE_SIZE},
-            {phys.particleCellBuffer, 0, VK_WHOLE_SIZE},
-            {phys.pressureXBuffer, 0, VK_WHOLE_SIZE},
-            {phys.pressureYBuffer, 0, VK_WHOLE_SIZE},
-            {phys.pressureZBuffer, 0, VK_WHOLE_SIZE}
+        VkDescriptorBufferInfo densBufInfos[4] = {
+            {phys.cylDensityBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressureRBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressurePhiBuffer, 0, VK_WHOLE_SIZE},
+            {phys.cylPressureYBuffer, 0, VK_WHOLE_SIZE}
         };
-        VkWriteDescriptorSet densWrites[5] = {};
-        for (int i = 0; i < 5; i++) {
+        VkWriteDescriptorSet densWrites[4] = {};
+        for (int i = 0; i < 4; i++) {
             densWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             densWrites[i].dstSet = phys.siphonDensitySet;
             densWrites[i].dstBinding = i;
@@ -1949,7 +2151,7 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
             densWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             densWrites[i].pBufferInfo = &densBufInfos[i];
         }
-        vkUpdateDescriptorSets(ctx.device, 5, densWrites, 0, nullptr);
+        vkUpdateDescriptorSets(ctx.device, 4, densWrites, 0, nullptr);
     }
 
     /* --- Graded siphon pipeline (Phase 3.2): set 0 (pump) + set 1 (density) + set 2 (graded) --- */
@@ -3185,6 +3387,24 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
         vkDestroyBuffer(device, phys.posPrevBuffer, nullptr);
         vkFreeMemory(device, phys.posPrevMemory, nullptr);
     }
+
+    /* Cylindrical density grid */
+    vkDestroyPipeline(device, phys.cylScatterPipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.cylScatterPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.cylScatterSetLayout, nullptr);
+    vkDestroyDescriptorPool(device, phys.cylScatterDescPool, nullptr);
+    vkDestroyPipeline(device, phys.cylStencilPipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.cylStencilPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.cylStencilSetLayout, nullptr);
+    vkDestroyDescriptorPool(device, phys.cylStencilDescPool, nullptr);
+    vkDestroyBuffer(device, phys.cylDensityBuffer, nullptr);
+    vkFreeMemory(device, phys.cylDensityMemory, nullptr);
+    vkDestroyBuffer(device, phys.cylPressureRBuffer, nullptr);
+    vkFreeMemory(device, phys.cylPressureRMemory, nullptr);
+    vkDestroyBuffer(device, phys.cylPressurePhiBuffer, nullptr);
+    vkFreeMemory(device, phys.cylPressurePhiMemory, nullptr);
+    vkDestroyBuffer(device, phys.cylPressureYBuffer, nullptr);
+    vkFreeMemory(device, phys.cylPressureYMemory, nullptr);
 
     /* Graded siphon pipeline + density feedback set */
     vkDestroyPipeline(device, phys.siphonGradedPipeline, nullptr);

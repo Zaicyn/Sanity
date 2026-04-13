@@ -44,13 +44,12 @@ layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];   
 layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
 
 // ============================================================================
-// Set 1 — Density feedback (from scatter + stencil passes)
+// Set 1 — Cylindrical density feedback (from cyl_scatter + cyl_stencil)
 // ============================================================================
-layout(std430, set = 1, binding = 0) readonly buffer GridDensity  { uint  grid_density[];  };
-layout(std430, set = 1, binding = 1) readonly buffer ParticleCell { uint  particle_cell[]; };
-layout(std430, set = 1, binding = 2) readonly buffer PressureX    { float pressure_x[];    };
+layout(std430, set = 1, binding = 0) readonly buffer CylDensity   { uint  cyl_density[];   };
+layout(std430, set = 1, binding = 1) readonly buffer PressureR    { float pressure_r[];    };
+layout(std430, set = 1, binding = 2) readonly buffer PressurePhi  { float pressure_phi[];  };
 layout(std430, set = 1, binding = 3) readonly buffer PressureY    { float pressure_y[];    };
-layout(std430, set = 1, binding = 4) readonly buffer PressureZ    { float pressure_z[];    };
 
 // ============================================================================
 // Set 2 — Grade-separated particle state
@@ -94,13 +93,18 @@ const float ISCO_R           = 6.0;
 const float PHI_CONST        = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float COHERENCE_GAMMA  = 0.02;
-const float DENSITY_GAIN     = 3.0;      // density feedback strength (self-gravity analog)
+const float DENSITY_GAIN     = 0.3;      // density feedback strength — tuning in progress
 const float JET_SPEED        = 0.4;
 
-// Grid constants (must match V21_GRID_* in vk_compute.h)
-const int   GRID_DIM         = 64;
-const float GRID_HALF_SIZE   = 250.0;
-const float GRID_CELL_SIZE   = 2.0 * GRID_HALF_SIZE / float(GRID_DIM);
+// Cylindrical grid constants (must match V21_CYL_* in vk_compute.h)
+const int   CYL_NR           = 64;
+const int   CYL_NPHI         = 96;
+const int   CYL_NY           = 32;
+const float CYL_R_MAX        = 200.0;
+const float CYL_Y_HALF       = 100.0;
+const float CYL_DR           = CYL_R_MAX / float(CYL_NR);
+const float CYL_DPHI         = TWO_PI / float(CYL_NPHI);
+const float CYL_DY           = 2.0 * CYL_Y_HALF / float(CYL_NY);
 const float PUMP_EJECT_THRESHOLD = 0.88;
 const int   PUMP_COHERENT_MAX    = 3;
 
@@ -357,23 +361,43 @@ void main() {
         // provides the perturbation. The density feedback gain must be high
         // enough to amplify this past the shearing threshold (critical gain).
 
-        // Sustainer: density gradient feedback (self-gravity analog)
-        uint cell = particle_cell[i];
-        uint total_cells = uint(GRID_DIM * GRID_DIM * GRID_DIM);
-        if (cell < total_cells) {
-            float dpx = pressure_x[cell];
-            float dpy = pressure_y[cell];
-            float dpz = pressure_z[cell];
+        // Sustainer: cylindrical density gradient feedback (self-gravity analog).
+        // Pressure gradients are already in cylindrical (r, phi, y) from the
+        // cyl_stencil pass — maps directly to graded velocity components.
+        // No Cartesian projection, no grid artifacts.
+        {
+            int ir   = int(r_safe / CYL_DR);
+            float phi_pos = phi;  // already in [0, 2pi) from earlier wrap
+            int iphi = int(phi_pos / CYL_DPHI);
+            int iy   = int((delta_y + CYL_Y_HALF) / CYL_DY);
 
-            float cp = cos(phi);
-            float sp = sin(phi);
-            float dp_radial     =  dpx * cp + dpz * sp;
-            float dp_tangential = -dpx * sp + dpz * cp;
+            if (ir >= 0 && ir < CYL_NR &&
+                iphi >= 0 && iphi < CYL_NPHI &&
+                iy >= 0 && iy < CYL_NY) {
 
-            // Attract toward overdensities (negate stencil's dispersive sign)
-            vel_r     -= DENSITY_GAIN * dp_radial * pc.dt;
-            omega_orb -= DENSITY_GAIN * dp_tangential / max(r_safe, 1.0) * pc.dt;
-            vel_y     -= DENSITY_GAIN * dpy * pc.dt;
+                int cell = ir + iphi * CYL_NR + iy * CYL_NR * CYL_NPHI;
+
+                float dp_r   = pressure_r[cell];
+                float dp_phi = pressure_phi[cell];
+                float dp_y   = pressure_y[cell];
+
+                // Radial softening: cylindrical cells are tiny near the core
+                // (arc length = r * dphi), so gradients are artificially sharp
+                // at small r. Soften by clamping effective radius.
+                float r_soft = max(r_safe, 20.0);
+                float gain = DENSITY_GAIN * (r_soft / CYL_R_MAX);
+
+                // Attractive self-gravity with force clamping to prevent heating.
+                // Clamp per-component force to prevent extreme kicks from
+                // sharp density gradients in small cylindrical cells.
+                float max_force = 0.5;  // max velocity change per frame
+                float fr = clamp(-gain * dp_r,   -max_force, max_force);
+                float fp = clamp(-gain * dp_phi,  -max_force, max_force);
+                float fy = clamp(-gain * dp_y,    -max_force, max_force);
+                vel_r     += fr * pc.dt;
+                omega_orb += fp * pc.dt;
+                vel_y     += fy * pc.dt;
+            }
         }
     }
 

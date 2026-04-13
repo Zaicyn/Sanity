@@ -109,6 +109,17 @@ struct ReorderPushConstants {
 #define V21_GRID_CELL_SIZE    (2.0f * V21_GRID_HALF_SIZE / (float)V21_GRID_DIM)
 #define V21_GRID_SHARD_COUNT  8
 
+/* Cylindrical density grid — aligned with disk geometry, no Cartesian artifacts */
+#define V21_CYL_NR            64
+#define V21_CYL_NPHI          96
+#define V21_CYL_NY            32
+#define V21_CYL_CELLS         (V21_CYL_NR * V21_CYL_NPHI * V21_CYL_NY)
+#define V21_CYL_R_MAX         200.0f
+#define V21_CYL_Y_HALF        100.0f
+#define V21_CYL_DR            (V21_CYL_R_MAX / (float)V21_CYL_NR)
+#define V21_CYL_DPHI          (6.28318530718f / (float)V21_CYL_NPHI)
+#define V21_CYL_DY            (2.0f * V21_CYL_Y_HALF / (float)V21_CYL_NY)
+
 /* Scatter contention-mode selector (A/B/C test for Squaragon thesis). */
 enum ScatterMode {
     SCATTER_MODE_BASELINE  = 0,  /* 1 shard, maximum atomic contention */
@@ -342,9 +353,30 @@ struct PhysicsCompute {
     /* Graded siphon pipeline (Phase 3.2) — reads set 0 (pump) + set 1 (density) + set 2 (graded) */
     VkPipelineLayout      siphonGradedPipelineLayout;
     VkPipeline            siphonGradedPipeline;
-    VkDescriptorSetLayout siphonDensitySetLayout;  /* set 1: grid_density + particle_cell */
+    VkDescriptorSetLayout siphonDensitySetLayout;  /* set 1: cyl density + pressure */
     VkDescriptorPool      siphonDensityDescPool;
     VkDescriptorSet       siphonDensitySet;
+
+    /* Cylindrical density grid — replaces Cartesian grid for density feedback.
+     * Aligned with disk geometry: Nr × Nphi × Ny. No Cartesian artifacts. */
+    VkBuffer              cylDensityBuffer;         /* uint[CYL_CELLS] */
+    VkDeviceMemory        cylDensityMemory;
+    VkBuffer              cylPressureRBuffer;       /* float[CYL_CELLS] — d(rho)/dr */
+    VkDeviceMemory        cylPressureRMemory;
+    VkBuffer              cylPressurePhiBuffer;     /* float[CYL_CELLS] — (1/r)*d(rho)/dphi */
+    VkDeviceMemory        cylPressurePhiMemory;
+    VkBuffer              cylPressureYBuffer;       /* float[CYL_CELLS] — d(rho)/dy */
+    VkDeviceMemory        cylPressureYMemory;
+    VkDescriptorSetLayout cylScatterSetLayout;
+    VkPipelineLayout      cylScatterPipelineLayout;
+    VkPipeline            cylScatterPipeline;
+    VkDescriptorPool      cylScatterDescPool;
+    VkDescriptorSet       cylScatterSet;
+    VkDescriptorSetLayout cylStencilSetLayout;
+    VkPipelineLayout      cylStencilPipelineLayout;
+    VkPipeline            cylStencilPipeline;
+    VkDescriptorPool      cylStencilDescPool;
+    VkDescriptorSet       cylStencilSet;
 
     /* Graded constraint pipeline (Phase 3.3) — set 0 (compat) + set 1 (pairs) + set 2 (graded) */
     VkPipelineLayout      constraintGradedPipelineLayout;

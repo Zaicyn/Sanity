@@ -1,0 +1,66 @@
+// cyl_scatter.comp — Scatter particles into cylindrical density grid
+// ====================================================================
+// Bins particles by (r, phi, y) into a cylindrical grid. No Cartesian
+// artifacts because the grid is aligned with the disk's natural geometry.
+//
+// Dispatch: ceil(N / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Set 0 — Cartesian particle positions (read from siphon output)
+layout(std430, set = 0, binding = 0) readonly buffer PosX { float pos_x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer PosY { float pos_y[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PosZ { float pos_z[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PackedMeta { uint packed_meta[]; };
+
+// Set 1 — Cylindrical density grid (write)
+layout(std430, set = 1, binding = 0) buffer CylDensity { uint cyl_density[]; };
+
+layout(push_constant) uniform PushConstants {
+    int N;
+} pc;
+
+const float PI     = 3.14159265358979;
+const float TWO_PI = 6.28318530718;
+const int   CYL_NR   = 64;
+const int   CYL_NPHI = 96;
+const int   CYL_NY   = 32;
+const float CYL_R_MAX  = 200.0;
+const float CYL_Y_HALF = 100.0;
+const float CYL_DR   = CYL_R_MAX / float(CYL_NR);
+const float CYL_DPHI = TWO_PI / float(CYL_NPHI);
+const float CYL_DY   = 2.0 * CYL_Y_HALF / float(CYL_NY);
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint meta = packed_meta[i];
+    uint f = (meta >> 5) & 0x0Fu;
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+
+    float r = sqrt(px * px + pz * pz);
+    float phi = atan(pz, px);
+    if (phi < 0.0) phi += TWO_PI;
+
+    int ir   = int(r / CYL_DR);
+    int iphi = int(phi / CYL_DPHI);
+    int iy   = int((py + CYL_Y_HALF) / CYL_DY);
+
+    if (ir < 0 || ir >= CYL_NR) return;
+    if (iphi < 0 || iphi >= CYL_NPHI) return;
+    if (iy < 0 || iy >= CYL_NY) return;
+
+    int cell = ir + iphi * CYL_NR + iy * CYL_NR * CYL_NPHI;
+    atomicAdd(cyl_density[cell], 1u);
+}
