@@ -353,9 +353,14 @@ void main() {
     // 2. Density gradient feedback (self-gravity analog) amplifies and sustains it
     // The seed is temporary — once arms form, the feedback maintains them.
     {
-        // Seed: weak rectified m=3 density wave (compressive only).
-        // Fades out linearly between frame 5000-10000 (dt≈0.033, so
-        // time 5000*0.033≈165, 10000*0.033≈330). After fade, pure feedback.
+        // Seed: rectified m=3 density wave. Fades to zero by frame ~10000.
+        // Breaks azimuthal symmetry so the density feedback loop can amplify
+        // and sustain m=3 structure. Without the seed, the system is subcritically
+        // stable — the feedback sustains existing structure but cannot nucleate
+        // new structure from noise at DENSITY_GAIN=0.3. This is a subcritical
+        // bifurcation: two stable states (featureless vs structured), and the
+        // seed provides the finite perturbation to reach the structured basin.
+        // Analogous to primordial density fluctuations seeding galactic structure.
         const float SEED_EPSILON = 0.02;
         const float OMEGA_PATTERN = 0.004;
         const float SEED_FADE_START = 165.0;  // ~frame 5000
