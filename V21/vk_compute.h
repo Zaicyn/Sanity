@@ -339,9 +339,12 @@ struct PhysicsCompute {
     VkDescriptorPool      gradedDescPool;
     VkDescriptorSet       gradedSet;
 
-    /* Graded siphon pipeline (Phase 3.2) — reads set 0 (pump) + set 2 (graded) */
+    /* Graded siphon pipeline (Phase 3.2) — reads set 0 (pump) + set 1 (density) + set 2 (graded) */
     VkPipelineLayout      siphonGradedPipelineLayout;
     VkPipeline            siphonGradedPipeline;
+    VkDescriptorSetLayout siphonDensitySetLayout;  /* set 1: grid_density + particle_cell */
+    VkDescriptorPool      siphonDensityDescPool;
+    VkDescriptorSet       siphonDensitySet;
 
     /* Graded constraint pipeline (Phase 3.3) — set 0 (compat) + set 1 (pairs) + set 2 (graded) */
     VkPipelineLayout      constraintGradedPipelineLayout;

@@ -1726,11 +1726,13 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
 
         vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
     } else {
-        /* Graded siphon fallback — separate SoA buffers */
+        /* Graded siphon — separate SoA buffers + density feedback */
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                           phys.siphonGradedPipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             phys.siphonGradedPipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.siphonGradedPipelineLayout, 1, 1, &phys.siphonDensitySet, 0, nullptr);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             phys.siphonGradedPipelineLayout, 2, 1, &phys.gradedSet, 0, nullptr);
 
@@ -1896,14 +1898,67 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     }
     vkUpdateDescriptorSets(ctx.device, VK_GRADED_NUM_BINDINGS, writes, 0, nullptr);
 
-    /* --- Graded siphon pipeline (Phase 3.2): set 0 (pump) + set 2 (graded) --- */
+    /* --- Siphon density feedback set 1: grid_density + particle_cell + pressure_xyz --- */
     {
-        VkDescriptorSetLayoutCreateInfo emptyInfo = {};
-        emptyInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        emptyInfo.bindingCount = 0;
-        VkDescriptorSetLayout emptyLayout;
-        vkCreateDescriptorSetLayout(ctx.device, &emptyInfo, nullptr, &emptyLayout);
-        VkDescriptorSetLayout allSets[3] = { phys.descLayout, emptyLayout, phys.gradedSetLayout };
+        VkDescriptorSetLayoutBinding densBindings[5] = {};
+        for (int b = 0; b < 5; b++) {
+            densBindings[b].binding = b;
+            densBindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            densBindings[b].descriptorCount = 1;
+            densBindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+
+        VkDescriptorSetLayoutCreateInfo densLayoutInfo = {};
+        densLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        densLayoutInfo.bindingCount = 5;
+        densLayoutInfo.pBindings = densBindings;
+        vkCreateDescriptorSetLayout(ctx.device, &densLayoutInfo, nullptr,
+                                    &phys.siphonDensitySetLayout);
+
+        /* Pool + set */
+        VkDescriptorPoolSize densPoolSize = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 5};
+        VkDescriptorPoolCreateInfo densPoolInfo = {};
+        densPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        densPoolInfo.maxSets = 1;
+        densPoolInfo.poolSizeCount = 1;
+        densPoolInfo.pPoolSizes = &densPoolSize;
+        vkCreateDescriptorPool(ctx.device, &densPoolInfo, nullptr,
+                               &phys.siphonDensityDescPool);
+
+        VkDescriptorSetAllocateInfo densAllocInfo = {};
+        densAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        densAllocInfo.descriptorPool = phys.siphonDensityDescPool;
+        densAllocInfo.descriptorSetCount = 1;
+        densAllocInfo.pSetLayouts = &phys.siphonDensitySetLayout;
+        vkAllocateDescriptorSets(ctx.device, &densAllocInfo, &phys.siphonDensitySet);
+
+        /* Write descriptors: 0=density, 1=particle_cell, 2=pressure_x, 3=pressure_y, 4=pressure_z */
+        VkDescriptorBufferInfo densBufInfos[5] = {
+            {phys.gridDensityBuffer, 0, VK_WHOLE_SIZE},
+            {phys.particleCellBuffer, 0, VK_WHOLE_SIZE},
+            {phys.pressureXBuffer, 0, VK_WHOLE_SIZE},
+            {phys.pressureYBuffer, 0, VK_WHOLE_SIZE},
+            {phys.pressureZBuffer, 0, VK_WHOLE_SIZE}
+        };
+        VkWriteDescriptorSet densWrites[5] = {};
+        for (int i = 0; i < 5; i++) {
+            densWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            densWrites[i].dstSet = phys.siphonDensitySet;
+            densWrites[i].dstBinding = i;
+            densWrites[i].descriptorCount = 1;
+            densWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            densWrites[i].pBufferInfo = &densBufInfos[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 5, densWrites, 0, nullptr);
+    }
+
+    /* --- Graded siphon pipeline (Phase 3.2): set 0 (pump) + set 1 (density) + set 2 (graded) --- */
+    {
+        VkDescriptorSetLayout allSets[3] = {
+            phys.descLayout,              /* set 0: particle SSBOs */
+            phys.siphonDensitySetLayout,  /* set 1: grid_density + particle_cell */
+            phys.gradedSetLayout          /* set 2: graded state */
+        };
 
         /* Same push constants as original siphon */
         VkPushConstantRange pcRange = {};
@@ -1931,7 +1986,6 @@ void initGradedCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr,
                                  &phys.siphonGradedPipeline);
         vkDestroyShaderModule(ctx.device, mod, nullptr);
-        vkDestroyDescriptorSetLayout(ctx.device, emptyLayout, nullptr);
         printf("[vk-compute] Graded siphon pipeline created\n");
     }
 
@@ -3131,6 +3185,12 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
         vkDestroyBuffer(device, phys.posPrevBuffer, nullptr);
         vkFreeMemory(device, phys.posPrevMemory, nullptr);
     }
+
+    /* Graded siphon pipeline + density feedback set */
+    vkDestroyPipeline(device, phys.siphonGradedPipeline, nullptr);
+    vkDestroyPipelineLayout(device, phys.siphonGradedPipelineLayout, nullptr);
+    vkDestroyDescriptorSetLayout(device, phys.siphonDensitySetLayout, nullptr);
+    vkDestroyDescriptorPool(device, phys.siphonDensityDescPool, nullptr);
 
     /* Projection pipeline */
     vkDestroyPipeline(device, phys.projPipeline, nullptr);

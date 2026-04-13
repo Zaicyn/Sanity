@@ -44,6 +44,15 @@ layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];   
 layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
 
 // ============================================================================
+// Set 1 — Density feedback (from scatter + stencil passes)
+// ============================================================================
+layout(std430, set = 1, binding = 0) readonly buffer GridDensity  { uint  grid_density[];  };
+layout(std430, set = 1, binding = 1) readonly buffer ParticleCell { uint  particle_cell[]; };
+layout(std430, set = 1, binding = 2) readonly buffer PressureX    { float pressure_x[];    };
+layout(std430, set = 1, binding = 3) readonly buffer PressureY    { float pressure_y[];    };
+layout(std430, set = 1, binding = 4) readonly buffer PressureZ    { float pressure_z[];    };
+
+// ============================================================================
 // Set 2 — Grade-separated particle state
 // ============================================================================
 
@@ -85,8 +94,13 @@ const float ISCO_R           = 6.0;
 const float PHI_CONST        = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float COHERENCE_GAMMA  = 0.02;
-const float ARM_M3_EPSILON   = 0.05;     // m=3 density wave amplitude (radial kick)
+const float DENSITY_GAIN     = 0.3;      // density feedback strength (self-gravity analog)
 const float JET_SPEED        = 0.4;
+
+// Grid constants (must match V21_GRID_* in vk_compute.h)
+const int   GRID_DIM         = 64;
+const float GRID_HALF_SIZE   = 250.0;
+const float GRID_CELL_SIZE   = 2.0 * GRID_HALF_SIZE / float(GRID_DIM);
 const float PUMP_EJECT_THRESHOLD = 0.88;
 const int   PUMP_COHERENT_MAX    = 3;
 
@@ -333,33 +347,44 @@ void main() {
     apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb, vel_y,
                             d_vel_r, d_omega_orb, d_vel_y);
 
+    // ----- m=3 seed + density feedback sustainer -----
+    // Two mechanisms working together:
+    // 1. Weak rectified m=3 wave seeds the azimuthal symmetry breaking
+    // 2. Density gradient feedback (self-gravity analog) amplifies and sustains it
+    // The seed is temporary — once arms form, the feedback maintains them.
+    {
+        // Seed: weak rectified m=3 density wave (compressive only)
+        const float SEED_EPSILON = 0.02;
+        const float OMEGA_PATTERN = 0.004;
+        float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time);
+        float seed_wave = max(cos(phi_pattern), 0.0);
+        vel_r += SEED_EPSILON * seed_wave * pc.dt;
+
+        // Sustainer: density gradient feedback (self-gravity analog)
+        uint cell = particle_cell[i];
+        uint total_cells = uint(GRID_DIM * GRID_DIM * GRID_DIM);
+        if (cell < total_cells) {
+            float dpx = pressure_x[cell];
+            float dpy = pressure_y[cell];
+            float dpz = pressure_z[cell];
+
+            float cp = cos(phi);
+            float sp = sin(phi);
+            float dp_radial     =  dpx * cp + dpz * sp;
+            float dp_tangential = -dpx * sp + dpz * cp;
+
+            // Attract toward overdensities (negate stencil's dispersive sign)
+            vel_r     -= DENSITY_GAIN * dp_radial * pc.dt;
+            omega_orb -= DENSITY_GAIN * dp_tangential / max(r_safe, 1.0) * pc.dt;
+            vel_y     -= DENSITY_GAIN * dpy * pc.dt;
+        }
+    }
+
     // Transport is an acceleration (like the Cartesian siphon), integrate with dt.
     // Without * dt, the transport is ~60× too strong and feeds the damping.
     vel_r     += d_vel_r * pc.dt;
     omega_orb += d_omega_orb * pc.dt;
     vel_y     += d_vel_y * pc.dt;
-
-    // ----- m=3 density wave (asymmetric — closed transport loop) -----
-    // Outward push at arm crests (compressive), weaker inward pull between
-    // arms (replenishment). The asymmetry ratio controls arm contrast vs
-    // sustainability: 1.0/0.3 means outward kick is 3.3× stronger than
-    // inward return flow. This closes the mass transport loop so the inner
-    // disk doesn't deplete, while maintaining the 3-fold structure.
-    // Also fixes DC radial drift: net force = epsilon*(1.0 - 0.3)/pi ≈ 0.011
-    // (much smaller than pure rectification's 0.016).
-    {
-        const float OMEGA_PATTERN = 0.004;
-        const float ARM_SCALE_HEIGHT = 10.0;
-        const float ARM_VERT_TWIST  = 0.01;
-        const float RETURN_RATIO    = 0.3;   // inward return strength relative to outward
-        float phi_pattern = 3.0 * (phi - OMEGA_PATTERN * pc.time)
-                          + 3.0 * ARM_VERT_TWIST * delta_y;
-        float vert_atten = exp(-(delta_y * delta_y) / (2.0 * ARM_SCALE_HEIGHT * ARM_SCALE_HEIGHT));
-        float wave = cos(phi_pattern);
-        // Asymmetric wave: full strength outward, RETURN_RATIO strength inward
-        float asym_wave = (wave > 0.0) ? wave : wave * RETURN_RATIO;
-        vel_r += ARM_M3_EPSILON * asym_wave * vert_atten * pc.dt;
-    }
 
     // ----- Grade 1: Orbital-plane damping (vel_y, the out-of-plane component) -----
     if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
