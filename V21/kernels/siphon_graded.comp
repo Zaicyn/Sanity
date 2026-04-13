@@ -94,7 +94,7 @@ const float PHI_CONST        = 1.6180339887498948;
 const float PHI_EXCESS       = 0.09017;
 const float COHERENCE_GAMMA  = 0.02;
 const float DENSITY_GAIN     = 3.0;      // Viviani m=3 transport modulation amplitude
-const float BOND_GAMMA       = 0.03;     // density-dependent radial damping (neighbor bonding)
+const float BOND_GAMMA       = 0.003;    // density-dependent phase locking (neighbor bonding)
 const float JET_SPEED        = 0.4;
 
 // Cylindrical grid constants (must match V21_CYL_* in vk_compute.h)
@@ -500,11 +500,14 @@ void main() {
     // ----- Grade 1: Anisotropic damping (radial, γ=0.02) -----
     vel_r *= (1.0 - COHERENCE_GAMMA);
 
-    // ----- Neighbor bonding: density-dependent radial damping -----
-    // Particles in overdense cells (arms) have radial dispersion reduced,
-    // keeping the arm coherent against shear. Particles in underdense
-    // regions (inter-arm) are unaffected. Uses the cylindrical density
-    // grid — no force injection, no heating, just phase synchronization.
+    // ----- Neighbor bonding: density-weighted phase locking -----
+    // Two mechanisms using the cylindrical density grid:
+    // 1. Phase correction: particles in overdense cells lock their orbital
+    //    frequency to the analytic m=3 pattern phase (Kuramoto-style).
+    //    This is the primary bonding — particles in arms synchronize
+    //    to the same angular velocity, keeping the arm coherent.
+    // 2. Radial damping: reduce vel_r dispersion at arm centers,
+    //    preventing particles from scattering out of the arm.
     {
         int ir   = int(r_safe / CYL_DR);
         int iphi = int(phi / CYL_DPHI);
@@ -516,7 +519,18 @@ void main() {
             float rho = float(cyl_density[cell]);
             float rho_avg = float(pc.N) / float(CYL_NR * CYL_NPHI * CYL_NY);
             float overdensity = clamp(rho / max(rho_avg, 1.0) - 1.0, 0.0, 5.0);
-            vel_r *= (1.0 - BOND_GAMMA * overdensity);
+            float lock = BOND_GAMMA * overdensity;
+
+            // Phase locking: align omega_orb to the m=3 pattern phase.
+            // The analytic phase field IS the collective phase — no need
+            // to measure neighbors when you already know the pattern.
+            const float OMEGA_PATTERN = 0.004;
+            float phase = 3.0 * phi - r_safe * 0.04 - 3.0 * OMEGA_PATTERN * pc.time;
+            float dphi = sin(phase);  // smooth wrapped phase error
+            omega_orb += lock * dphi * pc.dt;
+
+            // Radial cohesion: damp vel_r at arm centers (where |sin(phase)| is small)
+            vel_r *= (1.0 - lock * abs(dphi));
         }
     }
 
