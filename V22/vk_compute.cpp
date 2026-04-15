@@ -510,13 +510,29 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     /* Siphon set 1 — pressure grid descriptors (particle_cell + pressure_x/y/z) */
     initSiphonSet1(phys, ctx);
 
-    /* --- Siphon pipeline: set 0 (particles) + set 1 (pressure grid) ---
-     * The siphon reads pressure gradient directly from the grid buffers via
-     * particle_cell[i] and computes density magnitude inline (sqrt). */
+    /* --- Siphon pipeline: set 0 (particles) + set 1 (pressure grid) + set 2 (projection) ---
+     * Fused projection eliminates the separate project.comp dispatch. */
     {
-        VkDescriptorSetLayout siphonSets[2] = {
+        /* Set 2 layout: density image + camera UBO (descriptors written by initDensityRender) */
+        VkDescriptorSetLayoutBinding projBindings[2] = {};
+        projBindings[0].binding = 0;
+        projBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        projBindings[0].descriptorCount = 1;
+        projBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        projBindings[1].binding = 1;
+        projBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        projBindings[1].descriptorCount = 1;
+        projBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        VkDescriptorSetLayoutCreateInfo projLI = {};
+        projLI.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        projLI.bindingCount = 2;
+        projLI.pBindings = projBindings;
+        vkCreateDescriptorSetLayout(ctx.device, &projLI, nullptr, &phys.siphonProjLayout);
+
+        VkDescriptorSetLayout siphonSets[3] = {
             phys.descLayout,              /* set 0: 16 SoA particle buffers */
-            phys.siphonSet1Layout         /* set 1: particle_cell + pressure xyz */
+            phys.siphonSet1Layout,        /* set 1: particle_cell + pressure xyz + sort_index */
+            phys.siphonProjLayout         /* set 2: density image + camera UBO */
         };
         VkPushConstantRange pushRange = {};
         pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -524,7 +540,7 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 
         VkPipelineLayoutCreateInfo plInfo = {};
         plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plInfo.setLayoutCount = 2;
+        plInfo.setLayoutCount = 3;
         plInfo.pSetLayouts = siphonSets;
         plInfo.pushConstantRangeCount = 1;
         plInfo.pPushConstantRanges = &pushRange;
@@ -863,9 +879,19 @@ void initStencilCompute(PhysicsCompute& phys, VulkanContext& ctx) {
  * ======================================================================== */
 
 void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
-    /* --- Descriptor set layout for set 1: 5 SSBOs --- */
-    VkDescriptorSetLayoutBinding set1Bindings[5] = {};
-    for (int i = 0; i < 5; i++) {
+    /* --- Allocate sort_index buffer (overwritten each frame by scatter_build_index
+     *     when cell sort is enabled; no init needed).
+     *     Sized to N, not capacity — sort_index only indexes active particles. */
+    size_t sortIdx_bytes = (size_t)phys.N * sizeof(uint32_t);
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.sortIndexBuffer, phys.sortIndexMemory, sortIdx_bytes);
+
+    printf("[vk-compute] sort_index buffer: %.1f MB\n",
+           (float)sortIdx_bytes / (1024 * 1024));
+
+    /* --- Descriptor set layout for set 1: 6 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[6] = {};
+    for (int i = 0; i < 6; i++) {
         set1Bindings[i].binding = i;
         set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         set1Bindings[i].descriptorCount = 1;
@@ -873,14 +899,14 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo set1Info = {};
     set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set1Info.bindingCount = 5;
+    set1Info.bindingCount = 6;
     set1Info.pBindings = set1Bindings;
     vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.siphonSet1Layout);
 
     /* --- Descriptor pool + set for set 1 --- */
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 5;
+    poolSize.descriptorCount = 6;
 
     VkDescriptorPoolCreateInfo dpInfo = {};
     dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -897,15 +923,16 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
     vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.siphonSet1);
 
     /* --- Write descriptors for set 1 --- */
-    VkDescriptorBufferInfo bufInfos[5] = {
+    VkDescriptorBufferInfo bufInfos[6] = {
         { phys.particleCellBuffer,      0, VK_WHOLE_SIZE },
         { phys.pressureXBuffer,         0, VK_WHOLE_SIZE },
         { phys.pressureYBuffer,         0, VK_WHOLE_SIZE },
         { phys.pressureZBuffer,         0, VK_WHOLE_SIZE },
         { phys.gridDensityShardsBuffer, 0, (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t) },
+        { phys.sortIndexBuffer,         0, VK_WHOLE_SIZE },
     };
-    VkWriteDescriptorSet writes[5] = {};
-    for (int i = 0; i < 5; i++) {
+    VkWriteDescriptorSet writes[6] = {};
+    for (int i = 0; i < 6; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = phys.siphonSet1;
         writes[i].dstBinding = i;
@@ -913,9 +940,9 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(ctx.device, 5, writes, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 6, writes, 0, nullptr);
 
-    printf("[vk-compute] Siphon set 1 (pressure grid + density) created — 5 bindings\n");
+    printf("[vk-compute] Siphon set 1 (pressure grid + density + sort_index) created — 6 bindings\n");
 }
 
 /* ========================================================================
@@ -1340,7 +1367,8 @@ void initCollisionCompute(PhysicsCompute& phys, VulkanContext& ctx,
  * ======================================================================== */
 
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
-                            int frame, float sim_time, float dt) {
+                            int frame, float sim_time, float dt,
+                            int render_mode, const float* viewProj) {
     /* Reset this slot's 8 timestamps and write the begin marker.
      * Layout:
      *   +0 begin            +1 scatter_end      +2 stencil_end
@@ -1368,7 +1396,7 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     /* Zero shard 0 of the shards buffer — scatter accumulates density here directly. */
     vkCmdFillBuffer(cmd, phys.gridDensityShardsBuffer, 0,
                     (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t), 0);
-    if (phys.countingSortEnabled) {
+    if (phys.countingSortEnabled || phys.cellSortEnabled) {
         vkCmdFillBuffer(cmd, phys.writeCounterBuffer, 0,
                         (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t), 0);
         vkCmdFillBuffer(cmd, phys.scanBlockSumsBuffer, 0,
@@ -1410,6 +1438,104 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 1, &bar, 0, nullptr, 0, nullptr);
+    }
+
+    if (phys.cellSortEnabled) {
+        /* Cell-sorted dispatch: copy shard 0 density → cellOffset, prefix-scan,
+         * then build sort_index permutation for siphon cache coherence. */
+
+        /* Copy shard 0 (scatter's density output) → cellOffset */
+        VkBufferCopy copyRegion = {0, 0, (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t)};
+        vkCmdCopyBuffer(cmd, phys.gridDensityShardsBuffer, phys.cellOffsetBuffer, 1, &copyRegion);
+
+        {
+            VkMemoryBarrier bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            bar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &bar, 0, nullptr, 0, nullptr);
+        }
+
+        /* Prefix scan cellOffset — 3 dispatches */
+        uint32_t scan_N = V21_GRID_CELLS;
+        uint32_t scan_groups = (scan_N + 255) / 256;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.scanPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.scanPipelineLayout, 0, 1, &phys.scanSet, 0, nullptr);
+
+        ScanPushConstants scanPC = {};
+        scanPC.N = scan_N;
+        scanPC.mode = 0;
+        vkCmdPushConstants(cmd, phys.scanPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scanPC), &scanPC);
+        vkCmdDispatch(cmd, scan_groups, 1, 1);
+
+        {
+            VkMemoryBarrier bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &bar, 0, nullptr, 0, nullptr);
+        }
+
+        scanPC.mode = 1;
+        vkCmdPushConstants(cmd, phys.scanPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scanPC), &scanPC);
+        vkCmdDispatch(cmd, 1, 1, 1);
+
+        {
+            VkMemoryBarrier bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &bar, 0, nullptr, 0, nullptr);
+        }
+
+        scanPC.mode = 2;
+        vkCmdPushConstants(cmd, phys.scanPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(scanPC), &scanPC);
+        vkCmdDispatch(cmd, scan_groups, 1, 1);
+
+        {
+            VkMemoryBarrier bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &bar, 0, nullptr, 0, nullptr);
+        }
+
+        /* Build sort_index permutation */
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.buildIndexPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.buildIndexPipelineLayout, 0, 1, &phys.buildIndexSet, 0, nullptr);
+        uint32_t buildN = (uint32_t)phys.N;
+        vkCmdPushConstants(cmd, phys.buildIndexPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(buildN), &buildN);
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+        {
+            VkMemoryBarrier bar = {};
+            bar.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &bar, 0, nullptr, 0, nullptr);
+        }
     }
 
     if (phys.countingSortEnabled) {
@@ -1782,7 +1908,76 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
     }
 
-    /* ---- Siphon (physics) -------------------------------------------- */
+    /* ---- Mode partition (before siphon) -------------------------------- */
+    if (phys.modePartEnabled) {
+        /* Zero partition counts */
+        vkCmdFillBuffer(cmd, phys.partitionCountsBuffer, 0,
+                        2 * sizeof(uint32_t), 0);
+        {
+            VkMemoryBarrier b = {};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.modePartPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+            phys.modePartPipelineLayout, 0, 1, &phys.modePartSet, 0, nullptr);
+        uint32_t partN = (uint32_t)phys.N;
+        vkCmdPushConstants(cmd, phys.modePartPipelineLayout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(partN), &partN);
+        vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+        {
+            VkMemoryBarrier b = {};
+            b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+        }
+    }
+
+    /* ---- Density image clear (before siphon fused projection) --------- */
+    if (viewProj) {
+        /* Update camera UBO */
+        ProjectCameraUBO cam = {};
+        memcpy(cam.view_proj, viewProj, 16 * sizeof(float));
+        cam.zoom = 1.0f;
+        cam.aspect = 1.0f;  /* aspect already baked into viewProj */
+        cam.width = phys.densityWidth;
+        cam.height = phys.densityHeight;
+        memcpy(phys.cameraMapped, &cam, sizeof(cam));
+
+        /* Transition + clear density image */
+        VkImageMemoryBarrier imgBar = {};
+        imgBar.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        imgBar.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        imgBar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        imgBar.srcAccessMask = 0;
+        imgBar.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        imgBar.image = phys.densityImage;
+        imgBar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &imgBar);
+
+        VkClearColorValue clearColor = {};
+        clearColor.uint32[0] = 0;
+        VkImageSubresourceRange clearRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, phys.densityImage, VK_IMAGE_LAYOUT_GENERAL,
+                             &clearColor, 1, &clearRange);
+
+        imgBar.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        imgBar.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &imgBar);
+    }
+
+    /* ---- Siphon (physics + fused projection) ------------------------ */
     SiphonPushConstants push = {};
     push.N = phys.N;
     push.time = sim_time;
@@ -1793,15 +1988,14 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     push.TANGENT_SCALE = 2.0f;
     push.seam_bits = 0x03;  /* SEAM_FULL */
     push.bias = 0.75f;
+    push.brightness = 1.0f;
+    push.render_mode = render_mode;
+    push.frame = frame;
 
-    /* Squaragon V2: use the clean Cartesian siphon pipeline (siphon.comp).
-     * This is the ground truth force model — 3 channels + gravity.
-     * The graded/packed variants are legacy and don't implement
-     * the correct Squaragon physics. */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
-    VkDescriptorSet siphonSets[2] = { phys.descSet, phys.siphonSet1 };
+    VkDescriptorSet siphonSets[3] = { phys.descSet, phys.siphonSet1, phys.siphonProjSet };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.pipelineLayout, 0, 2, siphonSets, 0, nullptr);
+        phys.pipelineLayout, 0, 3, siphonSets, 0, nullptr);
     vkCmdPushConstants(cmd, phys.pipelineLayout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
@@ -2636,6 +2830,246 @@ void initCountingSortCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     printf("[vk-compute] Counting sort initialized (disabled — atomic scatter faster at this scale)\n");
 }
 
+/* ========================================================================
+ * CELL-SORTED DISPATCH — lightweight counting sort for siphon cache coherence
+ * Reuses gridDensityShardsBuffer shard 0 as histogram source (written by scatter).
+ * Produces sort_index[N] permutation so wavefronts hit same grid cells.
+ * ======================================================================== */
+
+void initCellSort(PhysicsCompute& phys, VulkanContext& ctx) {
+    /* Allocate sort infrastructure buffers (small — 1 MB each for 262K cells) */
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.cellOffsetBuffer, phys.cellOffsetMemory,
+               (size_t)V21_GRID_CELLS * sizeof(uint32_t));
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.scanBlockSumsBuffer, phys.scanBlockSumsMemory,
+               1024 * sizeof(uint32_t));
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.writeCounterBuffer, phys.writeCounterMemory,
+               (size_t)V21_GRID_CELLS * sizeof(uint32_t));
+
+    /* --- Scan pipeline (reuse existing shader) --- */
+    {
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        bindings[0] = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 2;
+        li.pBindings = bindings;
+        vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.scanSetLayout);
+
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ScanPushConstants)};
+        VkPipelineLayoutCreateInfo pli = {};
+        pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &phys.scanSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(ctx.device, &pli, nullptr, &phys.scanPipelineLayout);
+
+        auto code = readShaderFile("scatter_scan.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = phys.scanPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                 &phys.scanPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
+    /* --- Descriptor pool for scan + build_index (2 sets) --- */
+    VkDescriptorPoolSize poolSizes[1] = {};
+    poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSizes[0].descriptorCount = 10;  /* 2 for scan + 4 for build_index + headroom */
+    VkDescriptorPoolCreateInfo poolInfo = {};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.maxSets = 2;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = poolSizes;
+    vkCreateDescriptorPool(ctx.device, &poolInfo, nullptr, &phys.buildIndexDescPool);
+
+    /* --- Scan descriptor set --- */
+    {
+        VkDescriptorSetAllocateInfo dsai = {};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = phys.buildIndexDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &phys.scanSetLayout;
+        vkAllocateDescriptorSets(ctx.device, &dsai, &phys.scanSet);
+
+        VkDescriptorBufferInfo bufs[2] = {
+            { phys.cellOffsetBuffer, 0, VK_WHOLE_SIZE },
+            { phys.scanBlockSumsBuffer, 0, VK_WHOLE_SIZE }
+        };
+        VkWriteDescriptorSet writes[2] = {};
+        for (int i = 0; i < 2; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = phys.scanSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufs[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+    }
+
+    /* --- Build-index pipeline --- */
+    {
+        VkDescriptorSetLayoutBinding bindings[4] = {};
+        for (int i = 0; i < 4; i++) {
+            bindings[i].binding = i;
+            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[i].descriptorCount = 1;
+            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li = {};
+        li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        li.bindingCount = 4;
+        li.pBindings = bindings;
+        vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.buildIndexSetLayout);
+
+        VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)};
+        VkPipelineLayoutCreateInfo pli = {};
+        pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &phys.buildIndexSetLayout;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(ctx.device, &pli, nullptr, &phys.buildIndexPipelineLayout);
+
+        auto code = readShaderFile("scatter_build_index.spv");
+        VkShaderModule mod = createShaderModule(ctx.device, code);
+        VkComputePipelineCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = mod;
+        ci.stage.pName = "main";
+        ci.layout = phys.buildIndexPipelineLayout;
+        vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                                 &phys.buildIndexPipeline);
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+        /* Descriptor set for build_index */
+        VkDescriptorSetAllocateInfo dsai = {};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = phys.buildIndexDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &phys.buildIndexSetLayout;
+        vkAllocateDescriptorSets(ctx.device, &dsai, &phys.buildIndexSet);
+
+        VkDescriptorBufferInfo bufs[4] = {
+            { phys.particleCellBuffer, 0, VK_WHOLE_SIZE },
+            { phys.cellOffsetBuffer, 0, VK_WHOLE_SIZE },
+            { phys.writeCounterBuffer, 0, VK_WHOLE_SIZE },
+            { phys.sortIndexBuffer, 0, VK_WHOLE_SIZE }
+        };
+        VkWriteDescriptorSet writes[4] = {};
+        for (int i = 0; i < 4; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = phys.buildIndexSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufs[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+    }
+
+    phys.cellSortEnabled = false;  /* L2 already covers 3MB pressure grid at 20M; sort overhead > cache savings */
+    printf("[vk-compute] Cell-sorted dispatch initialized (disabled — pressure grid fits L2)\n");
+}
+
+/* ========================================================================
+ * MODE PARTITION — split sort_index into [COAST | ACTIVE+FLOW]
+ * Eliminates wavefront divergence in siphon: COAST warps exit fast,
+ * ACTIVE+FLOW warps never carry idle COAST lanes.
+ * ======================================================================== */
+
+void initModePartition(PhysicsCompute& phys, VulkanContext& ctx) {
+    /* partition_counts: 2 × uint32 (coast_count, active_count) */
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.partitionCountsBuffer, phys.partitionCountsMemory,
+               2 * sizeof(uint32_t));
+
+    /* Descriptor set layout: theta(0) + flags(1) + sort_index(2) + partition_counts(3) */
+    VkDescriptorSetLayoutBinding bindings[4] = {};
+    for (int i = 0; i < 4; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo li = {};
+    li.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    li.bindingCount = 4;
+    li.pBindings = bindings;
+    vkCreateDescriptorSetLayout(ctx.device, &li, nullptr, &phys.modePartSetLayout);
+
+    VkPushConstantRange pcr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t)};
+    VkPipelineLayoutCreateInfo pli = {};
+    pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &phys.modePartSetLayout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    vkCreatePipelineLayout(ctx.device, &pli, nullptr, &phys.modePartPipelineLayout);
+
+    auto code = readShaderFile("mode_partition.spv");
+    VkShaderModule mod = createShaderModule(ctx.device, code);
+    VkComputePipelineCreateInfo ci = {};
+    ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = mod;
+    ci.stage.pName = "main";
+    ci.layout = phys.modePartPipelineLayout;
+    vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr,
+                             &phys.modePartPipeline);
+    vkDestroyShaderModule(ctx.device, mod, nullptr);
+
+    /* Descriptor pool + set */
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+    VkDescriptorPoolCreateInfo dpi = {};
+    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    dpi.maxSets = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes = &ps;
+    vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &phys.modePartDescPool);
+
+    VkDescriptorSetAllocateInfo dsai = {};
+    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    dsai.descriptorPool = phys.modePartDescPool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &phys.modePartSetLayout;
+    vkAllocateDescriptorSets(ctx.device, &dsai, &phys.modePartSet);
+
+    VkDescriptorBufferInfo bufs[4] = {
+        { phys.soa_buffers[12], 0, VK_WHOLE_SIZE },  /* theta (binding 12 in SoA) */
+        { phys.soa_buffers[14], 0, VK_WHOLE_SIZE },  /* flags (binding 14 in SoA) */
+        { phys.sortIndexBuffer, 0, VK_WHOLE_SIZE },   /* sort_index */
+        { phys.partitionCountsBuffer, 0, VK_WHOLE_SIZE },
+    };
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstSet = phys.modePartSet;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufs[i];
+    }
+    vkUpdateDescriptorSets(ctx.device, 4, writes, 0, nullptr);
+
+    phys.modePartEnabled = false;  /* sort_index indirection costs more than divergence savings on Turing */
+    printf("[vk-compute] Mode partition initialized (disabled — indirection > divergence cost)\n");
+}
+
 void dispatchCartesianToGraded(PhysicsCompute& phys, VkCommandBuffer cmd) {
 
 
@@ -2704,6 +3138,8 @@ void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd) {
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx) {
     uint32_t w = ctx.swapchainExtent.width;
     uint32_t h = ctx.swapchainExtent.height;
+    phys.densityWidth = (int)w;
+    phys.densityHeight = (int)h;
 
     /* --- Density image (R32_UINT) --- */
     VkImageCreateInfo imgInfo = {};
@@ -2764,7 +3200,49 @@ void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx) {
     vkBindBufferMemory(ctx.device, phys.cameraUBO, phys.cameraMemory, 0);
     vkMapMemory(ctx.device, phys.cameraMemory, 0, sizeof(ProjectCameraUBO), 0, &phys.cameraMapped);
 
-    /* --- Projection compute pipeline --- */
+    /* --- Siphon set 2: fused projection descriptors (density image + camera UBO) --- */
+    {
+        VkDescriptorPoolSize ps[2] = {
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1}
+        };
+        VkDescriptorPoolCreateInfo dpi = {};
+        dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets = 1;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = ps;
+        vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &phys.siphonProjDescPool);
+
+        VkDescriptorSetAllocateInfo dsai = {};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = phys.siphonProjDescPool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &phys.siphonProjLayout;
+        vkAllocateDescriptorSets(ctx.device, &dsai, &phys.siphonProjSet);
+
+        VkDescriptorImageInfo imgInfo = {VK_NULL_HANDLE, phys.densityView, VK_IMAGE_LAYOUT_GENERAL};
+        VkDescriptorBufferInfo camInfo = {phys.cameraUBO, 0, sizeof(ProjectCameraUBO)};
+
+        VkWriteDescriptorSet writes[2] = {};
+        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet = phys.siphonProjSet;
+        writes[0].dstBinding = 0;
+        writes[0].descriptorCount = 1;
+        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[0].pImageInfo = &imgInfo;
+
+        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet = phys.siphonProjSet;
+        writes[1].dstBinding = 1;
+        writes[1].descriptorCount = 1;
+        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[1].pBufferInfo = &camInfo;
+
+        vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+        printf("[vk-compute] Siphon set 2 (fused projection) created\n");
+    }
+
+    /* --- Projection compute pipeline (legacy — kept for fallback) --- */
     /* Descriptor layout: 16 SoA SSBOs (bindings 0-15) + density image (16) + camera UBO (17) */
     VkDescriptorSetLayoutBinding projBindings[18] = {};
     for (int i = 0; i < 16; i++) {
@@ -3026,58 +3504,12 @@ void recordDensityRender(PhysicsCompute& phys, VkCommandBuffer cmd,
     uint32_t w = ctx.swapchainExtent.width;
     uint32_t h = ctx.swapchainExtent.height;
 
-    /* Update camera UBO */
-    ProjectCameraUBO cam = {};
-    memcpy(cam.view_proj, viewProj, 16 * sizeof(float));
-    cam.zoom = 1.0f;
-    cam.aspect = (float)w / (float)h;
-    cam.width = (int)w;
-    cam.height = (int)h;
-    memcpy(phys.cameraMapped, &cam, sizeof(cam));
-
-    /* Barrier 1: Undefined → General (for clear) */
+    /* Projection was fused into siphon — density image already populated.
+     * Just transition to read-only for the tonemap fragment shader. */
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.image = phys.densityImage;
     barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    /* Clear density to zero */
-    VkClearColorValue clearColor = {};
-    clearColor.uint32[0] = 0;
-    VkImageSubresourceRange clearRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd, phys.densityImage, VK_IMAGE_LAYOUT_GENERAL,
-                         &clearColor, 1, &clearRange);
-
-    /* Barrier 2: Clear → Compute write */
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    /* Projection compute dispatch */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.projPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.projPipelineLayout, 0, 1, &phys.projDescSet, 0, nullptr);
-
-    ProjectPushConstants projPush = {};
-    projPush.particle_count = phys.N;
-    projPush.brightness = 1.0f;
-    projPush.temp_scale = 0.1f;
-    projPush.render_mode = render_mode;
-    vkCmdPushConstants(cmd, phys.projPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(projPush), &projPush);
-
-    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
-
-    /* Barrier 3: Compute write → Fragment read */
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;

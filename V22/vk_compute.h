@@ -28,6 +28,9 @@ struct SiphonPushConstants {
     float TANGENT_SCALE;
     uint32_t seam_bits;
     float bias;
+    float brightness;
+    int   render_mode;
+    int   frame;
 };
 
 /* Push constants for scatter.comp */
@@ -241,6 +244,11 @@ struct PhysicsCompute {
     VkDescriptorPool      siphonSet1DescPool;
     VkDescriptorSet       siphonSet1;
 
+    /* Siphon set 2 — fused projection (density image + camera UBO) */
+    VkDescriptorSetLayout siphonProjLayout;
+    VkDescriptorPool      siphonProjDescPool;
+    VkDescriptorSet       siphonProjSet;
+
     /* Constraint solver pipeline (Pass 4 — PBD distance constraints, rigid-body MVP).
      * All buffers and pipeline state are only allocated when constraintEnabled is
      * true (i.e. when --rigid-body != off). */
@@ -318,6 +326,8 @@ struct PhysicsCompute {
     VkDeviceMemory densityMemory;
     VkImageView densityView;
     VkSampler densitySampler;
+    int densityWidth;
+    int densityHeight;
 
     /* Camera UBO */
     VkBuffer cameraUBO;
@@ -428,6 +438,31 @@ struct PhysicsCompute {
     VkDescriptorPool      countingSortDescPool;
     bool                  countingSortEnabled;
 
+    /* Cell-sorted dispatch: index permutation so siphon threads in a wavefront
+     * hit the same grid cell → cache-coherent pressure reads.
+     * sort_index[sorted_pos] = original_particle_index.
+     * Identity permutation when cellSortEnabled is false. */
+    VkBuffer              sortIndexBuffer;            /* uint[capacity] */
+    VkDeviceMemory        sortIndexMemory;
+    VkDescriptorSetLayout buildIndexSetLayout;        /* particle_cell + cell_offset + write_counter + sort_index */
+    VkDescriptorSet       buildIndexSet;
+    VkPipelineLayout      buildIndexPipelineLayout;
+    VkPipeline            buildIndexPipeline;
+    VkDescriptorPool      buildIndexDescPool;
+    bool                  cellSortEnabled;
+
+    /* Mode partition: split sort_index into [COAST | ACTIVE+FLOW] so siphon
+     * wavefronts have uniform mode — no idle lanes from divergence.
+     * partition_counts[0] = coast_count after dispatch. */
+    VkBuffer              partitionCountsBuffer;      /* uint[2] */
+    VkDeviceMemory        partitionCountsMemory;
+    VkDescriptorSetLayout modePartSetLayout;          /* theta + flags + sort_index + partition_counts */
+    VkDescriptorSet       modePartSet;
+    VkPipelineLayout      modePartPipelineLayout;
+    VkPipeline            modePartPipeline;
+    VkDescriptorPool      modePartDescPool;
+    bool                  modePartEnabled;
+
     /* Packed siphon (bandwidth optimization) — single AoS struct buffer
      * + fused Cartesian projection. Eliminates graded_to_cartesian dispatch. */
     VkBuffer              packedParticleBuffer;     /* Particle[N], 80 bytes each */
@@ -515,7 +550,8 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 
 /* Record compute dispatch commands into command buffer */
 void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
-                            int frame, float sim_time, float dt);
+                            int frame, float sim_time, float dt,
+                            int render_mode = 0, const float* viewProj = nullptr);
 
 /* Initialize scatter compute pipeline + grid SSBOs (Pass 1 of streaming arch).
  * Loads the SPIRV corresponding to phys.scatterMode. */
@@ -583,6 +619,8 @@ void dispatchGradedToCartesian(PhysicsCompute& phys, VkCommandBuffer cmd);
  * Replaces the shard-based atomic scatter for the density grid.
  * Must be called after initGradedCompute (uses graded set 2). */
 void initCountingSortCompute(PhysicsCompute& phys, VulkanContext& ctx);
+void initCellSort(PhysicsCompute& phys, VulkanContext& ctx);
+void initModePartition(PhysicsCompute& phys, VulkanContext& ctx);
 
 /* Initialize density rendering pipeline (projection + tone-map) */
 void initDensityRender(PhysicsCompute& phys, VulkanContext& ctx);

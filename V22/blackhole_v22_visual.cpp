@@ -1667,6 +1667,7 @@ int main(int argc, char** argv) {
     bool  benchmark   = false;  /* headless + timing breakdown */
     bool  use_forward = false;  /* use forward-pass siphon (V8-style double buffer) */
     int   render_mode = 0; /* 0=all, 1=alive only, 2=nova only, 3=crystal only */
+    bool  no_spawn   = false;  /* disable CPU spawn — fixed particle count for benchmarking */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -1732,6 +1733,9 @@ int main(int argc, char** argv) {
         }
         else if (strcmp(argv[i], "--fourier-render") == 0) {
             /* Legacy flag — fourier render removed, ignored */
+        }
+        else if (strcmp(argv[i], "--no-spawn") == 0) {
+            no_spawn = true;
         }
         else if (strcmp(argv[i], "--benchmark") == 0) {
             headless = true;
@@ -2274,7 +2278,11 @@ int main(int argc, char** argv) {
          * so the graded buffers mirror the Cartesian initial state. */
         if (use_forward) gpuPhys.forwardSiphonEnabled = true;  /* hint to skip packed siphon alloc */
         initGradedCompute(gpuPhys, vkCtx);
-        initCountingSortCompute(gpuPhys, vkCtx);
+        /* Old counting sort disabled — packed siphon inside blew VRAM at 20M.
+         * Cell-sorted dispatch replaces it: lightweight index permutation only. */
+        gpuPhys.countingSortEnabled = false;
+        initCellSort(gpuPhys, vkCtx);
+        initModePartition(gpuPhys, vkCtx);
         {
             VkCommandBuffer ucmd;
             VkCommandBufferAllocateInfo cba = {};
@@ -2881,7 +2889,7 @@ int main(int argc, char** argv) {
             }
 
             /* CPU-side spawn: energy well growth, every 100 frames */
-            if (use_gpu_physics && frame > 0 && frame % 100 == 0) {
+            if (use_gpu_physics && !no_spawn && frame > 0 && frame % 100 == 0) {
                 int spawned = spawn_step(particles, gpuPhys, vkCtx);
                 if (spawned > 0) {
                     printf("[spawn] frame=%d  N=%d (+%d)  capacity=%d\n",
@@ -2935,17 +2943,10 @@ int main(int argc, char** argv) {
                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                             0, 1, &b2, 0, nullptr, 0, nullptr);
                     } else {
-                        dispatchPhysicsCompute(gpuPhys, cmd, frame, sim_time, dt * 2.0f);
-
-                        /* Barrier: siphon writes must complete before projection reads */
-                        VkMemoryBarrier siphonBarrier = {};
-                        siphonBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-                        siphonBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                        siphonBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                        vkCmdPipelineBarrier(cmd,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                            0, 1, &siphonBarrier, 0, nullptr, 0, nullptr);
+                        /* Get viewProj early so siphon can fuse projection */
+                        GlobalUBO* ubo = (GlobalUBO*)vkCtx.uniformBuffersMapped[vkCtx.currentFrame];
+                        dispatchPhysicsCompute(gpuPhys, cmd, frame, sim_time, dt * 2.0f,
+                                               render_mode, ubo->viewProj);
                     }
                 }
 
@@ -2957,7 +2958,7 @@ int main(int argc, char** argv) {
                     readback_frame = frame;
                 }
 
-                /* Get viewProj from the mapped UBO */
+                /* Density render: siphon already did projection, just tonemap */
                 GlobalUBO* ubo = (GlobalUBO*)vkCtx.uniformBuffersMapped[vkCtx.currentFrame];
                 recordDensityRender(gpuPhys, cmd, vkCtx, imageIndex, ubo->viewProj, render_mode);
             } else {

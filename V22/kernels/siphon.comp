@@ -39,6 +39,21 @@ layout(std430, set = 1, binding = 1) readonly buffer PressX  { float pressure_x[
 layout(std430, set = 1, binding = 2) readonly buffer PressY  { float pressure_y[];    };
 layout(std430, set = 1, binding = 3) readonly buffer PressZ  { float pressure_z[];    };
 layout(std430, set = 1, binding = 4) readonly buffer GDens   { uint  grid_density[];  };
+layout(std430, set = 1, binding = 5) readonly buffer SortIdx { uint  sort_index[];    };
+
+// ============================================================================
+// Set 2: fused projection (density image + camera UBO)
+// ============================================================================
+
+layout(set = 2, binding = 0, r32ui) uniform uimage2D density_buf;
+
+layout(set = 2, binding = 1) uniform CameraUBO {
+    mat4  view_proj;
+    float zoom;
+    float aspect;
+    int   width;
+    int   height;
+} cam;
 
 // ============================================================================
 // Push constants
@@ -54,6 +69,9 @@ layout(push_constant) uniform PushConstants {
     float TANGENT_SCALE;
     uint  seam_bits;
     float bias;
+    float brightness;
+    int   render_mode;
+    int   frame;
 } pc;
 
 // ============================================================================
@@ -171,13 +189,59 @@ const float OMEGA_DECAY    = 0.15;  // COAST exponential decay rate
 const float OMEGA_MAX      = 2.0;   // hard clamp
 
 // ============================================================================
+// Fused projection — Tsoding x/z, y/z + density accumulation
+// ============================================================================
+
+void fused_project(float wx, float wy, float wz, uint f) {
+    // Render mode filtering
+    bool is_nova    = (f & PFLAG_NOVA) != 0u;
+    bool is_crystal = (f & PFLAG_CRYSTAL) != 0u;
+    bool is_alive   = !is_nova && !is_crystal;
+
+    if (pc.render_mode == 1 && !is_alive)   return;
+    if (pc.render_mode == 2 && !is_nova)    return;
+    if (pc.render_mode == 3 && !is_crystal) return;
+
+    float cx = cam.view_proj[0][0] * wx
+             + cam.view_proj[1][0] * wy
+             + cam.view_proj[2][0] * wz
+             + cam.view_proj[3][0];
+    float cy = cam.view_proj[0][1] * wx
+             + cam.view_proj[1][1] * wy
+             + cam.view_proj[2][1] * wz
+             + cam.view_proj[3][1];
+    float cw = cam.view_proj[0][3] * wx
+             + cam.view_proj[1][3] * wy
+             + cam.view_proj[2][3] * wz
+             + cam.view_proj[3][3];
+
+    if (cw <= 0.0) return;
+
+    float inv_w = 1.0 / cw;
+    float nx = cx * inv_w;
+    float ny = cy * inv_w;
+
+    if (abs(nx) > 1.0 || abs(ny) > 1.0) return;
+
+    int px = int((nx * 0.5 + 0.5) * float(cam.width));
+    int py = int((ny * 0.5 + 0.5) * float(cam.height));
+
+    if (px >= 0 && px < cam.width && py >= 0 && py < cam.height) {
+        if (imageLoad(density_buf, ivec2(px, py)).r > 4096u) return;
+        uint contrib = uint(pc.brightness * 32.0);
+        imageAtomicAdd(density_buf, ivec2(px, py), max(contrib, 1u));
+    }
+}
+
+// ============================================================================
 // Main kernel — mode-branched execution
 // ============================================================================
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.N) return;
+    uint dispatch_id = gl_GlobalInvocationID.x;
+    if (dispatch_id >= pc.N) return;
 
+    uint i = dispatch_id;  /* direct indexing — sort_index indirection measured slower on Turing */
     uint f = flags[i];
     if ((f & PFLAG_ACTIVE) == 0u) return;
     if ((f & PFLAG_EJECTED) != 0u) return;
@@ -194,9 +258,8 @@ void main() {
 
         float r3d_sq  = px*px + py*py + pz*pz;
         float inv_r3d = inversesqrt(r3d_sq + 1e-8);
-        float r_safe  = max(r3d_sq * inv_r3d, 1.0);
-        float inv_r   = 1.0 / r_safe;
-        float gravity  = pc.BH_MASS / (r_safe * r_safe);
+        float inv_r   = min(inv_r3d, 1.0);
+        float gravity  = pc.BH_MASS * inv_r * inv_r;
 
         vx -= (px * inv_r) * gravity * pc.dt;
         vy -= (py * inv_r) * gravity * pc.dt;
@@ -205,12 +268,12 @@ void main() {
         if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz))
             return;
 
-        pos_x[i] = px + vx * pc.dt;
-        pos_y[i] = py + vy * pc.dt;
-        pos_z[i] = pz + vz * pc.dt;
-        vel_x[i] = vx;
-        vel_y[i] = vy;
-        vel_z[i] = vz;
+        float fx = px + vx * pc.dt;
+        float fy = py + vy * pc.dt;
+        float fz = pz + vz * pc.dt;
+        pos_x[i] = fx; pos_y[i] = fy; pos_z[i] = fz;
+        vel_x[i] = vx; vel_y[i] = vy; vel_z[i] = vz;
+        fused_project(fx, fy, fz, f);
         return;
     }
 
@@ -237,28 +300,42 @@ void main() {
     float inv_r3d = inversesqrt(r3d_sq + 1e-8);
     float r3d     = r3d_sq * inv_r3d;
     float r_safe  = max(r3d, 1.0);
-    float inv_r   = 1.0 / r_safe;
+    float inv_r   = min(inv_r3d, 1.0);  // 1/r_safe via inversesqrt, clamped
 
     float rx = px * inv_r;
     float ry = py * inv_r;
     float rz = pz * inv_r;
 
-    float gravity = pc.BH_MASS / (r_safe * r_safe);
+    float gravity = pc.BH_MASS * inv_r * inv_r;
 
     float ax = -rx * gravity;
     float ay = -ry * gravity;
     float az = -rz * gravity;
 
     // ======================================================================
-    // COAST (mode 0): gravity only — skip grid, LUTs, steering, everything
-    // 31% of particles take this path. No memory reads beyond pos/vel/theta.
+    // COAST (mode 0): gravity only — predicted Kepler orbit at 1/4 rate.
+    // 31% of particles. Physics runs every 4th frame; other frames just
+    // project from stored position (no loads beyond pos, no stores).
     // ======================================================================
     if (mode == 0) {
-        // ---- Omega decay: no coupling in COAST, exponential drain ----
-        omega *= (1.0 - OMEGA_DECAY * pc.dt);
+        // Non-physics frames: project only, skip all computation
+        #define COAST_STRIDE 4
+        if ((pc.frame & (COAST_STRIDE - 1)) != int(i & uint(COAST_STRIDE - 1))) {
+            fused_project(px, py, pz, f);
+            return;
+        }
+
+        // Physics frame: advance COAST_STRIDE steps of ballistic gravity
+        float K_dt = pc.dt * float(COAST_STRIDE);
+
+        // ---- Omega decay: K steps of exponential drain ----
+        float decay_K = 1.0 - OMEGA_DECAY * pc.dt;
+        decay_K = decay_K * decay_K;              // (1-d)^2
+        decay_K = decay_K * decay_K;              // (1-d)^4 = (1-d)^COAST_STRIDE
+        omega *= decay_K;
         omega = max(omega, 0.0);
 
-        // ---- Crystallization check: low omega + COAST + low velocity = heat death ----
+        // ---- Crystallization check ----
         float speed_sq = vx*vx + vy*vy + vz*vz;
         if (omega < OMEGA_CRYSTAL && speed_sq < 0.01) {
             vel_x[i] = 0.0;
@@ -267,24 +344,29 @@ void main() {
             omega_nat[i] = 0.0;
             theta[i] = theta_i;
             flags[i] = f | PFLAG_CRYSTAL;
+            fused_project(px, py, pz, f | PFLAG_CRYSTAL);
             return;
         }
 
-        vx += ax * pc.dt;
-        vy += ay * pc.dt;
-        vz += az * pc.dt;
+        // ---- Ballistic gravity over K steps ----
+        // pos(K) = pos + vel*K*dt + 0.5*accel*(K*dt)²
+        // vel(K) = vel + accel*K*dt
+        // Gravity direction constant over K frames (small-angle approximation)
+        vx += ax * K_dt;
+        vy += ay * K_dt;
+        vz += az * K_dt;
 
         if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz))
             return;
 
-        pos_x[i] = px + vx * pc.dt;
-        pos_y[i] = py + vy * pc.dt;
-        pos_z[i] = pz + vz * pc.dt;
-        vel_x[i] = vx;
-        vel_y[i] = vy;
-        vel_z[i] = vz;
+        float fx = px + vx * K_dt - ax * 0.5 * K_dt * K_dt;
+        float fy = py + vy * K_dt - ay * 0.5 * K_dt * K_dt;
+        float fz = pz + vz * K_dt - az * 0.5 * K_dt * K_dt;
+        pos_x[i] = fx; pos_y[i] = fy; pos_z[i] = fz;
+        vel_x[i] = vx; vel_y[i] = vy; vel_z[i] = vz;
         omega_nat[i] = omega;
         theta[i] = theta_i;
+        fused_project(fx, fy, fz, f);
         return;
     }
 
@@ -308,12 +390,13 @@ void main() {
     // The node sits at the same radius as the particle but at the curve's angular position.
     // Transport terms (steering, torsion, gradient) are strong near the node, roll off away.
     #define R_SCALE 25.0
+    #define INV_R_SCALE_SQ (1.0 / (R_SCALE * R_SCALE))
     vec3 cp_env = CURVE_PT[gen];
     float dx_n = px - cp_env.x * r_safe;
     float dy_n = py - cp_env.y * r_safe;
     float dz_n = pz - cp_env.z * r_safe;
-    float d_node = sqrt(dx_n*dx_n + dy_n*dy_n + dz_n*dz_n);
-    float envelope = 1.0 / (1.0 + d_node / R_SCALE);
+    float d_node_sq = dx_n*dx_n + dy_n*dy_n + dz_n*dz_n;
+    float envelope = inversesqrt(1.0 + d_node_sq * INV_R_SCALE_SQ);
 
     // ---- Density torsion (ACTIVE + FLOW) ----
     float torsion_boost = 0.5 * rho * envelope;
@@ -327,8 +410,7 @@ void main() {
     float z_coup = Z_COUPLING[gen];
 
     // ---- Prograde tangent ----
-    float r_xz = sqrt(px*px + pz*pz + 1e-8);
-    float inv_rxz = 1.0 / r_xz;
+    float inv_rxz = inversesqrt(px*px + pz*pz + 1e-8);
     float pgx = -pz * inv_rxz;
     float pgz =  px * inv_rxz;
 
@@ -349,18 +431,19 @@ void main() {
     float steer_rate = base_rate * density_gain * envelope;
 
     {
-        float speed_before = sqrt(vx*vx + vy*vy + vz*vz);
+        float speed_sq = vx*vx + vy*vy + vz*vz;
+        float inv_speed_before = inversesqrt(speed_sq + 1e-8);
 
-        float t_mag = sqrt(tx*tx + ty*ty + tz*tz + 1e-8);
-        float tnx = tx / t_mag, tny = ty / t_mag, tnz = tz / t_mag;
+        float inv_t_mag = inversesqrt(tx*tx + ty*ty + tz*tz + 1e-8);
+        float tnx = tx * inv_t_mag, tny = ty * inv_t_mag, tnz = tz * inv_t_mag;
 
         float v_dot_t = vx*tnx + vy*tny + vz*tnz;
         vx -= (vx - v_dot_t * tnx) * steer_rate;
         vy -= (vy - v_dot_t * tny) * steer_rate;
         vz -= (vz - v_dot_t * tnz) * steer_rate;
 
-        float speed_after = sqrt(vx*vx + vy*vy + vz*vz);
-        float rescale = speed_before / (speed_after + 1e-8);
+        float inv_speed_after = inversesqrt(vx*vx + vy*vy + vz*vz + 1e-8);
+        float rescale = inv_speed_after / inv_speed_before;
         vx *= rescale;
         vy *= rescale;
         vz *= rescale;
@@ -437,25 +520,25 @@ void main() {
         vz += tang_kick.z * blast;
 
         // Write final state and flag as nova ejecta
-        pos_x[i] = px + vx * pc.dt;
-        pos_y[i] = py + vy * pc.dt;
-        pos_z[i] = pz + vz * pc.dt;
-        vel_x[i] = vx;
-        vel_y[i] = vy;
-        vel_z[i] = vz;
-        omega_nat[i] = OMEGA_SUPERNOVA * 0.5;  // dump excess, prevent re-trigger
+        float fx = px + vx * pc.dt;
+        float fy = py + vy * pc.dt;
+        float fz = pz + vz * pc.dt;
+        pos_x[i] = fx; pos_y[i] = fy; pos_z[i] = fz;
+        vel_x[i] = vx; vel_y[i] = vy; vel_z[i] = vz;
+        omega_nat[i] = OMEGA_SUPERNOVA * 0.5;
         theta[i] = theta_i;
         flags[i] = f | PFLAG_NOVA;
+        fused_project(fx, fy, fz, f | PFLAG_NOVA);
         return;
     }
 
-    // ---- Normal writeback ----
-    pos_x[i] = px + vx * pc.dt;
-    pos_y[i] = py + vy * pc.dt;
-    pos_z[i] = pz + vz * pc.dt;
-    vel_x[i] = vx;
-    vel_y[i] = vy;
-    vel_z[i] = vz;
+    // ---- Normal writeback + fused projection ----
+    float fx = px + vx * pc.dt;
+    float fy = py + vy * pc.dt;
+    float fz = pz + vz * pc.dt;
+    pos_x[i] = fx; pos_y[i] = fy; pos_z[i] = fz;
+    vel_x[i] = vx; vel_y[i] = vy; vel_z[i] = vz;
     omega_nat[i] = omega;
     theta[i] = theta_i;
+    fused_project(fx, fy, fz, f);
 }
