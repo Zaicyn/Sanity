@@ -68,6 +68,18 @@ vec3 colormap_hopf(float t) {
     else               return mix(c2, c3, (s - 0.66) * 3.0);
 }
 
+vec3 colormap_ice(float t) {
+    // Crystal remnants: black → deep blue → cyan → white
+    const vec3 c0 = vec3(0.00, 0.00, 0.05);
+    const vec3 c1 = vec3(0.05, 0.15, 0.50);
+    const vec3 c2 = vec3(0.30, 0.70, 0.90);
+    const vec3 c3 = vec3(0.90, 0.95, 1.00);
+    float s = clamp(t, 0.0, 1.0);
+    if (s < 0.33)      return mix(c0, c1, s * 3.0);
+    else if (s < 0.66) return mix(c1, c2, (s - 0.33) * 3.0);
+    else               return mix(c2, c3, (s - 0.66) * 3.0);
+}
+
 // ----------------------------------------------------------------------------
 // Log-compression tone map — preserves structure across many decades of density
 // Same idea as astronomical image processing (arcsinh stretch)
@@ -80,13 +92,15 @@ float tone_compress(float raw_density) {
 void main() {
     // Sample density buffer (nearest — no filtering on integer counts)
     uint  raw = texture(usampler2D(density_buf, samp), uv).r;
+    if (raw == 0u) { frag_color = vec4(0.0, 0.0, 0.0, 1.0); return; }
     float t   = tone_compress(float(raw));
 
     vec3 rgb;
     if      (tp.colormap == 0) rgb = colormap_thermal(t);
     else if (tp.colormap == 1) rgb = colormap_plasma(t);
     else if (tp.colormap == 2) rgb = colormap_blue_white(t);
-    else                       rgb = colormap_hopf(t);      // default
+    else if (tp.colormap == 4) rgb = colormap_ice(t);
+    else                       rgb = colormap_hopf(t);      // default (3)
 
     // Gamma encode for display
     rgb = pow(clamp(rgb, 0.0, 1.0), vec3(1.0 / tp.gamma));

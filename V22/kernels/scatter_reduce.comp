@@ -1,0 +1,45 @@
+// scatter_reduce.comp — Sum the 8 privatized density shards into one buffer
+// ============================================================================
+// After scatter.comp writes into grid_density_shards[N_SHARDS * total_cells],
+// this pass collapses it into grid_density[total_cells] by summing across
+// the shard dimension:
+//
+//   grid_density[cell] = sum over s in [0, N_SHARDS) of grid_density_shards[s*total_cells + cell]
+//
+// Dispatch: ceil(total_cells / 256) workgroups. Each thread handles one cell.
+
+#version 450
+
+#define V21_GRID_SHARD_COUNT 8u
+
+layout(local_size_x = 256) in;
+
+// Single input: the privatized shards buffer (read-only here)
+layout(std430, set = 0, binding = 0) readonly buffer GridDensityShards { uint grid_density_shards[]; };
+
+// Single output: the canonical density buffer (this is what downstream
+// Pass 2/3 stencil / gather kernels will consume).
+layout(std430, set = 0, binding = 1) writeonly buffer GridDensity { uint grid_density[]; };
+
+layout(push_constant) uniform ReducePushConstants {
+    int total_cells;
+} pc;
+
+void main() {
+    int cell = int(gl_GlobalInvocationID.x);
+    if (cell >= pc.total_cells) return;
+
+    uint total_cells = uint(pc.total_cells);
+    uint sum = 0u;
+    // Unrolled sum over 8 shards
+    sum += grid_density_shards[0u * total_cells + uint(cell)];
+    sum += grid_density_shards[1u * total_cells + uint(cell)];
+    sum += grid_density_shards[2u * total_cells + uint(cell)];
+    sum += grid_density_shards[3u * total_cells + uint(cell)];
+    sum += grid_density_shards[4u * total_cells + uint(cell)];
+    sum += grid_density_shards[5u * total_cells + uint(cell)];
+    sum += grid_density_shards[6u * total_cells + uint(cell)];
+    sum += grid_density_shards[7u * total_cells + uint(cell)];
+
+    grid_density[cell] = sum;
+}

@@ -1,0 +1,156 @@
+// constraint_solve_graded.comp — PBD distance solver on grade-separated state
+// ============================================================================
+// Phase 3.3: constraint solver operating on graded buffers (set 2).
+// Corrections only touch Grade 1 (delta_r, delta_y). Grade 2 (phi, omega_orb)
+// is untouched — constraints physically cannot stretch the orbital structure.
+//
+// Strategy: reconstruct Cartesian positions from graded state, run the same
+// PBD correction math, then decompose the Cartesian displacement back into
+// graded components. This preserves the proven Phase 2 constraint math while
+// respecting grade separation.
+//
+// The reconstruction is cheap: 2 sin/cos per particle (shared across all
+// constraints touching that particle within a bucket dispatch).
+//
+// No velocity sync needed. In Cartesian Phase 2, velocity sync existed to
+// reconcile pos corrections with vel. In graded Phase 3, delta_r and vel_r
+// are independent Grade 1 scalars — correcting delta_r doesn't affect vel_r.
+// The next frame's integration starts from the corrected position naturally.
+//
+// Set 0: siphon particle layout (only for descriptor compatibility — we read
+//         nothing from pos_x/y/z). Declared so the set 0 layout matches.
+// Set 1: constraint data (pairs, rest_lengths, inv_masses) — unchanged.
+// Set 2: graded particle state (read r, phi, delta_r, delta_y; write delta_r, delta_y).
+//
+// Dispatch: ceil(constraint_count / 64) workgroups of 64 threads, once per
+// bucket, 7 buckets per solver iteration (6 lattice + 1 joint).
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// ============================================================================
+// Set 0 — siphon particle SSBOs (full 16-binding layout for descriptor compat)
+// None of these are actually read or written by this kernel.
+// ============================================================================
+layout(std430, set = 0, binding = 0)  buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion { uint  in_active_region[]; };
+
+// ============================================================================
+// Set 1 — constraint data (static, unchanged from Phase 2)
+// ============================================================================
+layout(std430, set = 1, binding = 0) readonly buffer ConstraintPairs { uvec2 pairs[];        };
+layout(std430, set = 1, binding = 1) readonly buffer RestLengths     { float rest_lengths[]; };
+layout(std430, set = 1, binding = 2) readonly buffer InvMasses       { float inv_m[];        };
+
+// ============================================================================
+// Set 2 — graded particle state
+// ============================================================================
+layout(std430, set = 2, binding = 0)  readonly  buffer GR       { float g_r[];         };
+layout(std430, set = 2, binding = 1)            buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2)            buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3)  readonly  buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4)  readonly  buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5)  readonly  buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6)  readonly  buffer GOmegaOrb{ float g_omega_orb[]; };
+layout(std430, set = 2, binding = 7)  readonly  buffer GTheta   { float g_theta[];     };
+layout(std430, set = 2, binding = 8)  readonly  buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9)  readonly  buffer GLTilt   { float g_L_tilt[];    };
+
+layout(push_constant) uniform ConstraintPushConstants {
+    uint  constraint_offset;
+    uint  constraint_count;
+    uint  rigid_base;
+    uint  rigid_count;
+    float beta;
+    float compliance;
+    float dt;
+    uint  _pad;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.constraint_count) return;
+
+    uint idx = pc.constraint_offset + k;
+
+    uvec2 pair = pairs[idx];
+    uint i = pair.x;
+    uint j = pair.y;
+
+    // --- Reconstruct Cartesian positions from graded state ---
+    float ri   = g_r[i] + g_delta_r[i];
+    float phii = g_phi[i];
+    float yi   = g_delta_y[i];
+
+    float rj   = g_r[j] + g_delta_r[j];
+    float phij = g_phi[j];
+    float yj   = g_delta_y[j];
+
+    // Cartesian reconstruction
+    float cpi = cos(phii), spi = sin(phii);
+    float cpj = cos(phij), spj = sin(phij);
+
+    vec3 pi = vec3(ri * cpi, yi, ri * spi);
+    vec3 pj = vec3(rj * cpj, yj, rj * spj);
+
+    // --- Standard PBD distance correction (identical to Phase 2) ---
+    vec3 d = pi - pj;
+    float L = length(d);
+    if (L < 1e-6) return;
+
+    float rest = rest_lengths[idx];
+    float C    = L - rest;
+
+    float wi = inv_m[i - pc.rigid_base];
+    float wj = inv_m[j - pc.rigid_base];
+    float w_sum = wi + wj;
+    if (w_sum < 1e-6) return;
+
+    float s = pc.beta * C / (w_sum * L);
+
+    vec3 corr_i = -s * wi * d;
+    vec3 corr_j = +s * wj * d;
+
+    // --- Decompose Cartesian correction back into graded (Grade 1 only) ---
+    // The correction is a small displacement. We project it onto the
+    // radial and vertical directions at each particle's current phi.
+    //
+    // For particle i at phase phi_i:
+    //   delta_r_correction = corr_x * cos(phi_i) + corr_z * sin(phi_i)
+    //   delta_y_correction = corr_y
+    //
+    // The tangential component (corr perpendicular to r̂ in xz-plane)
+    // is intentionally dropped — it would modify phi (Grade 2), which
+    // constraints must not touch. For lattice particles at r≈50 with
+    // spacing 0.5, the tangential component of a PBD correction is
+    // <1% of the radial component, so dropping it has negligible effect
+    // on constraint convergence.
+
+    float dr_i = corr_i.x * cpi + corr_i.z * spi;
+    float dy_i = corr_i.y;
+
+    float dr_j = corr_j.x * cpj + corr_j.z * spj;
+    float dy_j = corr_j.y;
+
+    // --- Write Grade 1 corrections (vertex-disjoint within bucket) ---
+    g_delta_r[i] += dr_i;
+    g_delta_y[i] += dy_i;
+
+    g_delta_r[j] += dr_j;
+    g_delta_y[j] += dy_j;
+}

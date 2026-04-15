@@ -1,0 +1,97 @@
+// collision_apply_graded.comp — Phase 3.4: velocity writeback to graded state
+// ============================================================================
+// Reads Cartesian vel_delta[k*3] (int32 fixed-point), decomposes into
+// radial and vertical components at each particle's phi, and applies to
+// g_vel_r and g_vel_y (Grade 1).
+//
+// Unlike the Cartesian collision_apply, this kernel does NOT integrate
+// position. Position integration is the graded siphon's job (Phase 3.2).
+// This kernel only modifies velocity — pure Grade 1 operation.
+//
+// No snapshot/sync needed. The velocity sync existed in Phase 2 because
+// constraint corrections to position weren't reflected in velocity. In
+// graded Phase 3, constraints write delta_r/delta_y (Grade 1 position)
+// and vel_r/vel_y (Grade 1 velocity) are independent — no reconciliation.
+//
+// Dispatch: ceil(rigid_count / 64) workgroups of 64 threads.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Set 0 — siphon layout (declared for descriptor compat, not written)
+layout(std430, set = 0, binding = 0)  buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion { uint  in_active_region[]; };
+
+// Set 1 — collision data
+layout(std430, set = 1, binding = 0) readonly buffer RigidBodyId       { uint  rigid_body_id[]; };
+layout(std430, set = 1, binding = 1)          buffer VelDelta          { int   vel_delta[];     };
+layout(std430, set = 1, binding = 2)          buffer ContactCount      { uint  contact_count[]; };
+layout(std430, set = 1, binding = 3)          buffer FirstContactFrame { uint  first_contact_frame[]; };
+
+// Set 2 — graded particle state (write vel_r, vel_y)
+layout(std430, set = 2, binding = 0)  readonly buffer GR       { float g_r[];         };
+layout(std430, set = 2, binding = 1)  readonly buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2)  readonly buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3)           buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4)           buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5)  readonly buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6)  readonly buffer GOmegaOrb{ float g_omega_orb[]; };
+layout(std430, set = 2, binding = 7)  readonly buffer GTheta   { float g_theta[];     };
+layout(std430, set = 2, binding = 8)  readonly buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9)  readonly buffer GLTilt   { float g_L_tilt[];    };
+
+layout(push_constant) uniform CollisionApplyPushConstants {
+    uint  rigid_base;
+    uint  rigid_count;
+    float dt;
+    uint  _pad;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.rigid_count) return;
+
+    uint i = pc.rigid_base + k;
+
+    // Read Cartesian velocity delta (fixed-point)
+    const float INV_SCALE = 1.0e-6;
+    float dvx = float(vel_delta[k * 3u + 0u]) * INV_SCALE;
+    float dvy = float(vel_delta[k * 3u + 1u]) * INV_SCALE;
+    float dvz = float(vel_delta[k * 3u + 2u]) * INV_SCALE;
+
+    // Decompose Cartesian impulse into radial and vertical at this particle's phi
+    float phi = g_phi[i];
+    float cp = cos(phi);
+    float sp = sin(phi);
+
+    // Radial component: projection of (dvx, dvz) onto (cos phi, sin phi)
+    float dv_r = dvx * cp + dvz * sp;
+    // Vertical component: direct
+    float dv_y = dvy;
+
+    // The tangential component (-dvx * sin(phi) + dvz * cos(phi)) would modify
+    // omega_orb (Grade 2). We intentionally drop it — collision impulses between
+    // lattice particles at similar phi have negligible tangential component.
+    // For particles at very different phi values, the tangential impulse is
+    // small compared to the radial impulse because the contact normal is
+    // approximately radial in the inter-body frame.
+
+    // Apply to Grade 1 velocity
+    g_vel_r[i] += dv_r;
+    g_vel_y[i] += dv_y;
+}

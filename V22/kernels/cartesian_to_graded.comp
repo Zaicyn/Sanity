@@ -1,0 +1,153 @@
+// cartesian_to_graded.comp — Convert Cartesian SoA to grade-separated state
+// ==========================================================================
+// One-shot kernel run at init time. Reads pos_x/y/z, vel_x/y/z from set 0
+// (Cartesian particle buffers) and writes the grade-separated representation
+// to set 2 (graded buffers).
+//
+// Grade 0 (scalars):  r, pump fields (already in set 0, just copy r)
+// Grade 1 (vectors):  delta_r, delta_y, vel_r, vel_y
+// Grade 2 (bivectors): phi, omega_orb, theta, omega_nat, L_tilt
+//
+// The canonical position is (r, phi, delta_y) in cylindrical coords:
+//   pos_x = r * cos(phi)
+//   pos_y = delta_y
+//   pos_z = r * sin(phi)
+//
+// delta_r starts at 0 (no shell assignment yet — that's Phase 3.2+).
+// For now r = sqrt(pos_x² + pos_z²), the cylindrical radius.
+//
+// Velocity decomposition into (vel_r, vel_tangential, vel_y):
+//   vel_r = (vel_x * cos(phi) + vel_z * sin(phi))   — radial
+//   vel_t = (-vel_x * sin(phi) + vel_z * cos(phi))   — tangential
+//   omega_orb = vel_t / r                              — angular velocity
+//   vel_y = vel_y                                      — vertical (direct)
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Set 0 — Cartesian particle SSBOs (read-only for this kernel)
+// ============================================================================
+
+layout(std430, set = 0, binding = 0)  readonly buffer PosX     { float pos_x[];     };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY     { float pos_y[];     };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ     { float pos_z[];     };
+layout(std430, set = 0, binding = 3)  readonly buffer VelX     { float vel_x[];     };
+layout(std430, set = 0, binding = 4)  readonly buffer VelY     { float vel_y[];     };
+layout(std430, set = 0, binding = 5)  readonly buffer VelZ     { float vel_z[];     };
+layout(std430, set = 0, binding = 12) readonly buffer ThetaSrc { float theta_src[]; };
+layout(std430, set = 0, binding = 13) readonly buffer OmegaSrc { float omega_nat_src[]; };
+layout(std430, set = 0, binding = 14) readonly buffer FlagsSrc { uint  flags_src[]; };
+
+// ============================================================================
+// Set 2 — Graded particle state (write targets)
+//
+// Grade 0: scalars
+//   binding 0: r[N]           — cylindrical radius
+//
+// Grade 1: vectors (translational offsets)
+//   binding 1: delta_r[N]     — radial offset from equilibrium (0 for now)
+//   binding 2: delta_y[N]     — vertical offset (= pos_y directly)
+//   binding 3: vel_r[N]       — radial velocity
+//   binding 4: vel_y[N]       — vertical velocity
+//
+// Grade 2: bivectors (rotation/phase)
+//   binding 5: phi[N]         — orbital azimuthal phase
+//   binding 6: omega_orb[N]   — orbital angular velocity
+//   binding 7: theta[N]       — Viviani phase (copy from set 0)
+//   binding 8: omega_nat[N]   — natural frequency (copy from set 0)
+//   binding 9: L_tilt[N]      — angular momentum tilt from disk normal
+// ============================================================================
+
+layout(std430, set = 2, binding = 0)  writeonly buffer GR      { float g_r[];         };
+layout(std430, set = 2, binding = 1)  writeonly buffer GDeltaR  { float g_delta_r[];   };
+layout(std430, set = 2, binding = 2)  writeonly buffer GDeltaY  { float g_delta_y[];   };
+layout(std430, set = 2, binding = 3)  writeonly buffer GVelR    { float g_vel_r[];     };
+layout(std430, set = 2, binding = 4)  writeonly buffer GVelY    { float g_vel_y[];     };
+layout(std430, set = 2, binding = 5)  writeonly buffer GPhi     { float g_phi[];       };
+layout(std430, set = 2, binding = 6)  writeonly buffer GOmegaOrb{ float g_omega_orb[]; };
+layout(std430, set = 2, binding = 7)  writeonly buffer GTheta   { float g_theta[];     };
+layout(std430, set = 2, binding = 8)  writeonly buffer GOmegaNat{ float g_omega_nat[]; };
+layout(std430, set = 2, binding = 9)  writeonly buffer GLTilt   { float g_L_tilt[];    };
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float BH_MASS;
+} pc;
+
+const float TWO_PI = 6.28318530718;
+const float ISCO_R = 6.0;
+const uint  PFLAG_ACTIVE = 0x01u;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    // Skip inactive particles — write zeros
+    uint f = flags_src[i];
+    if ((f & PFLAG_ACTIVE) == 0u) {
+        g_r[i] = 0.0;
+        g_delta_r[i] = 0.0;
+        g_delta_y[i] = 0.0;
+        g_vel_r[i] = 0.0;
+        g_vel_y[i] = 0.0;
+        g_phi[i] = 0.0;
+        g_omega_orb[i] = 0.0;
+        g_theta[i] = 0.0;
+        g_omega_nat[i] = 0.0;
+        g_L_tilt[i] = 0.0;
+        return;
+    }
+
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // --- Grade 0: cylindrical radius ---
+    float r_cyl = sqrt(px * px + pz * pz);
+    float r_safe = max(r_cyl, 1e-6);  // avoid atan2 singularity at origin
+
+    // --- Grade 2: orbital phase ---
+    float phi = atan(pz, px);  // atan2(z, x) — azimuthal angle in xz plane
+    if (phi < 0.0) phi += TWO_PI;
+
+    // --- Grade 1: decompose velocity into cylindrical components ---
+    float cos_phi = px / r_safe;  // cos(phi) = x/r
+    float sin_phi = pz / r_safe;  // sin(phi) = z/r
+
+    float v_r = vx * cos_phi + vz * sin_phi;      // radial component
+    float v_t = -vx * sin_phi + vz * cos_phi;      // tangential component
+
+    // --- Grade 2: orbital angular velocity ---
+    float omega = v_t / r_safe;
+
+    // --- Grade 2: angular momentum tilt ---
+    // L = r × v, disk normal is ŷ. Tilt = angle between L and ŷ.
+    // For most particles L ≈ (0, L_y, 0), so tilt ≈ 0.
+    float Lx = py * vz - pz * vy;
+    float Ly = pz * vx - px * vz;
+    float Lz = px * vy - py * vx;
+    float L_mag = sqrt(Lx * Lx + Ly * Ly + Lz * Lz + 1e-8);
+    float cos_tilt = Ly / L_mag;  // dot(L_hat, y_hat)
+    // Clamp to valid range for acos
+    cos_tilt = clamp(cos_tilt, -1.0, 1.0);
+    float tilt = acos(cos_tilt);  // 0 = disk plane, π/2 = polar orbit
+
+    // --- Write graded state ---
+    g_r[i]         = r_cyl;
+    g_delta_r[i]   = 0.0;       // no shell offset yet
+    g_delta_y[i]   = py;        // vertical position IS the offset from disk plane
+    g_vel_r[i]     = v_r;
+    g_vel_y[i]     = vy;
+    g_phi[i]       = phi;
+    g_omega_orb[i] = omega;
+    g_theta[i]     = theta_src[i];
+    g_omega_nat[i] = omega_nat_src[i];
+    g_L_tilt[i]    = tilt;
+}

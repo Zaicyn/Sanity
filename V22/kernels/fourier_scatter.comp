@@ -1,0 +1,77 @@
+// fourier_scatter.comp — Accumulate m=3 Fourier coefficients per radial shell
+// ============================================================================
+// Per particle, compute cos(3*phi) and sin(3*phi) and accumulate into radial
+// shell bins via atomicAdd on fixed-point integers (×10000 scale factor).
+// Also counts particles per shell for normalization.
+//
+// Uses the same CYL_NR=64 radial bins as the cylindrical grid.
+// Output: 3 arrays × 64 uint32 = 768 bytes. Tiny.
+//
+// Dispatch: ceil(N / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Set 0 — Particle state (Cartesian positions for r, packed_meta for active check)
+layout(std430, set = 0, binding = 0) readonly buffer PosX { float pos_x[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PosZ { float pos_z[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PackedMeta { uint packed_meta[]; };
+
+// Set 1 — Fourier accumulation buffers (atomic uint32, fixed-point)
+layout(std430, set = 1, binding = 0) buffer FourierCos3  { uint fourier_cos3[];  };
+layout(std430, set = 1, binding = 1) buffer FourierSin3  { uint fourier_sin3[];  };
+layout(std430, set = 1, binding = 2) buffer FourierCount { uint fourier_count[]; };
+
+layout(push_constant) uniform PushConstants {
+    int N;
+} pc;
+
+const float TWO_PI   = 6.28318530718;
+const float CYL_R_MAX = 200.0;
+const int   CYL_NR    = 64;
+const float CYL_DR    = CYL_R_MAX / float(CYL_NR);
+
+// Fixed-point scale: multiply float by this, cast to int, atomicAdd.
+// 10000 gives 4 decimal places — enough for cos/sin in [-1,1].
+// We store as uint with a bias of 10000 so the value is always positive
+// (avoids issues with atomicAdd on negative values).
+const uint FP_SCALE = 10000u;
+const uint FP_BIAS  = 10000u;  // cos/sin range [-1,1] → [0, 20000]
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint meta = packed_meta[i];
+    uint f = (meta >> 5) & 0x0Fu;
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+
+    float px = pos_x[i];
+    float pz = pos_z[i];
+
+    float r = sqrt(px * px + pz * pz);
+    int ir = int(r / CYL_DR);
+    if (ir < 0 || ir >= CYL_NR) return;
+
+    // Compute azimuthal angle
+    float phi = atan(pz, px);
+    if (phi < 0.0) phi += TWO_PI;
+
+    // m=3 Fourier components
+    float angle = 3.0 * phi;
+    float c3 = cos(angle);
+    float s3 = sin(angle);
+
+    // Convert to biased fixed-point: [-1,1] → [0, 20000]
+    uint c3_fp = uint(int(c3 * float(FP_SCALE)) + int(FP_BIAS));
+    uint s3_fp = uint(int(s3 * float(FP_SCALE)) + int(FP_BIAS));
+
+    atomicAdd(fourier_cos3[ir], c3_fp);
+    atomicAdd(fourier_sin3[ir], s3_fp);
+    atomicAdd(fourier_count[ir], 1u);
+}

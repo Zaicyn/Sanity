@@ -1,0 +1,115 @@
+// scatter.comp — Particle-to-cell scatter (Pass 1), three compile variants
+// ===========================================================================
+// Compile-time variant selector (define at glslc invocation):
+//   -DV21_SCATTER_MODE=0  → baseline (1 shard, max atomic contention)
+//   -DV21_SCATTER_MODE=1  → privatized uniform (8 shards, shard = lane & 7)
+//   -DV21_SCATTER_MODE=2  → privatized squaragon (8 shards, LUT-derived)
+//
+// The three variants have IDENTICAL memory footprint (N_SHARDS * CELLS for
+// modes 1 and 2, N_SHARDS * CELLS for mode 0 with only shard 0 used, so we
+// waste 7/8 of the buffer in baseline mode — but that keeps the descriptor
+// layout uniform across variants and the reduce pass works for all three).
+//
+// After this pass, scatter_reduce.comp sums the 8 shards into grid_density[].
+//
+// Dispatch: ceil(N / 256) workgroups, 256 threads per group.
+
+#version 450
+
+#ifndef V21_SCATTER_MODE
+#define V21_SCATTER_MODE 0
+#endif
+
+#define V21_GRID_SHARD_COUNT 8u
+
+layout(local_size_x = 256) in;
+
+// ----------------------------------------------------------------------------
+// Set 0 — siphon-compatible particle SSBO layout
+// ----------------------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
+
+// ----------------------------------------------------------------------------
+// Set 1 — scatter output buffers
+//   binding 0: grid_density_shards[N_SHARDS * total_cells]
+//   binding 1: particle_cell[N]
+// ----------------------------------------------------------------------------
+layout(std430, set = 1, binding = 0) buffer GridDensityShards { uint grid_density_shards[]; };
+layout(std430, set = 1, binding = 1) buffer ParticleCell      { uint particle_cell[]; };
+
+layout(push_constant) uniform ScatterPushConstants {
+    int   N;
+    int   grid_dim;
+    float grid_cell_size;
+    float grid_half_size;
+} pc;
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+
+// ----------------------------------------------------------------------------
+// Squaragon scatter LUT (V21_SCATTER_LUT from v21_geometry.h line 98)
+// Precomputed O(1) contention-free distribution table — 32 entries, values
+// in [0, 7].
+// ----------------------------------------------------------------------------
+#if V21_SCATTER_MODE == 2
+const uint SQ_SCATTER_LUT[32] = uint[32](
+    6u, 5u, 4u, 1u, 6u, 7u, 1u, 2u, 0u, 0u, 1u, 5u, 6u, 3u, 4u, 7u,
+    6u, 5u, 4u, 1u, 6u, 7u, 1u, 2u, 0u, 0u, 1u, 5u, 6u, 3u, 4u, 7u
+);
+#endif
+
+// ----------------------------------------------------------------------------
+// Shard selector — one of the three modes
+// ----------------------------------------------------------------------------
+uint pickShard(uint lane_id) {
+#if V21_SCATTER_MODE == 0
+    // Baseline: single shard. Every thread writes to shard 0, maximum contention.
+    return 0u;
+#elif V21_SCATTER_MODE == 1
+    // Privatized uniform: round-robin by lane id, 8 shards.
+    return lane_id & 7u;
+#elif V21_SCATTER_MODE == 2
+    // Privatized Squaragon: lane → LUT → [0, 7].
+    return SQ_SCATTER_LUT[lane_id & 31u] & 7u;
+#else
+#error "V21_SCATTER_MODE must be 0, 1, or 2"
+#endif
+}
+
+uint cellIndex(float px, float py, float pz) {
+    float inv_h = 1.0 / pc.grid_cell_size;
+    uint cx = uint(clamp((px + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
+    uint cy = uint(clamp((py + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
+    uint cz = uint(clamp((pz + pc.grid_half_size) * inv_h, 0.0, float(pc.grid_dim - 1)));
+    return cx + cy * uint(pc.grid_dim) + cz * uint(pc.grid_dim * pc.grid_dim);
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & 0x1Au) != 0u) return;  // skip EJECTED|CRYSTAL|NOVA
+
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+
+    uint cell = cellIndex(px, py, pz);
+    uint total_cells = uint(pc.grid_dim * pc.grid_dim * pc.grid_dim);
+    if (cell >= total_cells) return;
+
+    particle_cell[i] = cell;
+
+    // Direct density accumulation into shard 0 (used as canonical density).
+    // 262K cells / 16M particles = ~60 per cell avg — low contention.
+    atomicAdd(grid_density_shards[cell], 1u);
+}

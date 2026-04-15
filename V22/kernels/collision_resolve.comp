@@ -1,0 +1,153 @@
+// collision_resolve.comp — Phase 2.2 C2: fused broadphase + velocity impulse
+// ============================================================================
+// Dispatched 2D over (i_local, j_local) in the upper triangle of the lattice
+// particle index space [0, N_rigid)². Each thread handles one (i, j) pair
+// candidate:
+//
+//   1. Early exit if i_local >= j_local (lower triangle + diagonal).
+//   2. Filter by rigid_body_id[i] != rigid_body_id[j] (same body → skip).
+//   3. Broadphase: squared distance check against CONTACT_THRESHOLD_SQ.
+//   4. Narrow phase: if distance < REST (= 2 * particle_radius = 0.5),
+//      the particles are penetrating.
+//   5. Velocity impulse: compute relative normal velocity, apply
+//      restitution + Baumgarte penetration bias.
+//   6. Accumulate velocity deltas into vel_delta[] via fixed-point int atomicAdd.
+//   7. Increment contact_count and update first_contact_frame probes.
+//
+// Dispatch: 2D, (ceil(N_rigid/16), ceil(N_rigid/16), 1) workgroups of (16, 16, 1).
+// Total threads: N_rigid² / 2 (upper triangle). For N_rigid=2000 this is
+// 2M effective threads, trivially cheap on modern GPUs.
+//
+// The kernel reads pos_x/y/z and vel_x/y/z from set 0, and writes ONLY to
+// vel_delta[] (int32, set 1 binding 1) via atomicAdd. No pos writes, no
+// vel writes — those happen in collision_apply.comp on the next dispatch.
+// This keeps the kernel vertex-race-free by construction: multiple threads
+// CAN write to the same vel_delta[k] slot via atomicAdd, but that's the
+// int-atomic-on-scratch pattern, not a position/velocity coherence issue.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// ----------------------------------------------------------------------------
+// Set 0 — siphon particle SSBOs (full 16-binding layout). Only pos and vel read.
+// ----------------------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  readonly buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  readonly buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  readonly buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  readonly buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  readonly buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) readonly buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) readonly buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) readonly buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) readonly buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) readonly buffer ActiveRegion { uint  in_active_region[]; };
+
+// ----------------------------------------------------------------------------
+// Set 1 — collision data (4 SSBOs, layout matches initCollisionCompute)
+// ----------------------------------------------------------------------------
+layout(std430, set = 1, binding = 0) readonly buffer RigidBodyId       { uint  rigid_body_id[]; };
+layout(std430, set = 1, binding = 1)          buffer VelDelta          { int   vel_delta[];     };
+layout(std430, set = 1, binding = 2)          buffer ContactCount      { uint  contact_count[]; };
+layout(std430, set = 1, binding = 3)          buffer FirstContactFrame { uint  first_contact_frame[]; };
+
+layout(push_constant) uniform CollisionResolvePushConstants {
+    uint  rigid_base;
+    uint  rigid_count;
+    float dt;
+    uint  frame_number;
+} pc;
+
+// Contact parameters — baked as compile-time constants per feedback_compile_constant_first.md.
+// Tune after empirical data, then promote to push constants if sweep data justifies it.
+#define PARTICLE_RADIUS     0.25
+#define REST_DISTANCE       0.5          // 2 * PARTICLE_RADIUS
+#define CONTACT_THRESHOLD   0.75         // 1.5 * REST_DISTANCE (broadphase margin)
+#define CONTACT_THRESHOLD_SQ (CONTACT_THRESHOLD * CONTACT_THRESHOLD)
+#define RESTITUTION         0.5          // half-elastic rebound
+#define BAUMGARTE_BETA      0.2          // penetration removal rate
+#define FIXED_POINT_SCALE   1000000.0    // 1e6
+
+void main() {
+    uint i_local = gl_GlobalInvocationID.x;
+    uint j_local = gl_GlobalInvocationID.y;
+
+    // Upper triangle only: i_local < j_local
+    if (i_local >= pc.rigid_count) return;
+    if (j_local >= pc.rigid_count) return;
+    if (i_local >= j_local) return;
+
+    uint i = pc.rigid_base + i_local;
+    uint j = pc.rigid_base + j_local;
+
+    // Same body → skip (no self-collision within one cube's lattice)
+    if (rigid_body_id[i] == rigid_body_id[j]) return;
+
+    // --- Broadphase: squared distance early exit ---
+    float dx = pos_x[j] - pos_x[i];
+    float dy = pos_y[j] - pos_y[i];
+    float dz = pos_z[j] - pos_z[i];
+    float L_sq = dx*dx + dy*dy + dz*dz;
+
+    if (L_sq > CONTACT_THRESHOLD_SQ) return;
+
+    // --- Narrow phase: actual penetration check ---
+    float L = sqrt(L_sq);
+    if (L >= REST_DISTANCE) return;  // unilateral: no penetration, no response
+
+    // Contact normal: points from i toward j
+    float inv_L = 1.0 / max(L, 1e-6);
+    float nx = dx * inv_L;
+    float ny = dy * inv_L;
+    float nz = dz * inv_L;
+
+    float penetration = REST_DISTANCE - L;
+
+    // --- Velocity impulse computation ---
+    float vix = vel_x[i], viy = vel_y[i], viz = vel_z[i];
+    float vjx = vel_x[j], vjy = vel_y[j], vjz = vel_z[j];
+
+    // Relative velocity along contact normal (negative = approaching)
+    float v_rel = (vjx - vix) * nx + (vjy - viy) * ny + (vjz - viz) * nz;
+
+    // Baumgarte penetration bias: velocity-level correction that removes
+    // penetration over ~5 frames (beta/dt gives the per-frame target)
+    float bias = BAUMGARTE_BETA * penetration / pc.dt;
+
+    // Only resolve if approaching OR stuck in penetration
+    if (v_rel >= 0.0 && bias < 1e-4) return;
+
+    // Both particles have equal inverse mass (1.0 for MVP lattice particles)
+    // w_sum = w_i + w_j = 2.0
+    const float W_SUM = 2.0;
+
+    // Impulse magnitude: j > 0 pushes particles apart
+    float j_mag = (-(1.0 + RESTITUTION) * v_rel + bias) / W_SUM;
+
+    // Velocity deltas: dv_i = -j * w_i * n, dv_j = +j * w_j * n
+    // With w_i = w_j = 1.0:
+    float dvi_x = -j_mag * nx;
+    float dvi_y = -j_mag * ny;
+    float dvi_z = -j_mag * nz;
+    float dvj_x =  j_mag * nx;
+    float dvj_y =  j_mag * ny;
+    float dvj_z =  j_mag * nz;
+
+    // --- Fixed-point accumulation into vel_delta ---
+    atomicAdd(vel_delta[i_local * 3u + 0u], int(dvi_x * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[i_local * 3u + 1u], int(dvi_y * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[i_local * 3u + 2u], int(dvi_z * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 0u], int(dvj_x * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 1u], int(dvj_y * FIXED_POINT_SCALE));
+    atomicAdd(vel_delta[j_local * 3u + 2u], int(dvj_z * FIXED_POINT_SCALE));
+
+    // --- Probe: contact count + first-contact detection ---
+    atomicAdd(contact_count[0], 1u);
+    atomicMin(first_contact_frame[0], pc.frame_number);
+}

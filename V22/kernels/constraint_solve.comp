@@ -1,0 +1,114 @@
+// constraint_solve.comp — Pass 4 distance-constraint solver (PBD)
+// ============================================================================
+// Minimum-viable GPU position-based-dynamics solver for distance constraints.
+// Used by the constraint_experiment to test whether GPU constraint work
+// disturbs the Viviani sort's gather-cache-coherence win.
+//
+// For each constraint pair (i, j, rest_length):
+//   1. Read pos_i, pos_j from set 0.
+//   2. Compute current length L = |pos_i - pos_j|.
+//   3. Derive correction s = beta * (L - rest) / ((w_i + w_j) * L).
+//   4. Write corrected positions back to pos_x/y/z.
+//
+// The host dispatches one thread per constraint in the current bucket, where
+// buckets are pre-colored by (axis, parity-of-starting-endpoint) on a regular
+// 3D lattice. Within one bucket, no two constraints share a particle, so
+// direct in-place position writes never race — true sequential Gauss-Seidel
+// without float atomics.
+//
+// Between buckets the host inserts a memory barrier so later buckets see
+// earlier buckets' pos writes. 4 outer iterations per frame (hardcoded).
+//
+// Set 0 uses siphon's particle layout (only pos_x/y/z are actually touched)
+// for descriptor set compatibility.
+// Set 1 holds the constraint pair list, rest lengths, and per-particle
+// inverse masses.
+//
+// Dispatch: ceil(constraint_count / 64) workgroups of 64 threads, once per
+// bucket, 6 buckets per solver iteration.
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// ----------------------------------------------------------------------------
+// Set 0 — siphon particle SSBOs (full 16-binding layout, reused via
+// phys.descLayout). Only pos_x/y/z are read and written; the rest are declared
+// so we can share the descriptor set without a bespoke layout.
+// ----------------------------------------------------------------------------
+layout(std430, set = 0, binding = 0)  buffer PosX         { float pos_x[];          };
+layout(std430, set = 0, binding = 1)  buffer PosY         { float pos_y[];          };
+layout(std430, set = 0, binding = 2)  buffer PosZ         { float pos_z[];          };
+layout(std430, set = 0, binding = 3)  buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion { uint  in_active_region[]; };
+
+// ----------------------------------------------------------------------------
+// Set 1 — constraint data (static, uploaded once at init time)
+//   binding 0: pairs[M]         (uvec2, absolute particle indices)
+//   binding 1: rest_lengths[M]  (float)
+//   binding 2: inv_masses[N_rigid] (float, indexed by i - rigid_base)
+// ----------------------------------------------------------------------------
+layout(std430, set = 1, binding = 0) readonly buffer ConstraintPairs { uvec2 pairs[];        };
+layout(std430, set = 1, binding = 1) readonly buffer RestLengths     { float rest_lengths[]; };
+layout(std430, set = 1, binding = 2) readonly buffer InvMasses       { float inv_m[];        };
+
+layout(push_constant) uniform ConstraintPushConstants {
+    uint  constraint_offset;   // start of the current bucket in pairs[]
+    uint  constraint_count;    // size of the current bucket
+    uint  rigid_base;          // = N_field, first lattice particle index
+    uint  rigid_count;         // = N_rigid (1000 for cube1000)
+    float beta;                // Baumgarte coefficient (0.2)
+    float compliance;          // XPBD compliance (0.0 for MVP, placeholder)
+    float dt;
+    uint  _pad;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.constraint_count) return;
+
+    uint idx = pc.constraint_offset + k;
+
+    uvec2 pair = pairs[idx];
+    uint i = pair.x;
+    uint j = pair.y;
+
+    vec3 pi = vec3(pos_x[i], pos_y[i], pos_z[i]);
+    vec3 pj = vec3(pos_x[j], pos_y[j], pos_z[j]);
+    vec3 d  = pi - pj;
+    float L = length(d);
+    if (L < 1e-6) return;   // degenerate — particles coincident, skip.
+
+    float rest = rest_lengths[idx];
+    float C    = L - rest;  // signed constraint violation
+
+    float wi = inv_m[i - pc.rigid_base];
+    float wj = inv_m[j - pc.rigid_base];
+    float w_sum = wi + wj;
+    if (w_sum < 1e-6) return;   // both endpoints pinned.
+
+    // Baumgarte-softened PBD correction. Unit direction d/L times the
+    // fraction of the violation each endpoint should absorb, scaled by beta.
+    float s = pc.beta * C / (w_sum * L);
+
+    vec3 corr_i = -s * wi * d;
+    vec3 corr_j = +s * wj * d;
+
+    pos_x[i] = pi.x + corr_i.x;
+    pos_y[i] = pi.y + corr_i.y;
+    pos_z[i] = pi.z + corr_i.z;
+    pos_x[j] = pj.x + corr_j.x;
+    pos_y[j] = pj.y + corr_j.y;
+    pos_z[j] = pj.z + corr_j.z;
+}

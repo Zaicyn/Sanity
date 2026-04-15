@@ -1,0 +1,172 @@
+// scatter_scan.comp — Work-efficient Blelloch exclusive prefix sum
+// ================================================================
+// Hierarchical 3-level scan for arrays up to 256*1024 = 262144 elements
+// (exactly V21_GRID_CELLS = 64³ = 262144).
+//
+// Dispatched 3 times per frame with different MODE push constants:
+//   MODE 0 (local scan):   Each workgroup scans 256 elements, writes
+//                           block sum to block_sums[wg_id].
+//   MODE 1 (block scan):   Single workgroup scans block_sums[0..1023].
+//   MODE 2 (propagate):    Each workgroup adds its block prefix to all
+//                           local elements.
+//
+// The scan is exclusive: cell_offset[i] = sum of cell_count[0..i-1].
+// This gives the starting write position for particles in cell i.
+//
+// Shared memory: 512 uint (2 elements per thread for Blelloch pattern).
+// Workgroup size: 256 threads, each handles 1 element per dispatch.
+//
+// For MODE 0/2: dispatch ceil(GRID_CELLS / 256) = 1024 workgroups.
+// For MODE 1: dispatch 1 workgroup (scans the 1024 block sums).
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) buffer Data       { uint data[];       };
+layout(std430, set = 0, binding = 1) buffer BlockSums  { uint block_sums[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint N;      // total elements to scan
+    uint mode;   // 0 = local scan, 1 = block scan, 2 = propagate
+} pc;
+
+shared uint temp[512];  // 2× workgroup size for Blelloch
+
+// Work-efficient Blelloch exclusive scan on shared memory.
+// Scans temp[0..n-1] in-place. n must be power of 2, max 512.
+void blelloch_scan(uint n, uint lid) {
+    // Up-sweep (reduce)
+    uint offset = 1;
+    for (uint d = n >> 1; d > 0; d >>= 1) {
+        barrier();
+        if (lid < d) {
+            uint ai = offset * (2 * lid + 1) - 1;
+            uint bi = offset * (2 * lid + 2) - 1;
+            temp[bi] += temp[ai];
+        }
+        offset <<= 1;
+    }
+
+    // Clear last for exclusive scan
+    if (lid == 0) temp[n - 1] = 0;
+
+    // Down-sweep
+    for (uint d = 1; d < n; d <<= 1) {
+        offset >>= 1;
+        barrier();
+        if (lid < d) {
+            uint ai = offset * (2 * lid + 1) - 1;
+            uint bi = offset * (2 * lid + 2) - 1;
+            uint t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    barrier();
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationIndex;
+    uint wg  = gl_WorkGroupID.x;
+
+    if (pc.mode == 0u) {
+        // --- MODE 0: Local scan ---
+        // Each workgroup loads 256 elements, scans them, saves block sum.
+        // We use the 2-element-per-thread Blelloch pattern with n=256.
+        // Load 256 elements into first half of shared (second half unused here).
+        // Actually, for 256 elements with 256 threads we use a simpler approach:
+        // load 1 element per thread, then Hillis-Steele inclusive scan,
+        // then convert to exclusive. This avoids the 2×N shared memory issue.
+
+        uint val = (gid < pc.N) ? data[gid] : 0u;
+        temp[lid] = val;
+        barrier();
+
+        // Hillis-Steele inclusive scan (simpler for n=workgroup_size)
+        for (uint stride = 1; stride < 256u; stride <<= 1) {
+            uint t = (lid >= stride) ? temp[lid - stride] : 0u;
+            barrier();
+            temp[lid] += t;
+            barrier();
+        }
+
+        // Save block total (inclusive sum of last element)
+        if (lid == 255u) {
+            block_sums[wg] = temp[255];
+        }
+
+        // Convert inclusive → exclusive: shift right, first element = 0
+        uint inclusive = temp[lid];
+        barrier();
+        temp[lid] = (lid > 0u) ? temp[lid - 1u] : 0u;
+        // Note: temp[lid-1] was the inclusive scan of the previous element
+        // We need the value BEFORE the current shift, which is the inclusive
+        // scan result shifted by 1. But we already modified temp. Fix:
+        // Use the inclusive result directly.
+        barrier();
+
+        // Actually, simpler: just write exclusive = inclusive - original_value
+        uint exclusive = inclusive - val;
+        if (gid < pc.N) {
+            data[gid] = exclusive;
+        }
+    }
+    else if (pc.mode == 1u) {
+        // --- MODE 1: Scan block sums ---
+        // Single workgroup, scans block_sums[0..N-1] where N ≤ 1024.
+        // Use Hillis-Steele for simplicity (N ≤ 1024, fits in shared).
+
+        // Load up to 256 elements per thread (but we only have 256 threads
+        // and up to 1024 block sums). Handle by having each thread load
+        // multiple elements... actually for 1024 we need 2 elements/thread.
+
+        // For V21: GRID_CELLS=262144, workgroup=256 → 1024 block sums.
+        // We need a workgroup of 512 to scan 1024 in one pass, but we're 256.
+        // Solution: scan 256 at a time with 2 sub-passes, or just use 256
+        // and have each thread handle 4 elements iteratively.
+        //
+        // Simplest correct approach: iterate. Load 256, scan, store back,
+        // carry the total into the next 256.
+
+        uint total_blocks = (pc.N + 255u) / 256u;  // number of block sums
+        uint carry = 0u;
+
+        for (uint chunk = 0; chunk < total_blocks; chunk += 256u) {
+            uint idx = chunk + lid;
+            uint val = (idx < total_blocks) ? block_sums[idx] : 0u;
+            temp[lid] = val;
+            barrier();
+
+            // Hillis-Steele inclusive scan
+            for (uint stride = 1; stride < 256u; stride <<= 1) {
+                uint t = (lid >= stride) ? temp[lid - stride] : 0u;
+                barrier();
+                temp[lid] += t;
+                barrier();
+            }
+
+            // Convert to exclusive + carry
+            uint inclusive = temp[lid];
+            uint exclusive = inclusive - val + carry;
+
+            if (idx < total_blocks) {
+                block_sums[idx] = exclusive;
+            }
+
+            // Carry forward the total of this chunk
+            carry += temp[255];
+            barrier();
+        }
+    }
+    else if (pc.mode == 2u) {
+        // --- MODE 2: Propagate block prefixes ---
+        // Each workgroup adds block_sums[wg_id] to all its elements.
+        uint prefix = block_sums[wg];
+
+        if (gid < pc.N && prefix > 0u) {
+            data[gid] += prefix;
+        }
+    }
+}

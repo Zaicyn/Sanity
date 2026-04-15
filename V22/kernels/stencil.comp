@@ -1,0 +1,96 @@
+// stencil.comp — Pass 2 density gradient stencil (cells → cells)
+// ============================================================================
+// Reads grid_density[cell] and its 6 spatial neighbors (±x, ±y, ±z),
+// computes the central-difference gradient of density, and writes the
+// result to pressure_x/y/z[cell].
+//
+// This is a density-only port of cell_grid_kernels.cuh::computeCellFields.
+// The full CUDA version also reads momentum to compute vorticity curl; we
+// skip that for now because it requires float atomics in Pass 1 and we're
+// optimizing for measurement simplicity (the cache-sensitive access pattern
+// is the neighbor read, not the specific value being computed).
+//
+// The main purpose of this pass is to EXERCISE the neighbor-read cache
+// pattern so the siphon kernel has real pressure data to sample and the
+// end-to-end streaming pipeline can be benchmarked for placement-sensitivity.
+//
+// Dispatch: ceil(total_cells / 256) workgroups. One thread per cell.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Set 0 — grid input/output SSBOs
+//   binding 0: grid_density[total_cells]       (uint, from scatter_reduce)
+//   binding 1: pressure_x[total_cells]          (float, write)
+//   binding 2: pressure_y[total_cells]          (float, write)
+//   binding 3: pressure_z[total_cells]          (float, write)
+layout(std430, set = 0, binding = 0) readonly buffer GridDensity { uint  grid_density[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer PressX    { float pressure_x[];  };
+layout(std430, set = 0, binding = 2) writeonly buffer PressY    { float pressure_y[];  };
+layout(std430, set = 0, binding = 3) writeonly buffer PressZ    { float pressure_z[];  };
+
+layout(push_constant) uniform StencilPushConstants {
+    int   grid_dim;       // e.g. 64
+    int   total_cells;    // grid_dim^3
+    float grid_cell_size; // 2h for the central-difference denominator
+    float pressure_k;     // scale factor for pressure force
+} pc;
+
+void main() {
+    int cell = int(gl_GlobalInvocationID.x);
+    if (cell >= pc.total_cells) return;
+
+    uint rho_u = grid_density[cell];
+    float rho = float(rho_u);
+
+    // Early out on empty cells — still write zero so the output buffer is
+    // valid everywhere, just skip the neighbor reads.
+    if (rho < 0.5) {
+        pressure_x[cell] = 0.0;
+        pressure_y[cell] = 0.0;
+        pressure_z[cell] = 0.0;
+        return;
+    }
+
+    // Unflatten cell index into (cx, cy, cz).
+    int gd = pc.grid_dim;
+    int cx = cell % gd;
+    int cy = (cell / gd) % gd;
+    int cz = cell / (gd * gd);
+
+    int stride_y = gd;
+    int stride_z = gd * gd;
+
+    // Central difference, with boundary guards. On the boundary we set the
+    // gradient in that direction to zero (one-sided would introduce bias).
+    float inv_2h = 1.0 / (2.0 * pc.grid_cell_size);
+
+    float grad_x = 0.0;
+    if (cx > 0 && cx < gd - 1) {
+        float rho_px = float(grid_density[cell + 1]);
+        float rho_mx = float(grid_density[cell - 1]);
+        grad_x = (rho_px - rho_mx) * inv_2h;
+    }
+
+    float grad_y = 0.0;
+    if (cy > 0 && cy < gd - 1) {
+        float rho_py = float(grid_density[cell + stride_y]);
+        float rho_my = float(grid_density[cell - stride_y]);
+        grad_y = (rho_py - rho_my) * inv_2h;
+    }
+
+    float grad_z = 0.0;
+    if (cz > 0 && cz < gd - 1) {
+        float rho_pz = float(grid_density[cell + stride_z]);
+        float rho_mz = float(grid_density[cell - stride_z]);
+        grad_z = (rho_pz - rho_mz) * inv_2h;
+    }
+
+    // Pressure force = -k * ∇ρ / ρ  (pushes toward lower density).
+    // Matches cell_grid_kernels.cuh::computeCellFields line 156.
+    float pressure_scale = -pc.pressure_k / rho;
+    pressure_x[cell] = grad_x * pressure_scale;
+    pressure_y[cell] = grad_y * pressure_scale;
+    pressure_z[cell] = grad_z * pressure_scale;
+}

@@ -1,0 +1,322 @@
+// siphon_forward.comp — Hopfion phase-alignment siphon
+// =====================================================
+// The Hopf map S³→S² decomposes each particle's state into:
+//   chi   = amplitude (from |v|, controls torus embedding)
+//   phi   = observable azimuthal angle (orbital position)
+//   theta = hidden fiber phase (Viviani phase, stored)
+//   psi   = theta - phi (fiber phase, derived)
+//
+// The ONLY dynamical rule: particles whose fiber phase (psi)
+// is aligned with the local collective phase move freely.
+// Misaligned particles are damped. Structure emerges from
+// phase coherence, not from forcing.
+//
+// No artificial damping coefficients. No heartbeat modulation.
+// No velocity injection. Topology IS the physics.
+//
+// Forward-pass: reads buffer A, writes buffer B. Zero RMW
+// except history accumulator.
+//
+// Dispatch: ceil(N / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Set 0 — Input state (read-only this frame)
+// ============================================================================
+layout(std430, set = 0, binding = 0) readonly buffer InR        { float in_r[];         };
+layout(std430, set = 0, binding = 1) readonly buffer InDeltaR   { float in_delta_r[];   };
+layout(std430, set = 0, binding = 2) readonly buffer InDeltaY   { float in_delta_y[];   };
+layout(std430, set = 0, binding = 3) readonly buffer InVelR     { float in_vel_r[];     };
+layout(std430, set = 0, binding = 4) readonly buffer InVelY     { float in_vel_y[];     };
+layout(std430, set = 0, binding = 5) readonly buffer InPhi      { float in_phi[];       };
+layout(std430, set = 0, binding = 6) readonly buffer InOmegaOrb { float in_omega_orb[]; };
+layout(std430, set = 0, binding = 7) readonly buffer InTheta    { float in_theta[];     };
+layout(std430, set = 0, binding = 8) readonly buffer InOmegaNat { float in_omega_nat[]; };
+layout(std430, set = 0, binding = 9) readonly buffer InMeta     { uint  in_meta[];      };
+
+// ============================================================================
+// Set 1 — Output state (write-only this frame)
+// ============================================================================
+layout(std430, set = 1, binding = 0) writeonly buffer OutR        { float out_r[];         };
+layout(std430, set = 1, binding = 1) writeonly buffer OutDeltaY   { float out_delta_y[];   };
+layout(std430, set = 1, binding = 2) writeonly buffer OutVelR     { float out_vel_r[];     };
+layout(std430, set = 1, binding = 3) writeonly buffer OutVelY     { float out_vel_y[];     };
+layout(std430, set = 1, binding = 4) writeonly buffer OutPhi      { float out_phi[];       };
+layout(std430, set = 1, binding = 5) writeonly buffer OutOmegaOrb { float out_omega_orb[]; };
+layout(std430, set = 1, binding = 6) writeonly buffer OutTheta    { float out_theta[];     };
+layout(std430, set = 1, binding = 7) writeonly buffer OutMeta     { uint  out_meta[];      };
+
+// ============================================================================
+// Set 2 — Accumulator (read-modify-write: history EMA only)
+// ============================================================================
+layout(std430, set = 2, binding = 0) buffer History { float history[]; };
+
+// ============================================================================
+// Set 3 — Density feedback (read-only, from cyl_scatter + cyl_stencil)
+// ============================================================================
+layout(std430, set = 3, binding = 0) readonly buffer CylDensity  { uint  cyl_density[];  };
+layout(std430, set = 3, binding = 1) readonly buffer PressureR   { float pressure_r[];   };
+layout(std430, set = 3, binding = 2) readonly buffer PressurePhi { float pressure_phi[]; };
+layout(std430, set = 3, binding = 3) readonly buffer PressureY   { float pressure_y[];   };
+
+// ============================================================================
+// Push constants
+// ============================================================================
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float bias;         // phase-locking strength
+} pc;
+
+// ============================================================================
+// Constants
+// ============================================================================
+const float PI              = 3.14159265358979;
+const float TWO_PI          = 6.28318530718;
+const float SCHW_R          = 2.0;
+const float ISCO_R          = 6.0;
+const float JET_SPEED       = 0.4;
+const float R_SCALE         = 30.0;
+const float L_RETURN        = 0.85;
+
+const int   CYL_NR          = 64;
+const int   CYL_NPHI        = 96;
+const int   CYL_NY          = 32;
+const float CYL_R_MAX       = 200.0;
+const float CYL_Y_HALF      = 100.0;
+const float CYL_DR          = CYL_R_MAX / float(CYL_NR);
+const float CYL_DPHI        = TWO_PI / float(CYL_NPHI);
+const float CYL_DY          = 2.0 * CYL_Y_HALF / float(CYL_NY);
+
+const uint PFLAG_ACTIVE     = 0x01u;
+const uint PFLAG_EJECTED    = 0x02u;
+
+// ============================================================================
+// Main — Hopfion phase-alignment dynamics
+// ============================================================================
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    // ----- Unpack meta -----
+    uint meta = in_meta[i];
+    uint f = (meta >> 5) & 0x0Fu;
+    uint is_active = (meta >> 9) & 0x01u;
+
+    if ((f & PFLAG_ACTIVE) == 0u || (f & PFLAG_EJECTED) != 0u || is_active == 0u) {
+        out_r[i]         = in_r[i];
+        out_delta_y[i]   = in_delta_y[i];
+        out_vel_r[i]     = in_vel_r[i];
+        out_vel_y[i]     = in_vel_y[i];
+        out_phi[i]       = in_phi[i];
+        out_omega_orb[i] = in_omega_orb[i];
+        out_theta[i]     = in_theta[i];
+        out_meta[i]      = meta;
+        return;
+    }
+
+    float r         = in_r[i];
+    float delta_r   = in_delta_r[i];
+    float delta_y   = in_delta_y[i];
+    float vel_r     = in_vel_r[i];
+    float vel_y     = in_vel_y[i];
+    float phi       = in_phi[i];
+    float omega_orb = in_omega_orb[i];
+    float theta_i   = in_theta[i];
+    float omega_i   = in_omega_nat[i];
+    float dt        = pc.dt;
+
+    // =====================================================================
+    // PHASE 1: Viviani phase advance (fiber phase evolves)
+    // =====================================================================
+    theta_i += omega_i * dt;
+    if (theta_i >= TWO_PI) theta_i -= TWO_PI;
+    if (theta_i < 0.0)     theta_i += TWO_PI;
+
+    // =====================================================================
+    // PHASE 2: Viviani transport (S² projection drives velocity)
+    // =====================================================================
+    float r_eff  = r + delta_r;
+    float r_safe = max(r_eff, SCHW_R * 0.5);
+    float r_envelope = sqrt(R_SCALE / max(r_safe, R_SCALE));
+
+    {
+        float s1 = sin(theta_i), c1 = cos(theta_i);
+        float s3 = sin(3.0 * theta_i), c3 = cos(3.0 * theta_i);
+        float cx = s1 - 0.5 * s3;
+        float cy = -c1 + 0.5 * c3;
+        float cz = c1 * c3;
+        float inv_c = inversesqrt(cx*cx + cy*cy + cz*cz + 1e-8);
+        float nhx = cx*inv_c, nhy = cy*inv_c, nhz = cz*inv_c;
+
+        float cp = cos(phi), sp = sin(phi);
+        float v_t = r_safe * omega_orb;
+        float vx = vel_r * cp - v_t * sp;
+        float vy = vel_y;
+        float vz = vel_r * sp + v_t * cp;
+
+        float ax = nhy*vz - nhz*vy;
+        float ay = nhz*vx - nhx*vz;
+        float az = nhx*vy - nhy*vx;
+        float dvx = ay*vz - az*vy;
+        float dvy = az*vx - ax*vz;
+        float dvz = ax*vy - ay*vx;
+
+        float dv_r = dvx * cp + dvz * sp;
+        float dv_t = -dvx * sp + dvz * cp;
+
+        vel_r     += pc.FIELD_STRENGTH * dv_r * r_envelope * dt;
+        omega_orb += pc.FIELD_STRENGTH * dv_t / max(r_safe, 1e-6) * r_envelope * dt;
+        vel_y     += pc.FIELD_STRENGTH * dvy * r_envelope * dt;
+    }
+
+    // =====================================================================
+    // PHASE 3: Orbital-plane damping (vel_y only)
+    // =====================================================================
+    if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
+        float r3 = r_safe * r_safe * r_safe;
+        float omega_z = sqrt(pc.BH_MASS / max(r3, 1.0));
+        float damping = min(2.0 * omega_z, 0.50);
+        vel_y += vel_y * (-damping);
+    }
+
+    // NaN guard
+    if (isinf(vel_r) || isnan(vel_r) || isinf(omega_orb) || isnan(omega_orb)) {
+        out_r[i] = in_r[i]; out_delta_y[i] = in_delta_y[i];
+        out_vel_r[i] = in_vel_r[i]; out_vel_y[i] = in_vel_y[i];
+        out_phi[i] = in_phi[i]; out_omega_orb[i] = in_omega_orb[i];
+        out_theta[i] = in_theta[i]; out_meta[i] = meta;
+        return;
+    }
+
+    // =====================================================================
+    // PHASE 4: Position integration with L conservation
+    // =====================================================================
+    float r_old = r;
+    r += vel_r * dt;
+    r = max(r, 0.01);
+    float r_ratio = r_old / r;
+    omega_orb *= r_ratio * r_ratio;
+
+    phi += omega_orb * dt;
+    delta_y += vel_y * dt;
+
+    if (phi >= TWO_PI) phi -= TWO_PI;
+    if (phi < 0.0)     phi += TWO_PI;
+
+    r_safe = max(r + delta_r, SCHW_R * 0.5);
+
+    // =====================================================================
+    // PHASE 5: Hopf fiber phase-alignment (replaces ALL damping)
+    // =====================================================================
+    // psi = theta - phi is the Hopf fiber phase.
+    // When psi is aligned with the m=3 collective phase, the particle
+    // is "in phase" with the structure → moves freely.
+    // When misaligned → velocity is damped toward alignment.
+    //
+    // The m=3 collective phase with logarithmic winding:
+    //   Phi_m3 = 3*(phi - 0.3*ln(r)) - omega_p * t
+    //
+    // Alignment = cos(3*theta - Phi_m3)
+    // This couples the Viviani fiber (theta) to the spiral structure (phi, r)
+    // through the Hopf map.
+    {
+        const float OMEGA_PATTERN = 0.004;
+        float phi_m3 = 3.0 * phi - 0.3 * 3.0 * log(max(r_safe, 1.0)) - 3.0 * OMEGA_PATTERN * pc.time;
+
+        // Fiber phase: how aligned is the Viviani phase with the spiral?
+        float psi = 3.0 * theta_i - phi_m3;
+        float align = cos(psi);
+
+        // Phase-alignment damping:
+        // align ≈ +1: particle in phase with arm → gamma ≈ 0 (free motion)
+        // align ≈ -1: particle out of phase → gamma = GAMMA_MAX (strong damping)
+        // This is the Hopf phase-locking: misaligned fiber → dissipation
+        float gamma = pc.bias * 0.04 * (1.0 - align);  // 0 when aligned, max when anti-aligned
+
+        float vr_before = vel_r;
+        vel_r *= (1.0 - gamma);
+        float vr_removed = vr_before - vel_r;
+
+        // L-conservation: return damped radial KE to tangential
+        float vr_return = vr_removed * L_RETURN;
+        float v_phi = r_safe * omega_orb;
+        float v_phi_sq_new = v_phi * v_phi + vr_return * vr_return;
+        float v_phi_new = sqrt(v_phi_sq_new);
+        if (v_phi < 0.0) v_phi_new = -v_phi_new;
+        omega_orb = v_phi_new / max(r_safe, 1e-6);
+
+        // Theta evolves freely via omega_nat (set in PHASE 1).
+        // NO explicit phase-locking of theta — that would kill differential
+        // rotation and prevent shear. The fiber alignment emerges from the
+        // damping selectivity above: aligned particles survive, misaligned
+        // particles lose radial energy. This IS the phase-locking, operating
+        // through dissipation rather than direct phase adjustment.
+    }
+
+    // =====================================================================
+    // PHASE 6: Pressure gradient force (self-consistent density feedback)
+    // =====================================================================
+    {
+        int ir   = int(r_safe / CYL_DR);
+        int iphi = int(phi / CYL_DPHI);
+        int iy   = int((delta_y + CYL_Y_HALF) / CYL_DY);
+        if (ir >= 0 && ir < CYL_NR &&
+            iphi >= 0 && iphi < CYL_NPHI &&
+            iy >= 0 && iy < CYL_NY) {
+            int cell = ir + iphi * CYL_NR + iy * CYL_NR * CYL_NPHI;
+
+            // Pressure gradient → radial/azimuthal/vertical force
+            vel_r     += pressure_r[cell] * dt;
+            omega_orb += pressure_phi[cell] / max(r_safe, 1e-6) * dt;
+            vel_y     += pressure_y[cell] * dt;
+        }
+    }
+
+    // =====================================================================
+    // PHASE 7: Coherence memory + ejection
+    // =====================================================================
+    float v_t = r_safe * omega_orb;
+    float v_mag = sqrt(vel_r*vel_r + v_t*v_t + vel_y*vel_y + 1e-8);
+    float alignment = abs(vel_r) / v_mag;
+
+    float hist = history[i];
+    hist = hist * (1.0 - 0.01) + alignment * 0.04;
+    hist = min(hist, 4.0);
+
+    bool eject = (r_safe < ISCO_R * 8.0) && (hist > 1.2);
+    if (eject) {
+        float muzzle = hist * JET_SPEED;
+        float collimation = clamp(1.0 - (r_safe - SCHW_R) / (ISCO_R * 2.0), 0.0, 1.0);
+        vel_y += muzzle * collimation;
+        vel_r += muzzle * (1.0 - collimation);
+        hist *= 0.3;
+        f = f | PFLAG_EJECTED;
+    }
+
+    // =====================================================================
+    // Write output
+    // =====================================================================
+    out_r[i]         = r;
+    out_delta_y[i]   = delta_y;
+    out_vel_r[i]     = vel_r;
+    out_vel_y[i]     = vel_y;
+    out_phi[i]       = phi;
+    out_omega_orb[i] = omega_orb;
+    out_theta[i]     = theta_i;
+
+    uint meta_out = (meta & 0x07u)          // pump state (passthrough)
+                  | ((meta >> 3) & 0x03u) << 3  // coh_count (passthrough)
+                  | ((f & 0x0Fu) << 5)
+                  | ((is_active & 0x01u) << 9);
+    out_meta[i] = meta_out;
+
+    history[i] = hist;
+}

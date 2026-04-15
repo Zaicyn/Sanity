@@ -1,0 +1,52 @@
+// fourier_normalize.comp — Compute m=3 amplitude and phase per radial shell
+// ============================================================================
+// Reads the fixed-point atomic accumulators from fourier_scatter, converts
+// back to float, normalizes by particle count, and outputs A3(r) and psi3(r).
+//
+// Dispatch: 1 workgroup of 64 threads (one thread per radial shell).
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+// Set 0 — Raw Fourier accumulators (fixed-point uint32 from scatter)
+layout(std430, set = 0, binding = 0) readonly buffer FourierCos3  { uint fourier_cos3[];  };
+layout(std430, set = 0, binding = 1) readonly buffer FourierSin3  { uint fourier_sin3[];  };
+layout(std430, set = 0, binding = 2) readonly buffer FourierCount { uint fourier_count[]; };
+
+// Set 0 — Normalized output (float)
+layout(std430, set = 0, binding = 3) writeonly buffer FourierA3   { float fourier_A3[];   };
+layout(std430, set = 0, binding = 4) writeonly buffer FourierPsi3 { float fourier_psi3[]; };
+
+const uint FP_SCALE = 10000u;
+const uint FP_BIAS  = 10000u;
+const int  CYL_NR   = 64;
+
+void main() {
+    int shell = int(gl_GlobalInvocationID.x);
+    if (shell >= CYL_NR) return;
+
+    uint count = fourier_count[shell];
+    if (count == 0u) {
+        fourier_A3[shell]   = 0.0;
+        fourier_psi3[shell] = 0.0;
+        return;
+    }
+
+    // Undo bias: each particle contributed (value * FP_SCALE + FP_BIAS).
+    // Sum of N contributions = sum(value_i * FP_SCALE) + N * FP_BIAS.
+    // Mean = (raw_sum - N * FP_BIAS) / (N * FP_SCALE)
+    float raw_cos = float(fourier_cos3[shell]);
+    float raw_sin = float(fourier_sin3[shell]);
+    float n = float(count);
+
+    float mean_cos = (raw_cos - n * float(FP_BIAS)) / (n * float(FP_SCALE));
+    float mean_sin = (raw_sin - n * float(FP_BIAS)) / (n * float(FP_SCALE));
+
+    // Amplitude and phase of the m=3 mode
+    float A3 = sqrt(mean_cos * mean_cos + mean_sin * mean_sin);
+    float psi3 = atan(mean_sin, mean_cos);
+
+    fourier_A3[shell]   = A3;
+    fourier_psi3[shell] = psi3;
+}

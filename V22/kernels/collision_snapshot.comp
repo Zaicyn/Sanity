@@ -1,0 +1,52 @@
+// collision_snapshot.comp — snapshot lattice positions before constraint solve
+// =============================================================================
+// Captures pos_x/y/z → pos_prev (interleaved float[N_rigid*3]) so that after
+// constraint_solve modifies positions, the velocity_sync pass can compute
+// vel += (pos_new - pos_old) / dt, making velocity consistent with the
+// constraint-corrected positions.
+//
+// Dispatch: ceil(N_rigid / 256) workgroups of 256 threads.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Set 0 — particle SSBOs (only pos_x/y/z read)
+layout(std430, set = 0, binding = 0)  readonly buffer PosX { float pos_x[]; };
+layout(std430, set = 0, binding = 1)  readonly buffer PosY { float pos_y[]; };
+layout(std430, set = 0, binding = 2)  readonly buffer PosZ { float pos_z[]; };
+layout(std430, set = 0, binding = 3)  buffer VelX         { float vel_x[];          };
+layout(std430, set = 0, binding = 4)  buffer VelY         { float vel_y[];          };
+layout(std430, set = 0, binding = 5)  buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 6)  buffer PumpState    { int   pump_state[];     };
+layout(std430, set = 0, binding = 7)  buffer PumpScale    { float pump_scale[];     };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent { int   pump_coherent[];  };
+layout(std430, set = 0, binding = 9)  buffer PumpResidual { float pump_residual[];  };
+layout(std430, set = 0, binding = 10) buffer PumpWork     { float pump_work[];      };
+layout(std430, set = 0, binding = 11) buffer PumpHistory  { float pump_history[];   };
+layout(std430, set = 0, binding = 12) buffer Theta        { float theta[];          };
+layout(std430, set = 0, binding = 13) buffer OmegaNat     { float omega_nat[];      };
+layout(std430, set = 0, binding = 14) buffer Flags        { uint  flags[];          };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion { uint  in_active_region[]; };
+
+// Set 1 — collision data (binding 4 = pos_prev[N_rigid*3])
+layout(std430, set = 1, binding = 0) readonly buffer RigidBodyId       { uint  rigid_body_id[]; };
+layout(std430, set = 1, binding = 1)          buffer VelDelta          { int   vel_delta[];     };
+layout(std430, set = 1, binding = 2)          buffer ContactCount      { uint  contact_count[]; };
+layout(std430, set = 1, binding = 3)          buffer FirstContactFrame { uint  first_contact_frame[]; };
+layout(std430, set = 1, binding = 4)          buffer PosPrev           { float pos_prev[];      };
+
+layout(push_constant) uniform SnapshotPushConstants {
+    uint rigid_base;
+    uint rigid_count;
+} pc;
+
+void main() {
+    uint k = gl_GlobalInvocationID.x;
+    if (k >= pc.rigid_count) return;
+
+    uint i = pc.rigid_base + k;
+    pos_prev[k * 3u + 0u] = pos_x[i];
+    pos_prev[k * 3u + 1u] = pos_y[i];
+    pos_prev[k * 3u + 2u] = pos_z[i];
+}

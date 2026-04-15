@@ -1,0 +1,93 @@
+// cyl_stencil.comp — Cylindrical density gradient (r, phi, y)
+// ============================================================
+// Reads cylindrical density grid, computes central-difference gradients
+// in (r, phi, y). Outputs pressure force components already in
+// cylindrical coordinates — no Cartesian artifacts.
+//
+// Azimuthal gradient wraps periodically (phi is cyclic).
+// Radial boundary: gradient = 0 at r=0 and r=R_MAX edges.
+// Vertical boundary: gradient = 0 at y edges.
+//
+// Dispatch: ceil(CYL_CELLS / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer CylDensity   { uint  cyl_density[];    };
+layout(std430, set = 0, binding = 1) writeonly buffer PressR       { float pressure_r[];     };
+layout(std430, set = 0, binding = 2) writeonly buffer PressPhi     { float pressure_phi[];   };
+layout(std430, set = 0, binding = 3) writeonly buffer PressY       { float pressure_y[];     };
+
+layout(push_constant) uniform PushConstants {
+    float pressure_k;
+} pc;
+
+const int   CYL_NR   = 64;
+const int   CYL_NPHI = 96;
+const int   CYL_NY   = 32;
+const int   CYL_CELLS = CYL_NR * CYL_NPHI * CYL_NY;
+const float CYL_R_MAX  = 200.0;
+const float CYL_Y_HALF = 100.0;
+const float CYL_DR   = CYL_R_MAX / float(CYL_NR);
+const float CYL_DPHI = 6.28318530718 / float(CYL_NPHI);
+const float CYL_DY   = 2.0 * CYL_Y_HALF / float(CYL_NY);
+
+void main() {
+    int cell = int(gl_GlobalInvocationID.x);
+    if (cell >= CYL_CELLS) return;
+
+    // Unflatten: cell = ir + iphi * NR + iy * NR * NPHI
+    int ir   = cell % CYL_NR;
+    int iphi = (cell / CYL_NR) % CYL_NPHI;
+    int iy   = cell / (CYL_NR * CYL_NPHI);
+
+    float rho = float(cyl_density[cell]);
+    if (rho < 0.5) {
+        pressure_r[cell]   = 0.0;
+        pressure_phi[cell] = 0.0;
+        pressure_y[cell]   = 0.0;
+        return;
+    }
+
+    int stride_r   = 1;
+    int stride_phi = CYL_NR;
+    int stride_y   = CYL_NR * CYL_NPHI;
+
+    // Radial gradient (boundary = zero)
+    float grad_r = 0.0;
+    if (ir > 0 && ir < CYL_NR - 1) {
+        float rho_pr = float(cyl_density[cell + stride_r]);
+        float rho_mr = float(cyl_density[cell - stride_r]);
+        grad_r = (rho_pr - rho_mr) / (2.0 * CYL_DR);
+    }
+
+    // Azimuthal gradient (periodic wrap)
+    float grad_phi = 0.0;
+    {
+        int iphi_p = (iphi + 1) % CYL_NPHI;
+        int iphi_m = (iphi - 1 + CYL_NPHI) % CYL_NPHI;
+        int cell_p = ir + iphi_p * CYL_NR + iy * stride_y;
+        int cell_m = ir + iphi_m * CYL_NR + iy * stride_y;
+        float rho_pp = float(cyl_density[cell_p]);
+        float rho_mp = float(cyl_density[cell_m]);
+        grad_phi = (rho_pp - rho_mp) / (2.0 * CYL_DPHI);
+    }
+    // Convert to physical azimuthal gradient: (1/r) * d(rho)/d(phi)
+    float r_cell = (float(ir) + 0.5) * CYL_DR;
+    float azimuthal_grad = grad_phi / max(r_cell, CYL_DR);
+
+    // Vertical gradient (boundary = zero)
+    float grad_y = 0.0;
+    if (iy > 0 && iy < CYL_NY - 1) {
+        float rho_py = float(cyl_density[cell + stride_y]);
+        float rho_my = float(cyl_density[cell - stride_y]);
+        grad_y = (rho_py - rho_my) / (2.0 * CYL_DY);
+    }
+
+    // Pressure force = -k * grad(rho) / rho
+    float inv_rho = -pc.pressure_k / rho;
+    pressure_r[cell]   = grad_r * inv_rho;
+    pressure_phi[cell] = azimuthal_grad * inv_rho;
+    pressure_y[cell]   = grad_y * inv_rho;
+}

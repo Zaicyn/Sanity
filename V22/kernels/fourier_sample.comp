@@ -1,0 +1,87 @@
+// fourier_sample.comp — Sparse Fourier sampling with vertical bins
+// ==================================================================
+// Subsamples O(k·log(N)) particles, accumulates azimuthal Fourier
+// coefficients per (radial shell, vertical bin) cell.
+//
+// Output: cos/sin accumulators + cell counts for NUM_MODES × NR × NY cells.
+// Dispatch: ceil(N / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer PosX { float pos_x[]; };
+layout(std430, set = 0, binding = 1) readonly buffer PosY { float pos_y[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PosZ { float pos_z[]; };
+layout(std430, set = 0, binding = 6) readonly buffer PackedMeta { uint packed_meta[]; };
+
+#define NUM_MODES     5
+#define NR           32
+#define NY           32
+#define TOTAL_CELLS  (NR * NY)
+#define TOTAL_COEFFS (NUM_MODES * TOTAL_CELLS)
+
+layout(std430, set = 1, binding = 0) buffer FourierCosAcc  { uint cos_acc[]; };
+layout(std430, set = 1, binding = 1) buffer FourierSinAcc  { uint sin_acc[]; };
+layout(std430, set = 1, binding = 2) buffer CellCount      { uint cell_count[]; };
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    uint  frame_seed;
+    float sample_rate;
+} pc;
+
+const float TWO_PI    = 6.28318530718;
+const float R_MAX     = 200.0;
+const float DR        = R_MAX / float(NR);
+const float Y_HALF    = 30.0;
+const float DY        = 2.0 * Y_HALF / float(NY);
+const uint  FP_SCALE  = 10000u;
+const uint  FP_BIAS   = 10000u;
+const uint  PFLAG_ACTIVE = 0x01u;
+
+uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    uint h = pcg_hash(uint(i) ^ pc.frame_seed);
+    if (h > uint(pc.sample_rate * 4294967296.0)) return;
+
+    uint meta = packed_meta[i];
+    uint f = (meta >> 5) & 0x0Fu;
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+
+    float r = sqrt(px * px + pz * pz);
+    int ir = int(r / DR);
+    if (ir < 0 || ir >= NR) return;
+
+    int iy = int((py + Y_HALF) / DY);
+    iy = clamp(iy, 0, NY - 1);
+
+    float phi = atan(pz, px);
+    if (phi < 0.0) phi += TWO_PI;
+
+    int cell = ir + iy * NR;
+    atomicAdd(cell_count[cell], 1u);
+
+    for (int m = 0; m < NUM_MODES; m++) {
+        float angle = float(m) * phi;
+        float c = cos(angle);
+        float s = sin(angle);
+        uint c_fp = uint(int(c * float(FP_SCALE)) + int(FP_BIAS));
+        uint s_fp = uint(int(s * float(FP_SCALE)) + int(FP_BIAS));
+        int idx = m * TOTAL_CELLS + cell;
+        atomicAdd(cos_acc[idx], c_fp);
+        atomicAdd(sin_acc[idx], s_fp);
+    }
+}

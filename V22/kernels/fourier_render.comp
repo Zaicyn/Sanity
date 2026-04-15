@@ -1,0 +1,178 @@
+// fourier_render.comp — Hopfion field renderer
+// ==============================================
+// Renders the actual Hopf fibration S³→S² as a volumetric field.
+//
+// The Hopf map from spatial coordinates to S² unit vector:
+//   z₁(x) = (x + iy) / (r² + 1)
+//   z₂(x) = (z + i(r² - 1)/2) / (r² + 1)
+//   n = (2Re(z₁z̄₂), 2Im(z₁z̄₂), |z₁|² - |z₂|²)
+//
+// The topological charge density |∇n|² gives the visual intensity.
+// Shell structure from radial modulation at λ = 4×ISCO.
+// m=3 spiral from the azimuthal winding of the Hopf fiber.
+// Vertical structure from the torus cross-sections at different y.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, r32ui) uniform uimage2D density_buf;
+
+layout(set = 0, binding = 1) uniform CameraUBO {
+    mat4  view_proj;
+    float zoom;
+    float aspect;
+    int   width;
+    int   height;
+} cam;
+
+layout(push_constant) uniform PushConstants {
+    float brightness;
+    float time;
+    float omega_pump;
+} pc;
+
+const float PI     = 3.14159265358979;
+const float TWO_PI = 6.28318530718;
+const float ISCO   = 6.0;
+const float LAMBDA = 24.0;
+const float R_SCALE = 80.0;      // scale factor: map simulation coords to unit hopfion
+const float Y_SCALE = 20.0;
+
+// Hopf map: R³ → S² via stereographic projection
+// Input: position in normalized coordinates (|p| ~ 1 at torus core)
+// Output: n-vector on S², fiber phase, and chi (latitude)
+void hopf_map(vec3 p, out vec3 n, out float fiber_phase, out float chi) {
+    float r2 = dot(p, p);
+    float denom = r2 + 1.0;
+    float inv_d = 1.0 / denom;
+
+    // Spinor components z₁ = (x + iy)/(r²+1), z₂ = (z + i(r²-1)/2)/(r²+1)
+    // z₁ = (z1r, z1i), z₂ = (z2r, z2i)
+    float z1r = p.x * inv_d;
+    float z1i = p.y * inv_d;
+    float z2r = p.z * inv_d;
+    float z2i = (r2 - 1.0) * 0.5 * inv_d;
+
+    // |z₁|², |z₂|²
+    float abs_z1_sq = z1r*z1r + z1i*z1i;
+    float abs_z2_sq = z2r*z2r + z2i*z2i;
+
+    // Hopf projection: n = (2Re(z₁z̄₂), 2Im(z₁z̄₂), |z₁|²-|z₂|²)
+    // z₁z̄₂ = (z1r + iz1i)(z2r - iz2i) = (z1r·z2r + z1i·z2i) + i(z1i·z2r - z1r·z2i)
+    float re_z1z2bar = z1r*z2r + z1i*z2i;
+    float im_z1z2bar = z1i*z2r - z1r*z2i;
+
+    n.x = 2.0 * re_z1z2bar;
+    n.y = 2.0 * im_z1z2bar;
+    n.z = abs_z1_sq - abs_z2_sq;
+
+    // Chi: latitude on S² (0 = north pole, π/2 = equator)
+    chi = 0.5 * acos(clamp(n.z, -1.0, 1.0));
+
+    // Fiber phase: arg(z₁) - arg(z₂)
+    float arg_z1 = atan(z1i, z1r);
+    float arg_z2 = atan(z2i, z2r);
+    fiber_phase = arg_z1 - arg_z2;
+}
+
+// Topological charge density: |∂n/∂x|² + |∂n/∂y|² + |∂n/∂z|²
+// Computed via finite differences
+float charge_density(vec3 p, float eps) {
+    vec3 n_px, n_mx, n_py, n_my, n_pz, n_mz;
+    float dummy_f, dummy_c;
+    hopf_map(p + vec3(eps, 0, 0), n_px, dummy_f, dummy_c);
+    hopf_map(p - vec3(eps, 0, 0), n_mx, dummy_f, dummy_c);
+    hopf_map(p + vec3(0, eps, 0), n_py, dummy_f, dummy_c);
+    hopf_map(p - vec3(0, eps, 0), n_my, dummy_f, dummy_c);
+    hopf_map(p + vec3(0, 0, eps), n_pz, dummy_f, dummy_c);
+    hopf_map(p - vec3(0, 0, eps), n_mz, dummy_f, dummy_c);
+
+    vec3 dn_dx = (n_px - n_mx) / (2.0 * eps);
+    vec3 dn_dy = (n_py - n_my) / (2.0 * eps);
+    vec3 dn_dz = (n_pz - n_mz) / (2.0 * eps);
+
+    return dot(dn_dx, dn_dx) + dot(dn_dy, dn_dy) + dot(dn_dz, dn_dz);
+}
+
+float hopfion_density(vec3 world_pos) {
+    // Transform world coordinates to hopfion coordinates
+    // The hopfion lives in a unit ball; scale simulation coords down
+    float r_cyl = length(world_pos.xz);
+    if (r_cyl < 2.0 || r_cyl > 160.0) return 0.0;
+    if (abs(world_pos.y) > Y_SCALE) return 0.0;
+
+    // Normalize to unit hopfion coordinates
+    vec3 p = vec3(world_pos.x / R_SCALE, world_pos.y / Y_SCALE, world_pos.z / R_SCALE);
+
+    // Base hopfion field
+    vec3 n;
+    float fiber_phase, chi;
+    hopf_map(p, n, fiber_phase, chi);
+
+    // Topological charge density — bright where field lines are dense
+    float rho_topo = charge_density(p, 0.01);
+
+    // Modulate with the simulation's structure:
+
+    // Radial shells at λ = 4×ISCO, propagating outward
+    float shell = 1.0 + 0.5 * sin(TWO_PI * r_cyl / LAMBDA - pc.omega_pump * pc.time);
+
+    // m=3 spiral arms from the Hopf fiber winding
+    // The fiber phase naturally has azimuthal structure; modulate with m=3
+    float theta_az = atan(world_pos.z, world_pos.x);
+    float arm = 1.0 + 0.4 * cos(3.0 * theta_az - 0.3 * 3.0 * log(max(r_cyl, 1.0))
+                                - 3.0 * 0.004 * pc.time + fiber_phase);
+
+    // Pump breathing
+    float breath = 1.0 + 0.1 * sin(pc.omega_pump * pc.time);
+
+    // Radial profile: peaked in the disk body
+    float x_r = r_cyl / 50.0;
+    float radial = x_r * exp(-x_r);
+
+    // Combine: topology × shells × arms × breathing × radial
+    return (rho_topo * 50.0 + radial * 0.5) * shell * arm * breath;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 img_size = imageSize(density_buf);
+    if (px.x >= img_size.x || px.y >= img_size.y) return;
+
+    float ndc_x = (float(px.x) + 0.5) / float(img_size.x) * 2.0 - 1.0;
+    float ndc_y = (float(px.y) + 0.5) / float(img_size.y) * 2.0 - 1.0;
+
+    mat4 inv_vp = inverse(cam.view_proj);
+    vec4 near4 = inv_vp * vec4(ndc_x, ndc_y, -1.0, 1.0);
+    vec4 far4  = inv_vp * vec4(ndc_x, ndc_y,  1.0, 1.0);
+    vec3 ray_o = near4.xyz / near4.w;
+    vec3 ray_d = normalize(far4.xyz / far4.w - ray_o);
+
+    // Bounding box intersection
+    float box_r = 160.0;
+    float box_y = Y_SCALE;
+    vec3 inv_d = 1.0 / (ray_d + vec3(1e-8));
+    vec3 t1 = (-vec3(box_r, box_y, box_r) - ray_o) * inv_d;
+    vec3 t2 = ( vec3(box_r, box_y, box_r) - ray_o) * inv_d;
+    vec3 tmin_v = min(t1, t2);
+    vec3 tmax_v = max(t1, t2);
+    float t_enter = max(max(tmin_v.x, tmin_v.y), tmin_v.z);
+    float t_exit  = min(min(tmax_v.x, tmax_v.y), tmax_v.z);
+    t_enter = max(t_enter, 0.0);
+    if (t_enter >= t_exit) return;
+
+    // Ray march
+    const int MAX_STEPS = 48;
+    float dt = (t_exit - t_enter) / float(MAX_STEPS);
+    float accum = 0.0;
+
+    for (int step = 0; step < MAX_STEPS; step++) {
+        float t = t_enter + (float(step) + 0.5) * dt;
+        vec3 p = ray_o + t * ray_d;
+        accum += hopfion_density(p) * dt;
+    }
+
+    uint val = uint(accum * pc.brightness);
+    if (val > 0u) imageAtomicAdd(density_buf, px, val);
+}

@@ -1,0 +1,461 @@
+// siphon.comp — Squaragon V2 Physics Kernel (mode-branched)
+// ==========================================================
+//
+// Three execution paths gated by flow mode:
+//   COAST (31%): gravity + integrate only — no grid, no LUT geometry
+//   ACTIVE (44%): gravity + steering + strong channel — grid read
+//   FLOW (25%): everything — grid + torsion + all channels + gradient
+//
+// Zero trig: all Viviani geometry from precomputed LUTs.
+// Direct grid sampling: pressure gradient from set 1, no per-particle copies.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Set 0: SoA particle buffers
+// ============================================================================
+
+layout(std430, set = 0, binding = 0)  buffer PosX        { float pos_x[];        };
+layout(std430, set = 0, binding = 1)  buffer PosY        { float pos_y[];        };
+layout(std430, set = 0, binding = 2)  buffer PosZ        { float pos_z[];        };
+layout(std430, set = 0, binding = 3)  buffer VelX        { float vel_x[];        };
+layout(std430, set = 0, binding = 4)  buffer VelY        { float vel_y[];        };
+layout(std430, set = 0, binding = 5)  buffer VelZ        { float vel_z[];        };
+layout(std430, set = 0, binding = 12) buffer Theta       { float theta[];        };
+layout(std430, set = 0, binding = 13) buffer OmegaNat    { float omega_nat[];    };
+layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
+// Binding 15 unused — density magnitude computed inline from pressure gradient.
+
+// ============================================================================
+// Set 1: pressure grid (direct sampling, no intermediary)
+// ============================================================================
+
+layout(std430, set = 1, binding = 0) readonly buffer PCell   { uint  particle_cell[]; };
+layout(std430, set = 1, binding = 1) readonly buffer PressX  { float pressure_x[];    };
+layout(std430, set = 1, binding = 2) readonly buffer PressY  { float pressure_y[];    };
+layout(std430, set = 1, binding = 3) readonly buffer PressZ  { float pressure_z[];    };
+layout(std430, set = 1, binding = 4) readonly buffer GDens   { uint  grid_density[];  };
+
+// ============================================================================
+// Push constants
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Squaragon V2 LUTs — precomputed from allocator ground truth
+// ============================================================================
+
+const int FLOW_MODE[32] = int[32](
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1,
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1
+);
+
+const float FLOW_W[32] = float[32](
+    0.000000, 0.263371, 0.231222, 0.227317, 0.340459, 0.163085,-0.216041,-0.319410,
+   -0.259259,-0.319410,-0.216041, 0.163086, 0.340459, 0.227318, 0.231222, 0.263371,
+   -0.000000,-0.263371,-0.231222,-0.227317,-0.340459,-0.163085, 0.216041, 0.319410,
+    0.259259, 0.319410, 0.216041,-0.163086,-0.340459,-0.227317,-0.231222,-0.263371
+);
+
+const vec3 TANGENT[32] = vec3[32](
+    vec3( -1.000000,  0.000000, -0.000000),
+    vec3( -0.138370, -0.331496, -0.933255),
+    vec3(  0.120303, -0.344944, -0.930882),
+    vec3(  0.408600, -0.332813, -0.849871),
+    vec3(  0.857493, -0.171499, -0.485071),
+    vec3(  0.941049,  0.250189,  0.227669),
+    vec3(  0.666393,  0.564428,  0.487177),
+    vec3(  0.386358,  0.836993,  0.387517),
+    vec3(  0.000000,  1.000000,  0.000000),
+    vec3( -0.386358,  0.836993, -0.387517),
+    vec3( -0.666393,  0.564428, -0.487177),
+    vec3( -0.941049,  0.250189, -0.227669),
+    vec3( -0.857493, -0.171499,  0.485071),
+    vec3( -0.408600, -0.332813,  0.849871),
+    vec3( -0.120303, -0.344944,  0.930882),
+    vec3(  0.138370, -0.331496,  0.933255),
+    vec3(  1.000000, -0.000000,  0.000000),
+    vec3(  0.138370,  0.331496, -0.933255),
+    vec3( -0.120303,  0.344944, -0.930882),
+    vec3( -0.408600,  0.332813, -0.849871),
+    vec3( -0.857493,  0.171499, -0.485071),
+    vec3( -0.941049, -0.250189,  0.227669),
+    vec3( -0.666393, -0.564428,  0.487177),
+    vec3( -0.386358, -0.836993,  0.387517),
+    vec3( -0.000000, -1.000000,  0.000000),
+    vec3(  0.386358, -0.836993, -0.387517),
+    vec3(  0.666393, -0.564428, -0.487177),
+    vec3(  0.941049, -0.250189, -0.227669),
+    vec3(  0.857493,  0.171499,  0.485071),
+    vec3(  0.408600,  0.332813,  0.849871),
+    vec3(  0.120303,  0.344944,  0.930882),
+    vec3( -0.138370,  0.331496,  0.933255)
+);
+
+const float Z_COUPLING[32] = float[32](
+     1.000000, 0.815493, 0.353553,-0.162212,-0.500000,-0.544895,-0.353553,-0.108386,
+    -0.000000,-0.108386,-0.353553,-0.544895,-0.500000,-0.162212, 0.353553, 0.815493,
+     1.000000, 0.815493, 0.353553,-0.162212,-0.500000,-0.544895,-0.353553,-0.108386,
+    -0.000000,-0.108386,-0.353553,-0.544895,-0.500000,-0.162212, 0.353553, 0.815493
+);
+
+const vec3 CURVE_PT[32] = vec3[32](
+    vec3(  0.000000, -0.447214,  0.894427),
+    vec3( -0.083063, -0.567568,  0.819126),
+    vec3( -0.096980, -0.896348,  0.432615),
+    vec3(  0.068948, -0.982752, -0.171595),
+    vec3(  0.288675, -0.866025, -0.408248),
+    vec3(  0.528346, -0.752980, -0.392265),
+    vec3(  0.772875, -0.585344, -0.245021),
+    vec3(  0.944624, -0.319859, -0.073314),
+    vec3(  1.000000, -0.000000, -0.000000),
+    vec3(  0.944624,  0.319859, -0.073314),
+    vec3(  0.772875,  0.585344, -0.245021),
+    vec3(  0.528346,  0.752980, -0.392265),
+    vec3(  0.288675,  0.866025, -0.408248),
+    vec3(  0.068948,  0.982752, -0.171595),
+    vec3( -0.096980,  0.896348,  0.432615),
+    vec3( -0.083063,  0.567568,  0.819126),
+    vec3( -0.000000,  0.447214,  0.894427),
+    vec3(  0.083063,  0.567568,  0.819126),
+    vec3(  0.096980,  0.896348,  0.432615),
+    vec3( -0.068948,  0.982752, -0.171595),
+    vec3( -0.288675,  0.866025, -0.408248),
+    vec3( -0.528346,  0.752980, -0.392265),
+    vec3( -0.772875,  0.585344, -0.245021),
+    vec3( -0.944624,  0.319859, -0.073314),
+    vec3( -1.000000,  0.000000, -0.000000),
+    vec3( -0.944624, -0.319859, -0.073314),
+    vec3( -0.772875, -0.585344, -0.245021),
+    vec3( -0.528346, -0.752980, -0.392265),
+    vec3( -0.288675, -0.866025, -0.408248),
+    vec3( -0.068948, -0.982752, -0.171595),
+    vec3(  0.096980, -0.896348,  0.432615),
+    vec3(  0.083063, -0.567568,  0.819126)
+);
+
+// ============================================================================
+// Stellar death constants
+// ============================================================================
+
+const uint PFLAG_ACTIVE   = 0x01u;
+const uint PFLAG_EJECTED  = 0x02u;
+const uint PFLAG_CRYSTAL  = 0x08u;
+const uint PFLAG_NOVA     = 0x10u;  // supernova ejecta — ballistic, gravity only
+
+const float OMEGA_SUPERNOVA = 0.65;  // phase velocity -> detonation
+const float OMEGA_CRYSTAL   = 0.008; // phase velocity -> heat death
+const float DENSITY_MIN_SN  = 0.2;   // density gate for supernova (no vacuum noise)
+const float BLAST_MULT      = 2.5;   // supernova kick = BLAST_MULT * omega_nat
+
+// Omega evolution: driven-damped relaxation toward local equilibrium
+const float OMEGA_BASE     = 0.08;  // natural floor (slightly below init 0.1)
+const float OMEGA_GAIN     = 1.2;   // density coupling → target omega
+const float OMEGA_RESPONSE = 0.5;   // relaxation rate toward target
+const float OMEGA_DECAY    = 0.15;  // COAST exponential decay rate
+const float OMEGA_MAX      = 2.0;   // hard clamp
+
+// ============================================================================
+// Main kernel — mode-branched execution
+// ============================================================================
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+
+    uint f = flags[i];
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if ((f & PFLAG_CRYSTAL) != 0u) return;  // frozen remnant, skip entirely
+
+    // ---- Supernova ejecta: ballistic trajectory, gravity only, no fiber ----
+    if ((f & PFLAG_NOVA) != 0u) {
+        float px = pos_x[i];
+        float py = pos_y[i];
+        float pz = pos_z[i];
+        float vx = vel_x[i];
+        float vy = vel_y[i];
+        float vz = vel_z[i];
+
+        float r3d_sq  = px*px + py*py + pz*pz;
+        float inv_r3d = inversesqrt(r3d_sq + 1e-8);
+        float r_safe  = max(r3d_sq * inv_r3d, 1.0);
+        float inv_r   = 1.0 / r_safe;
+        float gravity  = pc.BH_MASS / (r_safe * r_safe);
+
+        vx -= (px * inv_r) * gravity * pc.dt;
+        vy -= (py * inv_r) * gravity * pc.dt;
+        vz -= (pz * inv_r) * gravity * pc.dt;
+
+        if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz))
+            return;
+
+        pos_x[i] = px + vx * pc.dt;
+        pos_y[i] = py + vy * pc.dt;
+        pos_z[i] = pz + vz * pc.dt;
+        vel_x[i] = vx;
+        vel_y[i] = vy;
+        vel_z[i] = vz;
+        return;
+    }
+
+    // ---- Load minimal state (all modes need this) ----
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // ---- Advance fiber phase (no grid read needed) ----
+    float omega = omega_nat[i];
+    float theta_i = theta[i] + omega * pc.dt;
+    if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
+    if (theta_i < 0.0)           theta_i += 6.28318530718;
+
+    // ---- Mode from ring position ----
+    int gen = int(theta_i * 5.09295817894) & 31;
+    int mode = FLOW_MODE[gen];
+
+    // ---- Distances (all modes need gravity) ----
+    float r3d_sq  = px*px + py*py + pz*pz;
+    float inv_r3d = inversesqrt(r3d_sq + 1e-8);
+    float r3d     = r3d_sq * inv_r3d;
+    float r_safe  = max(r3d, 1.0);
+    float inv_r   = 1.0 / r_safe;
+
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    float gravity = pc.BH_MASS / (r_safe * r_safe);
+
+    float ax = -rx * gravity;
+    float ay = -ry * gravity;
+    float az = -rz * gravity;
+
+    // ======================================================================
+    // COAST (mode 0): gravity only — skip grid, LUTs, steering, everything
+    // 31% of particles take this path. No memory reads beyond pos/vel/theta.
+    // ======================================================================
+    if (mode == 0) {
+        // ---- Omega decay: no coupling in COAST, exponential drain ----
+        omega *= (1.0 - OMEGA_DECAY * pc.dt);
+        omega = max(omega, 0.0);
+
+        // ---- Crystallization check: low omega + COAST + low velocity = heat death ----
+        float speed_sq = vx*vx + vy*vy + vz*vz;
+        if (omega < OMEGA_CRYSTAL && speed_sq < 0.01) {
+            vel_x[i] = 0.0;
+            vel_y[i] = 0.0;
+            vel_z[i] = 0.0;
+            omega_nat[i] = 0.0;
+            theta[i] = theta_i;
+            flags[i] = f | PFLAG_CRYSTAL;
+            return;
+        }
+
+        vx += ax * pc.dt;
+        vy += ay * pc.dt;
+        vz += az * pc.dt;
+
+        if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz))
+            return;
+
+        pos_x[i] = px + vx * pc.dt;
+        pos_y[i] = py + vy * pc.dt;
+        pos_z[i] = pz + vz * pc.dt;
+        vel_x[i] = vx;
+        vel_y[i] = vy;
+        vel_z[i] = vz;
+        omega_nat[i] = omega;
+        theta[i] = theta_i;
+        return;
+    }
+
+    // ======================================================================
+    // ACTIVE + FLOW paths — need grid, LUT geometry, steering
+    // ======================================================================
+
+    // ---- Grid read (ACTIVE + FLOW only) ----
+    // Density magnitude computed inline from gradient.
+    uint cell = particle_cell[i];
+    float gx = 0.0, gy = 0.0, gz = 0.0;
+    if (cell < 262144u) {
+        gx = pressure_x[cell];
+        gy = pressure_y[cell];
+        gz = pressure_z[cell];
+    }
+    float rho = sqrt(gx*gx + gy*gy + gz*gz);
+
+    // ---- Radial envelope: field coherence dilutes with distance from dominant node ----
+    // CURVE_PT[gen] is the normalized Viviani curve point for this ring position.
+    // The node sits at the same radius as the particle but at the curve's angular position.
+    // Transport terms (steering, torsion, gradient) are strong near the node, roll off away.
+    #define R_SCALE 25.0
+    vec3 cp_env = CURVE_PT[gen];
+    float dx_n = px - cp_env.x * r_safe;
+    float dy_n = py - cp_env.y * r_safe;
+    float dz_n = pz - cp_env.z * r_safe;
+    float d_node = sqrt(dx_n*dx_n + dy_n*dy_n + dz_n*dz_n);
+    float envelope = 1.0 / (1.0 + d_node / R_SCALE);
+
+    // ---- Density torsion (ACTIVE + FLOW) ----
+    float torsion_boost = 0.5 * rho * envelope;
+    theta_i = theta[i] + omega * (1.0 + torsion_boost) * pc.dt;
+    if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
+    if (theta_i < 0.0)           theta_i += 6.28318530718;
+    gen = int(theta_i * 5.09295817894) & 31;
+
+    // ---- Viviani geometry from LUT ----
+    vec3 tang = TANGENT[gen];
+    float z_coup = Z_COUPLING[gen];
+
+    // ---- Prograde tangent ----
+    float r_xz = sqrt(px*px + pz*pz + 1e-8);
+    float inv_rxz = 1.0 / r_xz;
+    float pgx = -pz * inv_rxz;
+    float pgz =  px * inv_rxz;
+
+    // ---- Viviani modulation ----
+    float f_dot_r = tang.x*rx + tang.y*ry + tang.z*rz;
+    float fpx = tang.x - f_dot_r * rx;
+    float fpy = tang.y - f_dot_r * ry;
+    float fpz = tang.z - f_dot_r * rz;
+    float viviani_mod = fpx*pgx + fpz*pgz;
+
+    float tx = pgx * abs(viviani_mod) + fpx * 0.1;
+    float ty = fpy * 0.1;
+    float tz = pgz * abs(viviani_mod) + fpz * 0.1;
+
+    // ---- EM steering (density-modulated, speed preserved) ----
+    float density_gain = 1.0 + 2.0 * rho;
+    float base_rate = (mode == 2) ? 0.02 : 0.002;
+    float steer_rate = base_rate * density_gain * envelope;
+
+    {
+        float speed_before = sqrt(vx*vx + vy*vy + vz*vz);
+
+        float t_mag = sqrt(tx*tx + ty*ty + tz*tz + 1e-8);
+        float tnx = tx / t_mag, tny = ty / t_mag, tnz = tz / t_mag;
+
+        float v_dot_t = vx*tnx + vy*tny + vz*tnz;
+        vx -= (vx - v_dot_t * tnx) * steer_rate;
+        vy -= (vy - v_dot_t * tny) * steer_rate;
+        vz -= (vz - v_dot_t * tnz) * steer_rate;
+
+        float speed_after = sqrt(vx*vx + vy*vy + vz*vz);
+        float rescale = speed_before / (speed_after + 1e-8);
+        vx *= rescale;
+        vy *= rescale;
+        vz *= rescale;
+    }
+
+    // ---- Strong channel (ACTIVE + FLOW) ----
+    {
+        float strong = z_coup * gravity * 0.1;
+        ax += rx * strong;
+        ay += ry * strong;
+        az += rz * strong;
+    }
+
+    // ---- Density gradient: tangential deflection (ACTIVE + FLOW) ----
+    {
+        float g_dot_r = gx*rx + gy*ry + gz*rz;
+        float grad_strength = 0.1 * rho * envelope;
+        ax += (gx - g_dot_r * rx) * grad_strength;
+        ay += (gy - g_dot_r * ry) * grad_strength;
+        az += (gz - g_dot_r * rz) * grad_strength;
+    }
+
+    // ======================================================================
+    // FLOW only — weak channel + curve point attractor
+    // ======================================================================
+    if (mode == 2) {
+        float flow_w = FLOW_W[gen];
+        vec3 cp = CURVE_PT[gen];
+        float weak_dot_r = cp.x*rx + cp.y*ry + cp.z*rz;
+        float weak_strength = abs(flow_w) * gravity * 0.05;
+        ax += (cp.x - weak_dot_r * rx) * weak_strength;
+        ay += (cp.y - weak_dot_r * ry) * weak_strength;
+        az += (cp.z - weak_dot_r * rz) * weak_strength;
+    }
+
+    // ---- Integrate ----
+    vx += ax * pc.dt;
+    vy += ay * pc.dt;
+    vz += az * pc.dt;
+
+    if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz))
+        return;
+
+    // ======================================================================
+    // Omega evolution: driven-damped relaxation (ACTIVE / FLOW)
+    // rho = pressure gradient magnitude from the grid (real local density signal)
+    // ======================================================================
+    {
+        float drive = rho * envelope;
+        float target = OMEGA_BASE + drive * OMEGA_GAIN;
+
+        // Relax toward density-determined equilibrium
+        omega += (target - omega) * OMEGA_RESPONSE * pc.dt;
+
+        // Nonlinear instability boost — sudden ignition above ~0.4
+        float instability = max(omega - 0.4, 0.0);
+        omega += instability * instability * 0.5 * pc.dt;
+
+        omega = clamp(omega, 0.0, OMEGA_MAX);
+    }
+
+    // ======================================================================
+    // Stellar death checks — after physics, before writeback
+    // ======================================================================
+
+    // ---- Supernova: omega exceeds critical + real density confirms coupling ----
+    if (omega > OMEGA_SUPERNOVA && rho > DENSITY_MIN_SN) {
+        // Blast kick along fiber tangent, scaled by how supercritical we are
+        float blast = BLAST_MULT * omega;
+        vec3 tang_kick = TANGENT[gen];
+
+        vx += tang_kick.x * blast;
+        vy += tang_kick.y * blast;
+        vz += tang_kick.z * blast;
+
+        // Write final state and flag as nova ejecta
+        pos_x[i] = px + vx * pc.dt;
+        pos_y[i] = py + vy * pc.dt;
+        pos_z[i] = pz + vz * pc.dt;
+        vel_x[i] = vx;
+        vel_y[i] = vy;
+        vel_z[i] = vz;
+        omega_nat[i] = OMEGA_SUPERNOVA * 0.5;  // dump excess, prevent re-trigger
+        theta[i] = theta_i;
+        flags[i] = f | PFLAG_NOVA;
+        return;
+    }
+
+    // ---- Normal writeback ----
+    pos_x[i] = px + vx * pc.dt;
+    pos_y[i] = py + vy * pc.dt;
+    pos_z[i] = pz + vz * pc.dt;
+    vel_x[i] = vx;
+    vel_y[i] = vy;
+    vel_z[i] = vz;
+    omega_nat[i] = omega;
+    theta[i] = theta_i;
+}

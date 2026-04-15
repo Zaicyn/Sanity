@@ -1,0 +1,318 @@
+// siphon_packed.comp — Bandwidth-optimized siphon with packed AoS + fused projection
+// ====================================================================================
+// Replaces siphon_graded.comp + graded_to_cartesian.comp with a single kernel that:
+//   1. Reads one packed struct per particle (80 bytes, 5 memory transactions)
+//   2. Runs the full Viviani transport + pump state machine
+//   3. Writes the updated packed struct back
+//   4. Projects to Cartesian pos/vel and writes to set 0 (for scatter/rendering/oracle)
+//
+// This eliminates the separate graded_to_cartesian dispatch and halves the SSBO
+// binding count, cutting memory transactions from ~31 to ~7 per particle.
+//
+// Packed struct layout (80 bytes, std430 aligned):
+//   vec4 k0: r, delta_r, delta_y, vel_r           (core motion)
+//   vec4 k1: vel_y, phi, omega_orb, theta          (phase/angular)
+//   vec4 k2: pump_scale, pump_residual, pump_work, pump_history  (pump dynamics)
+//   vec4 k3: omega_nat, 0, 0, 0                    (cold, 3 spare slots)
+//   uint meta: pump_state:3 | coherent:1 | flags:4 | active:1  (packed control)
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// Packed particle struct (one SSBO, coalesced access)
+// ============================================================================
+
+struct Particle {
+    vec4 k0;    // r, delta_r, delta_y, vel_r
+    vec4 k1;    // vel_y, phi, omega_orb, theta
+    vec4 k2;    // pump_scale, pump_residual, pump_work, pump_history
+    vec4 k3;    // omega_nat, spare, spare, spare
+    uint meta;  // packed flags/state
+};
+
+layout(std430, set = 0, binding = 0) buffer Particles { Particle particles[]; };
+
+// Cartesian output for scatter/rendering/oracle (set 0 bindings 1-6)
+layout(std430, set = 0, binding = 1) writeonly buffer OutPosX { float out_pos_x[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer OutPosY { float out_pos_y[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer OutPosZ { float out_pos_z[]; };
+layout(std430, set = 0, binding = 4) writeonly buffer OutVelX { float out_vel_x[]; };
+layout(std430, set = 0, binding = 5) writeonly buffer OutVelY { float out_vel_y[]; };
+layout(std430, set = 0, binding = 6) writeonly buffer OutVelZ { float out_vel_z[]; };
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+const float TWO_PI           = 6.28318530718;
+const float SCHW_R           = 2.0;
+const float ISCO_R           = 6.0;
+const float PHI_CONST        = 1.6180339887498948;
+const float PHI_EXCESS       = 0.09017;
+const float COHERENCE_GAMMA  = 0.02;
+const float JET_SPEED        = 0.4;
+const float PUMP_EJECT_THRESHOLD = 0.88;
+const int   PUMP_COHERENT_MAX    = 3;
+
+const int PUMP_IDLE               = 0;
+const int PUMP_PRIMED             = 1;
+const int PUMP_UPSTROKE_COHERENT  = 2;
+const int PUMP_UPSTROKE_HOP       = 3;
+const int PUMP_EXPAND             = 4;
+const int PUMP_DOWNSTROKE         = 5;
+const int PUMP_VALVE_OPEN         = 6;
+const int PUMP_RECIRCULATE        = 7;
+
+const uint SEAM_CLOSED   = 0x00u;
+const uint SEAM_UP_ONLY  = 0x01u;
+const uint SEAM_FULL     = 0x03u;
+
+const uint PFLAG_ACTIVE  = 0x01u;
+const uint PFLAG_EJECTED = 0x02u;
+
+// ============================================================================
+// Meta field packing/unpacking
+// ============================================================================
+
+int  unpack_pump_state(uint m)    { return int(m & 0x7u); }
+int  unpack_pump_coherent(uint m) { return int((m >> 3u) & 0x1u); }
+uint unpack_flags(uint m)         { return (m >> 4u) & 0xFu; }
+uint unpack_active(uint m)        { return (m >> 8u) & 0x1u; }
+
+uint pack_meta(int ps, int co, uint fl, uint ar) {
+    return (uint(ps) & 0x7u)
+         | ((uint(co) & 0x1u) << 3u)
+         | ((fl & 0xFu) << 4u)
+         | ((ar & 0x1u) << 8u);
+}
+
+// ============================================================================
+// Viviani transport (same as siphon_graded.comp)
+// ============================================================================
+
+void apply_viviani_transport(
+    float r, float phi, float theta_i,
+    float vel_r_in, float omega_orb_in, float vel_y_in,
+    out float d_vel_r, out float d_omega_orb, out float d_vel_y)
+{
+    float s1 = sin(theta_i), c1 = cos(theta_i);
+    float s3 = sin(3.0 * theta_i), c3 = cos(3.0 * theta_i);
+
+    float cx = s1 - 0.5 * s3;
+    float cy = -c1 + 0.5 * c3;
+    float cz = c1 * c3;
+
+    float inv_c = inversesqrt(cx*cx + cy*cy + cz*cz + 1e-8);
+    float nhx = cx * inv_c, nhy = cy * inv_c, nhz = cz * inv_c;
+
+    float cp = cos(phi), sp = sin(phi);
+    float v_t = r * omega_orb_in;
+    float vx = vel_r_in * cp - v_t * sp;
+    float vy = vel_y_in;
+    float vz = vel_r_in * sp + v_t * cp;
+
+    // axis = n̂ × v
+    float axisx = nhy * vz - nhz * vy;
+    float axisy = nhz * vx - nhx * vz;
+    float axisz = nhx * vy - nhy * vx;
+    // dv = axis × v
+    float dvx = axisy * vz - axisz * vy;
+    float dvy = axisz * vx - axisx * vz;
+    float dvz = axisx * vy - axisy * vx;
+
+    d_vel_r     = pc.FIELD_STRENGTH * (dvx * cp + dvz * sp);
+    d_omega_orb = pc.FIELD_STRENGTH * (-dvx * sp + dvz * cp) / max(r, 1e-6);
+    d_vel_y     = pc.FIELD_STRENGTH * dvy;
+}
+
+// ============================================================================
+// Pump helpers (unchanged from siphon_graded.comp)
+// ============================================================================
+
+float compute_pressure(float scale) { return PHI_EXCESS * sqrt(scale); }
+
+uint select_seam_bits(float coupling) {
+    if (coupling > 0.5) return SEAM_FULL;
+    if (coupling > 0.2) return SEAM_UP_ONLY;
+    return SEAM_CLOSED;
+}
+
+void siphon_state_step(inout int state, inout float scale, inout int coh_count,
+                       inout float residual, inout float work,
+                       uint sb, float pressure, float global_bias,
+                       float tidal_stress, float history)
+{
+    if (state == PUMP_IDLE) { if (sb != 0u) state = PUMP_PRIMED; residual = 0.0; }
+    else if (state == PUMP_PRIMED) { residual = 0.0; if (sb == SEAM_FULL) state = (coh_count < PUMP_COHERENT_MAX) ? PUMP_UPSTROKE_COHERENT : PUMP_UPSTROKE_HOP; }
+    else if (state == PUMP_EXPAND) { state = PUMP_DOWNSTROKE; }
+    else if (state == PUMP_DOWNSTROKE) { state = PUMP_VALVE_OPEN; }
+    else if (state == PUMP_VALVE_OPEN) {
+        float eb = min(global_bias * ((scale > 10.0) ? (1.0 / (1.0 + 0.1 * log2(scale / 10.0))) : 1.0), 1.0);
+        residual = pressure * (1.0 - eb) + tidal_stress * history * 0.1;
+        work += pressure * residual;
+        state = PUMP_RECIRCULATE;
+    }
+    else if (state == PUMP_RECIRCULATE) { state = PUMP_PRIMED; }
+}
+
+void regulate_scale(inout float scale, inout int coh_count) {
+    if (scale > 30.0) {
+        float o = min((scale - 30.0) / 70.0, 1.0);
+        scale *= (1.0 - 0.05 * o * o * o);
+        if (o > 0.3 && coh_count > 0) coh_count--;
+    }
+    if (scale > 100.0) { scale = 24.0; coh_count = 0; }
+}
+
+// ============================================================================
+// Main — single pass: read packed → compute → write packed + Cartesian
+// ============================================================================
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    // ----- Single struct read (5 memory transactions) -----
+    Particle p = particles[i];
+
+    // Unpack meta
+    uint  f      = unpack_flags(p.meta);
+    uint  in_region = unpack_active(p.meta);
+    if ((f & PFLAG_ACTIVE) == 0u) return;
+    if ((f & PFLAG_EJECTED) != 0u) return;
+    if (in_region == 0u) return;
+
+    // Unpack fields from vec4s
+    float r         = p.k0.x;
+    float delta_r   = p.k0.y;
+    float delta_y   = p.k0.z;
+    float vel_r     = p.k0.w;
+
+    float vel_y     = p.k1.x;
+    float phi       = p.k1.y;
+    float omega_orb = p.k1.z;
+    float theta_i   = p.k1.w;
+
+    float scale     = p.k2.x;
+    float residual  = p.k2.y;
+    float work      = p.k2.z;
+    float history   = p.k2.w;
+
+    float omega_i   = p.k3.x;
+
+    int state     = unpack_pump_state(p.meta);
+    int coh_count = unpack_pump_coherent(p.meta);
+
+    // ----- Phase advance -----
+    theta_i += omega_i * pc.dt;
+    if (theta_i >= TWO_PI) theta_i -= TWO_PI;
+    if (theta_i < 0.0)     theta_i += TWO_PI;
+
+    // ----- Viviani transport -----
+    float r_eff = r + delta_r;
+    float r_safe = max(r_eff, SCHW_R * 0.5);
+
+    float d_vel_r, d_omega_orb, d_vel_y;
+    apply_viviani_transport(r_safe, phi, theta_i, vel_r, omega_orb, vel_y,
+                            d_vel_r, d_omega_orb, d_vel_y);
+    vel_r     += d_vel_r * pc.dt;
+    omega_orb += d_omega_orb * pc.dt;
+    vel_y     += d_vel_y * pc.dt;
+
+    // ----- Orbital-plane damping -----
+    if (r_safe > SCHW_R * 2.0 && r_safe < 250.0) {
+        float r3 = r_safe * r_safe * r_safe;
+        float damping = min(2.0 * sqrt(pc.BH_MASS / max(r3, 1.0)), 0.50);
+        vel_y *= (1.0 - damping);
+    }
+
+    // ----- NaN guard -----
+    if (isinf(vel_r) || isnan(vel_r) || isinf(omega_orb) || isnan(omega_orb)) return;
+
+    // ----- Integration with L-conservation -----
+    float r_old = r;
+    r += vel_r * pc.dt;
+    r = max(r, 0.01);
+    float r_ratio = r_old / r;
+    omega_orb *= r_ratio * r_ratio;
+
+    phi += omega_orb * pc.dt;
+    delta_y += vel_y * pc.dt;
+
+    if (phi >= TWO_PI) phi -= TWO_PI;
+    if (phi < 0.0)     phi += TWO_PI;
+
+    r_eff = r + delta_r;
+    r_safe = max(r_eff, SCHW_R * 0.5);
+
+    // ----- Pump state machine -----
+    float heartbeat = cos(phi) * cos(3.0 * phi);
+    float phase_stress = max(cos(phi)*cos(phi), sin(phi)*sin(phi));
+
+    float v_t = r_safe * omega_orb;
+    float v_mag = sqrt(vel_r * vel_r + v_t * v_t + vel_y * vel_y + 1e-8);
+    float circularity = min(abs(v_t) / v_mag, 1.0);
+    uint seam = select_seam_bits(circularity);
+    float pressure = compute_pressure(scale);
+
+    float shear = 0.0, tidal_radial = 0.0;
+    if (r_safe > SCHW_R * 1.5) { float r5 = r_safe*r_safe*r_safe*r_safe*r_safe; shear = 1.5 * sqrt(pc.BH_MASS / r5) * sqrt(scale); }
+    if (r_safe > SCHW_R * 1.2) { float r3 = r_safe*r_safe*r_safe; tidal_radial = pc.BH_MASS / r3 * sqrt(scale); }
+
+    if (state == PUMP_UPSTROKE_COHERENT) { scale = 1.0 + abs(vel_r) / v_mag; coh_count++; state = PUMP_EXPAND; }
+    else if (state == PUMP_UPSTROKE_HOP) { scale = 1.0 + abs(vel_r) / v_mag * PHI_CONST; coh_count = 0; state = PUMP_EXPAND; }
+    else { siphon_state_step(state, scale, coh_count, residual, work, seam, pressure, pc.bias, max(shear, tidal_radial), history); }
+    regulate_scale(scale, coh_count);
+
+    // ----- Ejection -----
+    bool eject = (phase_stress > 0.95) && (r_safe < ISCO_R * 2.5)
+              && (abs(residual) > PUMP_EJECT_THRESHOLD * 0.5);
+    if (eject) {
+        float muzzle = residual * (1.0 + history * 0.5) * JET_SPEED;
+        float collimation = clamp(1.0 - (r_safe - SCHW_R) / (ISCO_R * 2.0), 0.0, 1.0);
+        vel_y += muzzle * collimation;
+        vel_r += muzzle * (1.0 - collimation);
+    }
+
+    // ----- Anisotropic damping -----
+    vel_r *= (1.0 - COHERENCE_GAMMA);
+
+    // ----- Pack and write struct (5 memory transactions) -----
+    p.k0 = vec4(r, delta_r, delta_y, vel_r);
+    p.k1 = vec4(vel_y, phi, omega_orb, theta_i);
+    p.k2 = vec4(scale, residual, work, history * (1.0 - 0.02) + scale * 0.02);
+    // k3 unchanged (omega_nat is constant)
+
+    if (eject) f |= PFLAG_EJECTED;
+    p.meta = pack_meta(state, coh_count, f, in_region);
+
+    particles[i] = p;
+
+    // ----- Fused Cartesian projection (no separate kernel needed) -----
+    float cp = cos(phi), sp = sin(phi);
+    float r_proj = r + delta_r;
+    out_pos_x[i] = r_proj * cp;
+    out_pos_y[i] = delta_y;
+    out_pos_z[i] = r_proj * sp;
+
+    float vt = r_proj * omega_orb;
+    out_vel_x[i] = vel_r * cp - vt * sp;
+    out_vel_y[i] = vel_y;
+    out_vel_z[i] = vel_r * sp + vt * cp;
+}

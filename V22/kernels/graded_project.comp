@@ -1,0 +1,62 @@
+// graded_project.comp — Cylindrical → Cartesian projection
+// =========================================================
+// Lightweight kernel: reads graded state (r, delta_r, delta_y, phi,
+// omega_orb, vel_r, vel_y) and writes Cartesian pos/vel for rendering.
+//
+// Runs after the forward siphon. Reads from whichever buffer was
+// just written (the "pong" buffer), writes to set 0 Cartesian outputs.
+//
+// Memory: 28 B read + 24 B write = 52 B/particle. Pure forward.
+// Dispatch: ceil(N / 256) workgroups.
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Set 0 — Graded state (read-only, from forward siphon output)
+layout(std430, set = 0, binding = 0) readonly buffer InR        { float in_r[];         };
+layout(std430, set = 0, binding = 1) readonly buffer InDeltaY   { float in_delta_y[];   };
+layout(std430, set = 0, binding = 2) readonly buffer InVelR     { float in_vel_r[];     };
+layout(std430, set = 0, binding = 3) readonly buffer InVelY     { float in_vel_y[];     };
+layout(std430, set = 0, binding = 4) readonly buffer InPhi      { float in_phi[];       };
+layout(std430, set = 0, binding = 5) readonly buffer InOmegaOrb { float in_omega_orb[]; };
+// Binding 6: delta_r (shared readonly, not double-buffered)
+layout(std430, set = 0, binding = 6) readonly buffer InDeltaR   { float in_delta_r[];   };
+
+// Set 1 — Cartesian output (write-only, for renderer)
+layout(std430, set = 1, binding = 0) writeonly buffer OutPosX { float out_pos_x[]; };
+layout(std430, set = 1, binding = 1) writeonly buffer OutPosY { float out_pos_y[]; };
+layout(std430, set = 1, binding = 2) writeonly buffer OutPosZ { float out_pos_z[]; };
+layout(std430, set = 1, binding = 3) writeonly buffer OutVelX { float out_vel_x[]; };
+layout(std430, set = 1, binding = 4) writeonly buffer OutVelY { float out_vel_y[]; };
+layout(std430, set = 1, binding = 5) writeonly buffer OutVelZ { float out_vel_z[]; };
+
+layout(push_constant) uniform PushConstants {
+    int N;
+} pc;
+
+void main() {
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= pc.N) return;
+
+    float r       = in_r[i];
+    float delta_r = in_delta_r[i];
+    float delta_y = in_delta_y[i];
+    float vel_r   = in_vel_r[i];
+    float vel_y   = in_vel_y[i];
+    float phi     = in_phi[i];
+    float omega   = in_omega_orb[i];
+
+    float r_proj = r + delta_r;
+    float cp = cos(phi);
+    float sp = sin(phi);
+
+    out_pos_x[i] = r_proj * cp;
+    out_pos_y[i] = delta_y;
+    out_pos_z[i] = r_proj * sp;
+
+    float v_t = r_proj * omega;
+    out_vel_x[i] = vel_r * cp - v_t * sp;
+    out_vel_y[i] = vel_y;
+    out_vel_z[i] = vel_r * sp + v_t * cp;
+}
