@@ -28,12 +28,10 @@ layout(std430, set = 0, binding = 5)  buffer VelZ        { float vel_z[];       
 layout(std430, set = 0, binding = 12) buffer Theta       { float theta[];        };
 layout(std430, set = 0, binding = 13) buffer OmegaNat    { float omega_nat[];    };
 layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
-// Binding 15 (local_density) removed — density magnitude now computed inline
-// from pressure gradient components. Eliminated gather_measure.comp entirely
-// (was 0.86ms/frame of per-particle grid→SSBO copies). See archive/.
+layout(std430, set = 0, binding = 15) readonly buffer LocalDensity { float local_density[]; };
 
 // ============================================================================
-// Set 1: pressure grid (direct sampling, no intermediary)
+// Set 1: pressure grid (shared with gather_measure)
 // ============================================================================
 
 layout(std430, set = 1, binding = 0) readonly buffer PCell   { uint  particle_cell[]; };
@@ -224,7 +222,7 @@ void main() {
     // ======================================================================
 
     // ---- Grid read (ACTIVE + FLOW only) ----
-    // Density magnitude computed inline from gradient — no gather_measure needed.
+    float rho = local_density[i];
     uint cell = particle_cell[i];
     float gx = 0.0, gy = 0.0, gz = 0.0;
     if (cell < 262144u) {
@@ -232,7 +230,6 @@ void main() {
         gy = pressure_y[cell];
         gz = pressure_z[cell];
     }
-    float rho = sqrt(gx*gx + gy*gy + gz*gz);
 
     // ---- Density torsion (ACTIVE + FLOW) ----
     float torsion_boost = 0.5 * rho;

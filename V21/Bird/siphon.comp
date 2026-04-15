@@ -1,0 +1,315 @@
+// siphon.comp — Squaragon V2 Physics Kernel (LUT version)
+// ========================================================
+//
+// Zero-trig implementation following the allocator spec.
+// All Viviani geometry precomputed into 32-entry LUTs.
+// Three interaction channels gated by flow mode LUT.
+//
+// Gravity = BH_MASS / r² (proper Keplerian).
+// Per-particle fiber phase indexes LUTs directly.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// SoA particle buffers (bindings match host vk_compute.cpp)
+// ============================================================================
+
+layout(std430, set = 0, binding = 0)  buffer PosX        { float pos_x[];        };
+layout(std430, set = 0, binding = 1)  buffer PosY        { float pos_y[];        };
+layout(std430, set = 0, binding = 2)  buffer PosZ        { float pos_z[];        };
+layout(std430, set = 0, binding = 3)  buffer VelX        { float vel_x[];        };
+layout(std430, set = 0, binding = 4)  buffer VelY        { float vel_y[];        };
+layout(std430, set = 0, binding = 5)  buffer VelZ        { float vel_z[];        };
+layout(std430, set = 0, binding = 6)  buffer PumpState   { int   pump_state[];   };
+layout(std430, set = 0, binding = 7)  buffer PumpScale   { float pump_scale[];   };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent{ int   pump_coherent[];};
+layout(std430, set = 0, binding = 9)  buffer PumpResidual{ float pump_residual[];};
+layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];    };
+layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
+layout(std430, set = 0, binding = 12) buffer Theta       { float theta[];        };
+layout(std430, set = 0, binding = 13) buffer OmegaNat    { float omega_nat[];    };
+layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
+layout(std430, set = 0, binding = 15) readonly buffer LocalDensity { float local_density[]; };
+
+// ============================================================================
+// Push constants (layout matches host PushConstants struct)
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Squaragon V2 LUTs — precomputed from allocator ground truth
+// All indexed by gen = (theta * 32 / 2π) & 31
+// Zero trig on the hot path.
+// ============================================================================
+
+// Flow mode: 0=COAST, 1=ACTIVE, 2=FLOW  (from SQ2_FLOW_MODE_LUT)
+const int FLOW_MODE[32] = int[32](
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1,
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1
+);
+
+// Flow w-component (from SQ2_FLOW_W_LUT) — used for weak channel strength
+const float FLOW_W[32] = float[32](
+    0.000000, 0.263371, 0.231222, 0.227317, 0.340459, 0.163085,-0.216041,-0.319410,
+   -0.259259,-0.319410,-0.216041, 0.163086, 0.340459, 0.227318, 0.231222, 0.263371,
+   -0.000000,-0.263371,-0.231222,-0.227317,-0.340459,-0.163085, 0.216041, 0.319410,
+    0.259259, 0.319410, 0.216041,-0.163086,-0.340459,-0.227317,-0.231222,-0.263371
+);
+
+// Normalized Viviani tangent vectors at each of 32 ring positions.
+// d/dθ [sin(θ)-0.5sin(3θ), -cos(θ)+0.5cos(3θ), cos(θ)cos(3θ)], normalized.
+const vec3 TANGENT[32] = vec3[32](
+    vec3( -1.000000,  0.000000, -0.000000),  // gen 0
+    vec3( -0.138370, -0.331496, -0.933255),  // gen 1
+    vec3(  0.120303, -0.344944, -0.930882),  // gen 2
+    vec3(  0.408600, -0.332813, -0.849871),  // gen 3
+    vec3(  0.857493, -0.171499, -0.485071),  // gen 4
+    vec3(  0.941049,  0.250189,  0.227669),  // gen 5
+    vec3(  0.666393,  0.564428,  0.487177),  // gen 6
+    vec3(  0.386358,  0.836993,  0.387517),  // gen 7
+    vec3(  0.000000,  1.000000,  0.000000),  // gen 8
+    vec3( -0.386358,  0.836993, -0.387517),  // gen 9
+    vec3( -0.666393,  0.564428, -0.487177),  // gen 10
+    vec3( -0.941049,  0.250189, -0.227669),  // gen 11
+    vec3( -0.857493, -0.171499,  0.485071),  // gen 12
+    vec3( -0.408600, -0.332813,  0.849871),  // gen 13
+    vec3( -0.120303, -0.344944,  0.930882),  // gen 14
+    vec3(  0.138370, -0.331496,  0.933255),  // gen 15
+    vec3(  1.000000, -0.000000,  0.000000),  // gen 16
+    vec3(  0.138370,  0.331496, -0.933255),  // gen 17
+    vec3( -0.120303,  0.344944, -0.930882),  // gen 18
+    vec3( -0.408600,  0.332813, -0.849871),  // gen 19
+    vec3( -0.857493,  0.171499, -0.485071),  // gen 20
+    vec3( -0.941049, -0.250189,  0.227669),  // gen 21
+    vec3( -0.666393, -0.564428,  0.487177),  // gen 22
+    vec3( -0.386358, -0.836993,  0.387517),  // gen 23
+    vec3( -0.000000, -1.000000,  0.000000),  // gen 24
+    vec3(  0.386358, -0.836993, -0.387517),  // gen 25
+    vec3(  0.666393, -0.564428, -0.487177),  // gen 26
+    vec3(  0.941049, -0.250189, -0.227669),  // gen 27
+    vec3(  0.857493,  0.171499,  0.485071),  // gen 28
+    vec3(  0.408600,  0.332813,  0.849871),  // gen 29
+    vec3(  0.120303,  0.344944,  0.930882),  // gen 30
+    vec3( -0.138370,  0.331496,  0.933255)   // gen 31
+);
+
+// z-coupling = cos(θ)·cos(3θ) at each ring position (strong channel)
+const float Z_COUPLING[32] = float[32](
+     1.000000, 0.815493, 0.353553,-0.162212,-0.500000,-0.544895,-0.353553,-0.108386,
+    -0.000000,-0.108386,-0.353553,-0.544895,-0.500000,-0.162212, 0.353553, 0.815493,
+     1.000000, 0.815493, 0.353553,-0.162212,-0.500000,-0.544895,-0.353553,-0.108386,
+    -0.000000,-0.108386,-0.353553,-0.544895,-0.500000,-0.162212, 0.353553, 0.815493
+);
+
+// Normalized Viviani curve point at each ring position (weak channel)
+// [sin(θ)-0.5sin(3θ), -cos(θ)+0.5cos(3θ), cos(θ)cos(3θ)], normalized.
+const vec3 CURVE_PT[32] = vec3[32](
+    vec3(  0.000000, -0.447214,  0.894427),  // gen 0
+    vec3( -0.083063, -0.567568,  0.819126),  // gen 1
+    vec3( -0.096980, -0.896348,  0.432615),  // gen 2
+    vec3(  0.068948, -0.982752, -0.171595),  // gen 3
+    vec3(  0.288675, -0.866025, -0.408248),  // gen 4
+    vec3(  0.528346, -0.752980, -0.392265),  // gen 5
+    vec3(  0.772875, -0.585344, -0.245021),  // gen 6
+    vec3(  0.944624, -0.319859, -0.073314),  // gen 7
+    vec3(  1.000000, -0.000000, -0.000000),  // gen 8
+    vec3(  0.944624,  0.319859, -0.073314),  // gen 9
+    vec3(  0.772875,  0.585344, -0.245021),  // gen 10
+    vec3(  0.528346,  0.752980, -0.392265),  // gen 11
+    vec3(  0.288675,  0.866025, -0.408248),  // gen 12
+    vec3(  0.068948,  0.982752, -0.171595),  // gen 13
+    vec3( -0.096980,  0.896348,  0.432615),  // gen 14
+    vec3( -0.083063,  0.567568,  0.819126),  // gen 15
+    vec3( -0.000000,  0.447214,  0.894427),  // gen 16
+    vec3(  0.083063,  0.567568,  0.819126),  // gen 17
+    vec3(  0.096980,  0.896348,  0.432615),  // gen 18
+    vec3( -0.068948,  0.982752, -0.171595),  // gen 19
+    vec3( -0.288675,  0.866025, -0.408248),  // gen 20
+    vec3( -0.528346,  0.752980, -0.392265),  // gen 21
+    vec3( -0.772875,  0.585344, -0.245021),  // gen 22
+    vec3( -0.944624,  0.319859, -0.073314),  // gen 23
+    vec3( -1.000000,  0.000000, -0.000000),  // gen 24
+    vec3( -0.944624, -0.319859, -0.073314),  // gen 25
+    vec3( -0.772875, -0.585344, -0.245021),  // gen 26
+    vec3( -0.528346, -0.752980, -0.392265),  // gen 27
+    vec3( -0.288675, -0.866025, -0.408248),  // gen 28
+    vec3( -0.068948, -0.982752, -0.171595),  // gen 29
+    vec3(  0.096980, -0.896348,  0.432615),  // gen 30
+    vec3(  0.083063, -0.567568,  0.819126)   // gen 31
+);
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+
+    // Skip inactive / ejected particles
+    uint f = flags[i];
+    if ((f & 0x01u) == 0u) return;
+    if ((f & 0x02u) != 0u) return;
+
+    // ---- Load state ----
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // ---- Local density (pressure magnitude from gather_measure) ----
+    float rho = local_density[i];
+
+    // ---- Advance fiber phase (Keplerian omega_nat + density torsion) ----
+    // Compression accelerates the phase: denser regions twist faster.
+    // This desynchronizes flow mode windows in clumps → symmetry breaking.
+    float torsion = 1.0 + 0.5 * rho;
+    float theta_i = theta[i] + omega_nat[i] * torsion * pc.dt;
+    if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
+    if (theta_i < 0.0)           theta_i += 6.28318530718;
+
+    // ---- Ring position: single integer index, all LUT lookups ----
+    int gen = int(theta_i * 5.09295817894) & 31;  // 32 / 2π = 5.09295...
+    int mode = FLOW_MODE[gen];
+
+    // ---- Distances ----
+    float r3d_sq  = px*px + py*py + pz*pz;
+    float inv_r3d = inversesqrt(r3d_sq + 1e-8);
+    float r3d     = r3d_sq * inv_r3d;
+    float r_safe  = max(r3d, 1.0);
+    float inv_r   = 1.0 / r_safe;
+
+    // Radial unit vector
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    // Prograde tangent in the orbital plane
+    float r_xz = sqrt(px*px + pz*pz + 1e-8);
+    float inv_rxz = 1.0 / r_xz;
+    float pgx = -pz * inv_rxz;
+    float pgz =  px * inv_rxz;
+
+    // ---- Viviani geometry from LUT (zero trig) ----
+    vec3 tang = TANGENT[gen];
+    float z_coup = Z_COUPLING[gen];
+    float flow_w = FLOW_W[gen];
+
+    // Project tangent perpendicular to radial
+    float f_dot_r = tang.x*rx + tang.y*ry + tang.z*rz;
+    float fpx = tang.x - f_dot_r * rx;
+    float fpy = tang.y - f_dot_r * ry;
+    float fpz = tang.z - f_dot_r * rz;
+
+    // Viviani modulation onto prograde direction
+    float viviani_mod = fpx*pgx + fpz*pgz;
+
+    // Steer target: prograde modulated by Viviani, small vertical component
+    float tx = pgx * abs(viviani_mod) + fpx * 0.1;
+    float ty = fpy * 0.1;
+    float tz = pgz * abs(viviani_mod) + fpz * 0.1;
+
+    // ---- Gravity: 1/r² (always active) ----
+    float gravity = pc.BH_MASS / (r_safe * r_safe);
+
+    float ax = -rx * gravity;
+    float ay = -ry * gravity;
+    float az = -rz * gravity;
+
+    // ---- EM channel: direction steering (speed preserved) ----
+    // Base rates: COAST=0%, ACTIVE=0.2%, FLOW=2%
+    // Density modulates: geometry asserts itself harder where crowded.
+    float density_gain = 1.0 + 2.0 * rho;
+    float base_rate = (mode == 2) ? 0.02 : (mode == 1) ? 0.002 : 0.0;
+    float steer_rate = base_rate * density_gain;
+
+    if (steer_rate > 0.0) {
+        float speed_before = sqrt(vx*vx + vy*vy + vz*vz);
+
+        float t_mag = sqrt(tx*tx + ty*ty + tz*tz + 1e-8);
+        float tnx = tx / t_mag, tny = ty / t_mag, tnz = tz / t_mag;
+
+        float v_dot_t = vx*tnx + vy*tny + vz*tnz;
+        float perp_x = vx - v_dot_t * tnx;
+        float perp_y = vy - v_dot_t * tny;
+        float perp_z = vz - v_dot_t * tnz;
+
+        vx -= perp_x * steer_rate;
+        vy -= perp_y * steer_rate;
+        vz -= perp_z * steer_rate;
+
+        // Rescale to preserve KE exactly
+        float speed_after = sqrt(vx*vx + vy*vy + vz*vz);
+        float rescale = speed_before / (speed_after + 1e-8);
+        vx *= rescale;
+        vy *= rescale;
+        vz *= rescale;
+    }
+
+    // ---- Strong channel (ACTIVE+ mode): radial shell structure ----
+    // z_coupling from LUT creates alternating dense/sparse bands
+    if (mode >= 1) {
+        float strong = z_coup * gravity * 0.1;
+        ax += rx * strong;
+        ay += ry * strong;
+        az += rz * strong;
+    }
+
+    // ---- Weak channel (FLOW only): 3D structure ----
+    // Curve point from LUT, radial component removed
+    if (mode >= 2) {
+        vec3 cp = CURVE_PT[gen];
+        float weak_dot_r = cp.x*rx + cp.y*ry + cp.z*rz;
+        float weak_ax = cp.x - weak_dot_r * rx;
+        float weak_ay = cp.y - weak_dot_r * ry;
+        float weak_az = cp.z - weak_dot_r * rz;
+
+        float weak_strength = abs(flow_w) * gravity * 0.05;
+        ax += weak_ax * weak_strength;
+        ay += weak_ay * weak_strength;
+        az += weak_az * weak_strength;
+    }
+
+    // ---- Integrate ----
+    vx += ax * pc.dt;
+    vy += ay * pc.dt;
+    vz += az * pc.dt;
+
+    // NaN guard
+    if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz)) {
+        return;
+    }
+
+    px += vx * pc.dt;
+    py += vy * pc.dt;
+    pz += vz * pc.dt;
+
+    // ---- Write back ----
+    pos_x[i] = px;
+    pos_y[i] = py;
+    pos_z[i] = pz;
+    vel_x[i] = vx;
+    vel_y[i] = vy;
+    vel_z[i] = vz;
+    theta[i] = theta_i;
+
+    // pump_history/pump_scale: legacy diagnostics, not part of allocator state.
+    // Reads removed to save 2 SSBO accesses per particle per frame.
+}

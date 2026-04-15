@@ -1,0 +1,237 @@
+// siphon.comp — Squaragon V2 Physics Kernel
+// ============================================
+//
+// Clean implementation of the Squaragon force model.
+// Three interaction channels gated by flow mode:
+//   Strong (3θ): radial bunching via z-coupling
+//   EM (1θ):     tangential rotation via Viviani tangent
+//   Weak (9θ):   vertical structure via cross-plane kicks
+//
+// Gravity = BH_MASS / r² (proper Keplerian).
+// Per-particle fiber phase drives counter-rotation via 3θ winding.
+//
+// Dispatch: ceil(N / 256) workgroups of 256 threads
+
+#version 450
+
+layout(local_size_x = 256) in;
+
+// ============================================================================
+// SoA particle buffers (bindings match host vk_compute.cpp)
+// ============================================================================
+
+layout(std430, set = 0, binding = 0)  buffer PosX        { float pos_x[];        };
+layout(std430, set = 0, binding = 1)  buffer PosY        { float pos_y[];        };
+layout(std430, set = 0, binding = 2)  buffer PosZ        { float pos_z[];        };
+layout(std430, set = 0, binding = 3)  buffer VelX        { float vel_x[];        };
+layout(std430, set = 0, binding = 4)  buffer VelY        { float vel_y[];        };
+layout(std430, set = 0, binding = 5)  buffer VelZ        { float vel_z[];        };
+layout(std430, set = 0, binding = 6)  buffer PumpState   { int   pump_state[];   };
+layout(std430, set = 0, binding = 7)  buffer PumpScale   { float pump_scale[];   };
+layout(std430, set = 0, binding = 8)  buffer PumpCoherent{ int   pump_coherent[];};
+layout(std430, set = 0, binding = 9)  buffer PumpResidual{ float pump_residual[];};
+layout(std430, set = 0, binding = 10) buffer PumpWork    { float pump_work[];    };
+layout(std430, set = 0, binding = 11) buffer PumpHistory { float pump_history[]; };
+layout(std430, set = 0, binding = 12) buffer Theta       { float theta[];        };
+layout(std430, set = 0, binding = 13) buffer OmegaNat    { float omega_nat[];    };
+layout(std430, set = 0, binding = 14) buffer Flags       { uint  flags[];        };
+layout(std430, set = 0, binding = 15) buffer ActiveRegion{ uint in_active_region[]; };
+
+// ============================================================================
+// Push constants (layout matches host PushConstants struct)
+// ============================================================================
+
+layout(push_constant) uniform PushConstants {
+    int   N;
+    float time;
+    float dt;
+    float BH_MASS;
+    float FIELD_STRENGTH;
+    float FIELD_FALLOFF;
+    float TANGENT_SCALE;
+    uint  seam_bits;
+    float bias;
+} pc;
+
+// ============================================================================
+// Squaragon V2 Flow Mode LUT
+// 0 = COAST (EM only), 1 = ACTIVE (EM + strong), 2 = FLOW (all three)
+// ============================================================================
+
+const int FLOW_MODE[32] = int[32](
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1,
+    0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1
+);
+
+// ============================================================================
+// Main kernel
+// ============================================================================
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.N) return;
+
+    // Skip inactive / ejected particles
+    uint f = flags[i];
+    if ((f & 0x01u) == 0u) return;
+    if ((f & 0x02u) != 0u) return;
+
+    // ---- Load state ----
+    float px = pos_x[i];
+    float py = pos_y[i];
+    float pz = pos_z[i];
+    float vx = vel_x[i];
+    float vy = vel_y[i];
+    float vz = vel_z[i];
+
+    // ---- Advance fiber phase (Keplerian omega_nat) ----
+    float theta_i = theta[i] + omega_nat[i] * pc.dt;
+    if (theta_i >= 6.28318530718) theta_i -= 6.28318530718;
+    if (theta_i < 0.0)           theta_i += 6.28318530718;
+
+    // ---- Distances ----
+    float r3d_sq  = px*px + py*py + pz*pz;
+    float inv_r3d = inversesqrt(r3d_sq + 1e-8);
+    float r3d     = r3d_sq * inv_r3d;
+    float r_safe  = max(r3d, 1.0);
+
+    // ---- Viviani curve at fiber phase ----
+    float s1 = sin(theta_i);
+    float c1 = cos(theta_i);
+    float s3 = sin(3.0 * theta_i);
+    float c3 = cos(3.0 * theta_i);
+
+    // Tangent vector: d/dθ of the Viviani curve
+    float fx = c1 - 1.5 * c3;
+    float fy = s1 - 1.5 * s3;
+    float fz = -s1 * c3 - 3.0 * c1 * s3;
+    float inv_f = inversesqrt(fx*fx + fy*fy + fz*fz + 1e-8);
+    fx *= inv_f;
+    fy *= inv_f;
+    fz *= inv_f;
+
+    // Radial unit vector
+    float inv_r = 1.0 / r_safe;
+    float rx = px * inv_r;
+    float ry = py * inv_r;
+    float rz = pz * inv_r;
+
+    // Tangential: field direction projected perpendicular to radial
+    float f_dot_r = fx*rx + fy*ry + fz*rz;
+    float tx = fx - f_dot_r * rx;
+    float ty = fy - f_dot_r * ry;
+    float tz = fz - f_dot_r * rz;
+
+    // ---- Flow mode from ring position ----
+    int gen = int(theta_i * 32.0 / 6.28318530718) & 31;
+    int mode = FLOW_MODE[gen];
+
+    // ---- Gravity: proper 1/r² (always active) ----
+    float gravity = pc.BH_MASS / (r_safe * r_safe);
+
+    float ax = -rx * gravity;
+    float ay = -ry * gravity;
+    float az = -rz * gravity;
+
+    // ---- EM channel: DIRECTION STEERING (speed preserved) ----
+    // Rotate velocity toward Viviani tangent WITHOUT changing magnitude.
+    // COAST = 0% (pure gravity, natural variation enables branching).
+    // ACTIVE = 0.2%, FLOW = 2%.
+    float steer_rate = (mode == 2) ? 0.02 : (mode == 1) ? 0.002 : 0.0;
+
+    if (steer_rate > 0.0) {
+        float speed_before = sqrt(vx*vx + vy*vy + vz*vz);
+
+        float t_mag = sqrt(tx*tx + ty*ty + tz*tz + 1e-8);
+        float tnx = tx / t_mag, tny = ty / t_mag, tnz = tz / t_mag;
+
+        float v_dot_t = vx*tnx + vy*tny + vz*tnz;
+        float perp_x = vx - v_dot_t * tnx;
+        float perp_y = vy - v_dot_t * tny;
+        float perp_z = vz - v_dot_t * tnz;
+
+        vx -= perp_x * steer_rate;
+        vy -= perp_y * steer_rate;
+        vz -= perp_z * steer_rate;
+
+        // Rescale to preserve kinetic energy exactly
+        float speed_after = sqrt(vx*vx + vy*vy + vz*vz);
+        float rescale = speed_before / (speed_after + 1e-8);
+        vx *= rescale;
+        vy *= rescale;
+        vz *= rescale;
+    }
+
+    // ---- Strong channel (3θ, ACTIVE+ mode): radial shell structure ----
+    // z-coupling = cos(θ)·cos(3θ) creates preferred radii.
+    // Positive z_coupling → push outward (expand shell)
+    // Negative z_coupling → push inward (compress shell)
+    // This creates alternating dense/sparse radial bands.
+    if (mode >= 1) {
+        float z_coupling = c1 * c3;
+        float strong = z_coupling * gravity * 0.1;
+        ax += rx * strong;
+        ay += ry * strong;
+        az += rz * strong;
+    }
+
+    // ---- Weak channel (9θ, FLOW only): 3D structure ----
+    // Push toward Viviani curve point, but ONLY the tangential/vertical
+    // component — radial component removed to prevent inward drift.
+    if (mode >= 2) {
+        float s9 = sin(9.0 * theta_i);
+
+        float cx = s1 - 0.5 * s3;
+        float cy = -c1 + 0.5 * c3;
+        float cz_v = c1 * c3;
+        float inv_c = inversesqrt(cx*cx + cy*cy + cz_v*cz_v + 1e-8);
+
+        float weak_ax = cx * inv_c;
+        float weak_ay = cy * inv_c;
+        float weak_az = cz_v * inv_c;
+
+        // Project out radial component
+        float weak_dot_r = weak_ax*rx + weak_ay*ry + weak_az*rz;
+        weak_ax -= weak_dot_r * rx;
+        weak_ay -= weak_dot_r * ry;
+        weak_az -= weak_dot_r * rz;
+
+        float weak_strength = abs(s9) * gravity * 0.05;
+        ax += weak_ax * weak_strength;
+        ay += weak_ay * weak_strength;
+        az += weak_az * weak_strength;
+    }
+
+    // No damping. The geometry conserves energy by construction.
+    // Damping was draining KE and causing collapse into the core.
+    // The direction steering (above) rotates velocity without changing
+    // its magnitude. The strong/weak channels add energy at specific
+    // harmonic windows. The system finds its own equilibrium.
+
+    // ---- Integrate ----
+    vx += ax * pc.dt;
+    vy += ay * pc.dt;
+    vz += az * pc.dt;
+
+    // NaN guard
+    if (isinf(vx) || isnan(vx) || isinf(vy) || isnan(vy) || isinf(vz) || isnan(vz)) {
+        return;
+    }
+
+    px += vx * pc.dt;
+    py += vy * pc.dt;
+    pz += vz * pc.dt;
+
+    // ---- Write back ----
+    pos_x[i] = px;
+    pos_y[i] = py;
+    pos_z[i] = pz;
+    vel_x[i] = vx;
+    vel_y[i] = vy;
+    vel_z[i] = vz;
+    theta[i] = theta_i;
+
+    // Pump history smoothing (keep for diagnostics compatibility)
+    float history = pump_history[i];
+    pump_history[i] = history * 0.98 + pump_scale[i] * 0.02;
+}

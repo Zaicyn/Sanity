@@ -253,25 +253,14 @@ static void init_particles(ParticleState& ps, int N, unsigned int seed,
         p.topo_state = (uint8_t)(((sign>0)?1:2) << (axis*2));
         tmp[i] = p;
 
-        /* Mode-major sort: group particles by flow mode so entire warps
-         * share the same execution path in the siphon.
-         * COAST (mode 0) particles early-exit after gravity — grouping them
-         * means the warp exits together, no divergence.
-         *
-         * Key: [mode:2] [theta:30] [radius:32]
-         * mode = FLOW_MODE[gen] where gen = theta * 32 / 2π
-         * Within each mode group, Viviani angular sort for spatial coherence. */
-        static const uint8_t FM[32] = {
-            0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1,
-            0, 1, 1, 1, 2, 0, 0, 2, 1, 2, 0, 0, 2, 1, 1, 1
-        };
+        /* Viviani sort key: θ = atan2(pz, px) as primary axis, radius as
+         * tiebreak. Particles nearby on the disk are nearby in memory →
+         * coalesced GPU reads. */
         float theta_v = atan2f(z, x) + 3.14159265f;   /* [0, 2π) */
         float r2d = sqrtf(x*x + z*z);
-        int gen = (int)(p.theta * (32.0f / 6.28318f)) & 31;
-        uint32_t mode = FM[gen];
-        uint32_t theta_bucket = (uint32_t)(theta_v * (1024.0f / 6.28318f)) & 0x3FFFFFFF;
+        uint32_t theta_bucket = (uint32_t)(theta_v * (1024.0f / 6.28318f));
         uint32_t r_bucket     = (uint32_t)fminf(16383.0f, r2d * (16384.0f / DISK_OUTER_R));
-        sort_key[i] = ((uint64_t)mode << 62) | ((uint64_t)theta_bucket << 32) | r_bucket;
+        sort_key[i] = ((uint64_t)theta_bucket << 32) | r_bucket;
     }
 
     /* Build permutation indices and sort by key. */

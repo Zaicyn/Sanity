@@ -159,25 +159,20 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     size_t int_sz = N * sizeof(int);
     size_t uint_sz = N * sizeof(uint32_t);
 
-    /* Allocate SSBOs — full-size for active buffers only.
-     * Siphon reads gradient directly from pressure grid (set 1), not per-particle.
-     *
-     * Active:  0-5 (pos/vel), 12 (theta), 13 (omega_nat), 14 (flags)
-     * Stubs:   6-11, 15 (rebound to gather_scratch later) */
-    const size_t stub = 4;  /* minimum valid SSBO size */
+    /* Allocate SSBOs — all float-sized except flags/active_region which are uint-padded */
     size_t sizes[VK_COMPUTE_NUM_BINDINGS] = {
         float_sz, float_sz, float_sz,  /* pos x,y,z */
         float_sz, float_sz, float_sz,  /* vel x,y,z */
-        stub,                           /* unused */
-        stub,                           /* unused */
-        stub,                           /* unused */
-        stub,                           /* unused */
-        stub,                           /* unused */
-        stub,                           /* unused */
+        int_sz,                         /* pump_state */
+        float_sz,                       /* pump_scale */
+        int_sz,                         /* pump_coherent */
+        float_sz,                       /* pump_residual */
+        float_sz,                       /* pump_work */
+        float_sz,                       /* pump_history */
         float_sz,                       /* theta */
         float_sz,                       /* omega_nat */
         uint_sz,                        /* flags (uint32 padded) */
-        stub                            /* local_density (rebound to gather_scratch later) */
+        uint_sz                         /* in_active_region (uint32 padded) */
     };
 
     /* Allocate device-local SSBOs */
@@ -217,21 +212,31 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     vkMapMemory(ctx.device, stagingMem, 0, total_sz, 0, (void**)&staging_base);
     memset(staging_base, 0, total_sz);  /* Zero-init all */
 
-    /* Upload only the buffers the allocator actually uses.
-     * Bindings 6-11, 15 are 4-byte stubs — don't write into them. */
     memcpy(staging_base + offsets[0], pos_x, float_sz);
     memcpy(staging_base + offsets[1], pos_y, float_sz);
     memcpy(staging_base + offsets[2], pos_z, float_sz);
     memcpy(staging_base + offsets[3], vel_x, float_sz);
     memcpy(staging_base + offsets[4], vel_y, float_sz);
     memcpy(staging_base + offsets[5], vel_z, float_sz);
+    memcpy(staging_base + offsets[7], pump_scale, float_sz);
+    memcpy(staging_base + offsets[9], pump_residual, float_sz);
+    memcpy(staging_base + offsets[11], pump_history, float_sz);
     memcpy(staging_base + offsets[12], theta, float_sz);
     memcpy(staging_base + offsets[13], omega_nat, float_sz);
 
-    /* Flags (binding 14): active particles get 0x01 */
+    /* Pack pump_state, pump_coherent, flags, in_active_region into packed_meta (binding 6).
+     * Layout: bits 0-2 = pump_state, bits 3-4 = pump_coherent, bits 5-8 = flags, bit 9 = active */
+    uint32_t* meta_s = (uint32_t*)(staging_base + offsets[6]);
     uint32_t* flags_s = (uint32_t*)(staging_base + offsets[14]);
+    uint32_t* active_s = (uint32_t*)(staging_base + offsets[15]);
     for (int i = 0; i < N; i++) {
+        uint32_t ps = pump_state ? (uint32_t)(pump_state[i] & 0x07) : 0u;
+        uint32_t fl = (uint32_t)(flags[i] & 0x0F);
+        meta_s[i] = ps | (0u << 3) | (fl << 5) | (1u << 9);  /* coherent=0, active=1 */
+        /* Also populate legacy bindings 14/15 — cartesian_to_graded.comp reads binding 14
+         * during the one-shot init conversion. After that, only packed_meta is live. */
         flags_s[i] = flags[i];
+        active_s[i] = 1;
     }
     vkUnmapMemory(ctx.device, stagingMem);
 
@@ -283,8 +288,36 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     layoutInfo.pBindings = bindings;
     vkCreateDescriptorSetLayout(ctx.device, &layoutInfo, nullptr, &phys.descLayout);
 
-    /* Siphon pipeline layout + pipeline deferred until after gather_measure init,
-     * because the siphon now binds set 1 (pressure grid) for direct gradient sampling. */
+    /* Pipeline layout with push constants */
+    VkPushConstantRange pushRange = {};
+    pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushRange.size = sizeof(SiphonPushConstants);
+
+    VkPipelineLayoutCreateInfo plInfo = {};
+    plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plInfo.setLayoutCount = 1;
+    plInfo.pSetLayouts = &phys.descLayout;
+    plInfo.pushConstantRangeCount = 1;
+    plInfo.pPushConstantRanges = &pushRange;
+    vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.pipelineLayout);
+
+    /* Load siphon.spv and create compute pipeline */
+    auto code = readShaderFile("siphon.spv");
+    VkShaderModule shaderMod = createShaderModule(ctx.device, code);
+
+    VkComputePipelineCreateInfo cpInfo = {};
+    cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpInfo.stage.module = shaderMod;
+    cpInfo.stage.pName = "main";
+    cpInfo.layout = phys.pipelineLayout;
+
+    if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr, &phys.pipeline) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create siphon compute pipeline");
+
+    vkDestroyShaderModule(ctx.device, shaderMod, nullptr);
+    printf("[vk-compute] Siphon compute pipeline created\n");
 
     /* Descriptor pool + set */
     VkDescriptorPoolSize poolSize = {};
@@ -378,47 +411,6 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
 
     /* Pass 3 gather-measure pipeline (cells → per-particle scratch, measurement-only) */
     initGatherMeasureCompute(phys, ctx);
-
-    /* Binding 15 rebind removed — siphon computes density inline from
-     * pressure_x/y/z[particle_cell[i]]. No gather_scratch needed. */
-
-    /* --- Siphon pipeline (deferred): set 0 (particles) + set 1 (pressure grid) ---
-     * The siphon reads pressure gradient directly from the grid buffers via
-     * particle_cell[i] and computes density magnitude inline (sqrt). */
-    {
-        VkDescriptorSetLayout siphonSets[2] = {
-            phys.descLayout,              /* set 0: 16 SoA particle buffers */
-            phys.gatherMeasureSet1Layout  /* set 1: particle_cell + pressure xyz + scratch */
-        };
-        VkPushConstantRange pushRange = {};
-        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pushRange.size = sizeof(SiphonPushConstants);
-
-        VkPipelineLayoutCreateInfo plInfo = {};
-        plInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        plInfo.setLayoutCount = 2;
-        plInfo.pSetLayouts = siphonSets;
-        plInfo.pushConstantRangeCount = 1;
-        plInfo.pPushConstantRanges = &pushRange;
-        vkCreatePipelineLayout(ctx.device, &plInfo, nullptr, &phys.pipelineLayout);
-
-        auto code = readShaderFile("siphon.spv");
-        VkShaderModule shaderMod = createShaderModule(ctx.device, code);
-
-        VkComputePipelineCreateInfo cpInfo = {};
-        cpInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        cpInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpInfo.stage.module = shaderMod;
-        cpInfo.stage.pName = "main";
-        cpInfo.layout = phys.pipelineLayout;
-
-        if (vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpInfo, nullptr, &phys.pipeline) != VK_SUCCESS)
-            throw std::runtime_error("Failed to create siphon compute pipeline");
-
-        vkDestroyShaderModule(ctx.device, shaderMod, nullptr);
-        printf("[vk-compute] Siphon pipeline created (set 0 + set 1 pressure grid)\n");
-    }
 }
 
 /* ========================================================================
@@ -1504,9 +1496,34 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 2);
 
-    /* Pass 3 (gather_measure) REMOVED — siphon computes density magnitude
-     * inline from pressure_x/y/z[particle_cell[i]]. Saved 0.86ms/frame.
-     * gather_measure.comp archived in V21/archive/. */
+    /* ---- Pass 3: Gather-measure (cells → per-particle scratch) ------- */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.gatherMeasurePipeline);
+    VkDescriptorSet gatherSets[2] = { phys.descSet, phys.gatherMeasureSet1 };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.gatherMeasurePipelineLayout, 0, 2, gatherSets, 0, nullptr);
+
+    GatherMeasurePushConstants gatherPush = {};
+    gatherPush.N           = phys.N;
+    gatherPush.total_cells = V21_GRID_CELLS;
+    gatherPush.dt          = dt;
+    vkCmdPushConstants(cmd, phys.gatherMeasurePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(gatherPush), &gatherPush);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: gather writes to scratch — no downstream consumer in
+     * measurement-only mode, but the fence prevents the driver from
+     * elision-reordering the dispatch relative to siphon. */
+    {
+        VkMemoryBarrier gatherBarrier = {};
+        gatherBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        gatherBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gatherBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &gatherBarrier, 0, nullptr, 0, nullptr);
+    }
 
     /* Gather end */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -1753,9 +1770,8 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      * The graded/packed variants are legacy and don't implement
      * the correct Squaragon physics. */
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.pipeline);
-    VkDescriptorSet siphonSets[2] = { phys.descSet, phys.gatherMeasureSet1 };
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-        phys.pipelineLayout, 0, 2, siphonSets, 0, nullptr);
+        phys.pipelineLayout, 0, 1, &phys.descSet, 0, nullptr);
     vkCmdPushConstants(cmd, phys.pipelineLayout,
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
     vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
@@ -3149,10 +3165,10 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 
     size_t sz = (size_t)count * sizeof(float);
 
-    /* Source bindings: pos(0-2), vel(3-5), theta(12), flags(14).
-     * Binding 7 (pump_scale) and 6 (packed_meta) are stubs — skip them.
-     * Flags come from binding 14 directly (uint32, bit 0 = active). */
-    const int src_bindings[8] = {0, 1, 2, 3, 4, 5, 12, 14};
+    /* Source bindings for the 9 values we copy (8 floats + 1 uint32 packed_meta).
+     * Binding 6 = packed_meta (contains pump_state, pump_coherent, flags, active).
+     * Flags are unpacked from packed_meta after readback. */
+    const int src_bindings[9] = {0, 1, 2, 3, 4, 5, 12, 7, 6};
 
     VkCommandBuffer cmd;
     VkCommandBufferAllocateInfo cba = {};
@@ -3168,7 +3184,7 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     vkBeginCommandBuffer(cmd, &begin);
 
     size_t offset = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         VkBufferCopy region = {};
         region.srcOffset = 0;
         region.dstOffset = offset;
@@ -3221,22 +3237,20 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     memcpy(out_vel_y,      mapped + 4 * sz, sz);
     memcpy(out_vel_z,      mapped + 5 * sz, sz);
     memcpy(out_theta,      mapped + 6 * sz, sz);
+    memcpy(out_pump_scale, mapped + 7 * sz, sz);
 
-    /* pump_scale is a stub — fill with 1.0 for diagnostics compatibility */
-    for (int i = 0; i < count; i++) out_pump_scale[i] = 1.0f;
-
-    /* Flags from binding 14 (slot 7 in readback), uint32 → uint8 */
-    const uint32_t* flags32 = (const uint32_t*)(mapped + 7 * sz);
+    /* Unpack flags from packed_meta (bits 5-8) → uint8 */
+    const uint32_t* meta32 = (const uint32_t*)(mapped + 8 * sz);
     for (int i = 0; i < count; i++) {
-        out_flags[i] = (uint8_t)(flags32[i] & 0xFF);
+        out_flags[i] = (uint8_t)((meta32[i] >> 5) & 0x0F);
     }
 
     /* Copy graded-state arrays if requested */
     if (do_graded) {
-        memcpy(out_r,         mapped +  8 * sz, sz);
-        memcpy(out_vel_r,     mapped +  9 * sz, sz);
-        memcpy(out_phi,       mapped + 10 * sz, sz);
-        memcpy(out_omega_orb, mapped + 11 * sz, sz);
+        memcpy(out_r,         mapped +  9 * sz, sz);
+        memcpy(out_vel_r,     mapped + 10 * sz, sz);
+        memcpy(out_phi,       mapped + 11 * sz, sz);
+        memcpy(out_omega_orb, mapped + 12 * sz, sz);
     }
 
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
@@ -3251,9 +3265,47 @@ void readbackPumpStateSample(PhysicsCompute& phys, VulkanContext& ctx,
     if (count <= 0) return;
     if (count > ORACLE_SUBSET_SIZE) count = ORACLE_SUBSET_SIZE;
 
-    /* Binding 6 is a stub — pump_state is not part of allocator state.
-     * Return zeros instead of reading from a 4-byte buffer. */
-    memset(out_states, 0, (size_t)count * sizeof(int));
+    size_t sz = (size_t)count * sizeof(int);
+
+    VkCommandBuffer cmd;
+    VkCommandBufferAllocateInfo cba = {};
+    cba.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cba.commandPool = ctx.commandPool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    vkAllocateCommandBuffers(ctx.device, &cba, &cmd);
+
+    VkCommandBufferBeginInfo begin = {};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &begin);
+
+    /* Copy packed_meta (binding 6) into the first `sz` bytes of staging */
+    VkBufferCopy region = {0, 0, sz};
+    vkCmdCopyBuffer(cmd, phys.soa_buffers[6], phys.staging, 1, &region);
+
+    vkEndCommandBuffer(cmd);
+
+    VkFence fence;
+    VkFenceCreateInfo fi = {};
+    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    vkCreateFence(ctx.device, &fi, nullptr, &fence);
+
+    VkSubmitInfo si = {};
+    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &si, fence);
+    vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX);
+    vkDestroyFence(ctx.device, fence, nullptr);
+
+    /* Unpack pump_state (bits 0-2) from packed_meta */
+    const uint32_t* meta = (const uint32_t*)phys.stagingMapped;
+    for (int i = 0; i < count; i++) {
+        out_states[i] = (int)(meta[i] & 0x07);
+    }
+
+    vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
 }
 
 /* ========================================================================
@@ -3615,9 +3667,12 @@ void initForwardSiphonCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         vkCmdCopyBuffer(cmd, phys.graded_buffers[c.graded_idx],
                         phys.fwdBuffersA[c.fwd_idx], 1, &region);
     }
-    /* Bindings 6 (packed_meta) and 11 (pump_history) are stubs —
-     * zero-fill the forward siphon targets instead of copying. */
-    vkCmdFillBuffer(cmd, phys.fwdBuffersA[7], 0, uint_sz, 0);
+    /* Meta from set 0 binding 6 (packed_meta) */
+    {
+        VkBufferCopy region = {0, 0, uint_sz};
+        vkCmdCopyBuffer(cmd, phys.soa_buffers[6],
+                        phys.fwdBuffersA[7], 1, &region);
+    }
     /* Shared readonly: delta_r from graded[1], omega_nat from graded[8] */
     {
         VkBufferCopy region = {0, 0, float_sz};
@@ -3629,7 +3684,12 @@ void initForwardSiphonCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         vkCmdCopyBuffer(cmd, phys.graded_buffers[8],
                         phys.fwdOmegaNatBuffer, 1, &region);
     }
-    vkCmdFillBuffer(cmd, phys.fwdHistoryBuffer, 0, float_sz, 0);
+    /* History from set 0 binding 11 (pump_history) */
+    {
+        VkBufferCopy region = {0, 0, float_sz};
+        vkCmdCopyBuffer(cmd, phys.soa_buffers[11],
+                        phys.fwdHistoryBuffer, 1, &region);
+    }
 
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {};

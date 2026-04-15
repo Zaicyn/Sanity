@@ -75,11 +75,6 @@ void main() {
     int py = int((ny * 0.5 + 0.5) * float(cam.height));
 
     if (px >= 0 && px < cam.width && py >= 0 && py < cam.height) {
-        // Overdraw guard: skip if pixel is already saturated.
-        // Non-atomic read — cheap. Race condition is fine for a heatmap.
-        // Eliminates hundreds of serialized atomics per pixel in the dense core.
-        if (imageLoad(density_buf, ivec2(px, py)).r > 4096u) return;
-
         uint contrib = uint(pc.brightness * 32.0);
         imageAtomicAdd(density_buf, ivec2(px, py), max(contrib, 1u));
     }

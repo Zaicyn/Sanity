@@ -379,12 +379,26 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
     /* Pass 3 gather-measure pipeline (cells → per-particle scratch, measurement-only) */
     initGatherMeasureCompute(phys, ctx);
 
-    /* Binding 15 rebind removed — siphon computes density inline from
-     * pressure_x/y/z[particle_cell[i]]. No gather_scratch needed. */
+    /* Rebind set 0, binding 15 to gatherScratchBuffer so the siphon can
+     * read local density (pressure magnitude) per particle. */
+    {
+        VkDescriptorBufferInfo densityBufInfo = {
+            phys.gatherScratchBuffer, 0, VK_WHOLE_SIZE
+        };
+        VkWriteDescriptorSet w = {};
+        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet = phys.descSet;
+        w.dstBinding = 15;
+        w.descriptorCount = 1;
+        w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo = &densityBufInfo;
+        vkUpdateDescriptorSets(ctx.device, 1, &w, 0, nullptr);
+        printf("[vk-compute] Binding 15 rebound to gather_scratch (local density)\n");
+    }
 
     /* --- Siphon pipeline (deferred): set 0 (particles) + set 1 (pressure grid) ---
      * The siphon reads pressure gradient directly from the grid buffers via
-     * particle_cell[i] and computes density magnitude inline (sqrt). */
+     * particle_cell[i], eliminating per-particle gradient storage. */
     {
         VkDescriptorSetLayout siphonSets[2] = {
             phys.descLayout,              /* set 0: 16 SoA particle buffers */
@@ -1504,9 +1518,34 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         phys.queryPool, base + 2);
 
-    /* Pass 3 (gather_measure) REMOVED — siphon computes density magnitude
-     * inline from pressure_x/y/z[particle_cell[i]]. Saved 0.86ms/frame.
-     * gather_measure.comp archived in V21/archive/. */
+    /* ---- Pass 3: Gather-measure (cells → per-particle scratch) ------- */
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, phys.gatherMeasurePipeline);
+    VkDescriptorSet gatherSets[2] = { phys.descSet, phys.gatherMeasureSet1 };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+        phys.gatherMeasurePipelineLayout, 0, 2, gatherSets, 0, nullptr);
+
+    GatherMeasurePushConstants gatherPush = {};
+    gatherPush.N           = phys.N;
+    gatherPush.total_cells = V21_GRID_CELLS;
+    gatherPush.dt          = dt;
+    vkCmdPushConstants(cmd, phys.gatherMeasurePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(gatherPush), &gatherPush);
+
+    vkCmdDispatch(cmd, (phys.N + 255) / 256, 1, 1);
+
+    /* Barrier: gather writes to scratch — no downstream consumer in
+     * measurement-only mode, but the fence prevents the driver from
+     * elision-reordering the dispatch relative to siphon. */
+    {
+        VkMemoryBarrier gatherBarrier = {};
+        gatherBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        gatherBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        gatherBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &gatherBarrier, 0, nullptr, 0, nullptr);
+    }
 
     /* Gather end */
     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,

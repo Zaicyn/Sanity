@@ -341,7 +341,7 @@ void updateUniformBuffer(VulkanContext& ctx, uint32_t currentImage) {
     float aspect = (float)ctx.swapchainExtent.width / (float)ctx.swapchainExtent.height;
     float fov = 45.0f * 3.14159f / 180.0f;
     float near = 0.1f;
-    float far = 5000.0f;
+    float far = 50000.0f;
 
     // Perspective projection (column-major for Vulkan/GLSL)
     float tanHalfFov = tanf(fov / 2.0f);

@@ -1,10 +1,10 @@
 // gather_measure.comp — Pass 3: per-particle pressure sampling
 // ============================================================================
-// Reads each particle's cell index, samples pressure magnitude at that cell,
-// writes to gather_scratch (binding 15 in siphon's set 0).
+// Reads each particle's cell index, samples the pressure gradient at that cell,
+// writes the magnitude to gather_scratch[i] (binding 15 in siphon's set 0).
 //
-// The siphon reads gradient direction directly from the pressure grid (set 1),
-// so this shader only needs to write the scalar magnitude.
+// The siphon shader reads this as local_density to modulate steering gain —
+// geometry asserts itself harder where density is high.
 //
 // Dispatch: ceil(N / 256) workgroups.
 
@@ -16,11 +16,11 @@ layout(local_size_x = 256) in;
 layout(std430, set = 0, binding = 14) readonly buffer Flags { uint flags[]; };
 
 // Set 1 — gather input/output SSBOs
-layout(std430, set = 1, binding = 0) readonly  buffer PCell   { uint  particle_cell[]; };
-layout(std430, set = 1, binding = 1) readonly  buffer PressX2 { float pressure_x[];    };
-layout(std430, set = 1, binding = 2) readonly  buffer PressY2 { float pressure_y[];    };
-layout(std430, set = 1, binding = 3) readonly  buffer PressZ2 { float pressure_z[];    };
-layout(std430, set = 1, binding = 4) writeonly buffer Scratch  { float gather_scratch[]; };
+layout(std430, set = 1, binding = 0) readonly buffer PCell    { uint  particle_cell[]; };
+layout(std430, set = 1, binding = 1) readonly buffer PressX2  { float pressure_x[];    };
+layout(std430, set = 1, binding = 2) readonly buffer PressY2  { float pressure_y[];    };
+layout(std430, set = 1, binding = 3) readonly buffer PressZ2  { float pressure_z[];    };
+layout(std430, set = 1, binding = 4) writeonly buffer Scratch { float gather_scratch[]; };
 
 layout(push_constant) uniform GatherMeasurePushConstants {
     int   N;
