@@ -348,10 +348,26 @@ void main() {
             return;
         }
 
-        // ---- Ballistic gravity over K steps ----
+        // ---- Pressure gradient: feel nearby structure (arms, clusters) ----
+        // COAST particles are guided by the density field even without
+        // steering/torsion/channels. This is the Viviani field acting on them.
+        uint cell = particle_cell[i];
+        if (cell < 262144u) {
+            float gx = pressure_x[cell];
+            float gy = pressure_y[cell];
+            float gz = pressure_z[cell];
+            float g_dot_r = gx*rx + gy*ry + gz*rz;
+            float rho = sqrt(gx*gx + gy*gy + gz*gz);
+            float grad_strength = 0.05 * rho;  // gentler than ACTIVE (0.1*rho*envelope)
+            ax += (gx - g_dot_r * rx) * grad_strength;
+            ay += (gy - g_dot_r * ry) * grad_strength;
+            az += (gz - g_dot_r * rz) * grad_strength;
+        }
+
+        // ---- Ballistic gravity + field over K steps ----
         // pos(K) = pos + vel*K*dt + 0.5*accel*(K*dt)²
         // vel(K) = vel + accel*K*dt
-        // Gravity direction constant over K frames (small-angle approximation)
+        // Gravity + field direction constant over K frames (small-angle approx)
         vx += ax * K_dt;
         vy += ay * K_dt;
         vz += az * K_dt;
