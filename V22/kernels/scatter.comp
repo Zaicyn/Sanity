@@ -33,15 +33,18 @@ layout(std430, set = 0, binding = 2)  readonly buffer PosZ         { float pos_z
 layout(std430, set = 0, binding = 3)  readonly buffer VelX         { float vel_x[];          };
 layout(std430, set = 0, binding = 4)  readonly buffer VelY         { float vel_y[];          };
 layout(std430, set = 0, binding = 5)  readonly buffer VelZ         { float vel_z[];          };
+layout(std430, set = 0, binding = 12) readonly buffer Theta        { float theta[];          };
 layout(std430, set = 0, binding = 14) readonly buffer Flags        { uint  flags[];          };
 
 // ----------------------------------------------------------------------------
 // Set 1 — scatter output buffers
 //   binding 0: grid_density_shards[N_SHARDS * total_cells]
 //   binding 1: particle_cell[N]
+//   binding 2: bin_presence[total_cells] — functional coverage bitmask
 // ----------------------------------------------------------------------------
 layout(std430, set = 1, binding = 0) buffer GridDensityShards { uint grid_density_shards[]; };
 layout(std430, set = 1, binding = 1) buffer ParticleCell      { uint particle_cell[]; };
+layout(std430, set = 1, binding = 2) buffer BinPresence       { uint bin_presence[]; };
 
 layout(push_constant) uniform ScatterPushConstants {
     int   N;
@@ -112,4 +115,12 @@ void main() {
     // Direct density accumulation into shard 0 (used as canonical density).
     // 262K cells / 16M particles = ~60 per cell avg — low contention.
     atomicAdd(grid_density_shards[cell], 1u);
+
+    // Functional coverage: bin = ring_position mod 8.
+    // One atomicOr per particle — sets the bit for this particle's bin.
+    // siphon reads bitCount(bin_presence[cell]) for metabolic completeness.
+    float th = theta[i];
+    uint gen = uint(th * 5.09295817894) & 31u;
+    uint bin = gen & 7u;
+    atomicOr(bin_presence[cell], 1u << bin);
 }

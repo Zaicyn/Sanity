@@ -40,6 +40,7 @@ layout(std430, set = 1, binding = 2) readonly buffer PressY  { float pressure_y[
 layout(std430, set = 1, binding = 3) readonly buffer PressZ  { float pressure_z[];    };
 layout(std430, set = 1, binding = 4) readonly buffer GDens   { uint  grid_density[];  };
 layout(std430, set = 1, binding = 5) readonly buffer SortIdx { uint  sort_index[];    };
+layout(std430, set = 1, binding = 6) readonly buffer BinPres { uint  bin_presence[];  };
 
 // ============================================================================
 // Set 2: fused projection (density image + camera UBO)
@@ -183,7 +184,7 @@ const float BLAST_MULT      = 2.5;   // supernova kick = BLAST_MULT * omega_nat
 
 // Omega evolution: driven-damped relaxation toward local equilibrium
 const float OMEGA_BASE     = 0.08;  // natural floor (slightly below init 0.1)
-const float OMEGA_GAIN     = 1.2;   // density coupling → target omega
+const float OMEGA_GAIN     = 2.0;   // density coupling → target omega
 const float OMEGA_RESPONSE = 0.5;   // relaxation rate toward target
 const float OMEGA_DECAY    = 0.15;  // COAST exponential decay rate
 const float OMEGA_MAX      = 2.0;   // hard clamp
@@ -506,9 +507,21 @@ void main() {
     // ======================================================================
     // Omega evolution: driven-damped relaxation (ACTIVE / FLOW)
     // rho = pressure gradient magnitude from the grid (real local density signal)
+    // coverage = functional bin completeness from colony transport mapping
     // ======================================================================
     {
-        float drive = rho * envelope;
+        // Functional coverage: how many of 8 bins are represented locally.
+        // Maps colony RESRC = (ATP * NTP * AAP * LIP)^0.25 geometric mean.
+        // Missing bins = missing metabolic pathways = starvation even if dense.
+        // 20% floor (0.2 + 0.8*coverage) matches colony's bootstrap-death prevention.
+        float coverage = 1.0;
+        if (cell < 262144u) {
+            uint bp = bin_presence[cell];
+            coverage = float(bitCount(bp)) / 8.0;
+        }
+        float metabolic_gate = 0.2 + 1.3 * coverage;
+
+        float drive = rho * envelope * metabolic_gate;
         float target = OMEGA_BASE + drive * OMEGA_GAIN;
 
         // Relax toward density-determined equilibrium

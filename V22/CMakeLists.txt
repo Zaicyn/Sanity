@@ -35,12 +35,6 @@ file(MAKE_DIRECTORY ${SPV_DIR})
 # Single-variant shaders (compiled once with no defines)
 set(KERNEL_SOURCES
     ${KERNEL_DIR}/siphon.comp
-    ${KERNEL_DIR}/passive.comp
-    ${KERNEL_DIR}/hopfion.comp
-    ${KERNEL_DIR}/gather.comp
-    ${KERNEL_DIR}/spawn.comp
-    ${KERNEL_DIR}/region.comp
-    ${KERNEL_DIR}/accumulator.comp
     ${KERNEL_DIR}/project.comp
     ${KERNEL_DIR}/scatter_reduce.comp
     ${KERNEL_DIR}/stencil.comp
@@ -61,11 +55,8 @@ set(KERNEL_SOURCES
     ${KERNEL_DIR}/scatter_build_index.comp
     ${KERNEL_DIR}/mode_partition.comp
     ${KERNEL_DIR}/siphon_packed.comp
-    ${KERNEL_DIR}/graded_to_packed.comp
     ${KERNEL_DIR}/cyl_scatter.comp
     ${KERNEL_DIR}/cyl_stencil.comp
-    ${KERNEL_DIR}/fourier_scatter.comp
-    ${KERNEL_DIR}/fourier_normalize.comp
     ${KERNEL_DIR}/siphon_forward.comp
     ${KERNEL_DIR}/graded_project.comp
     ${KERNEL_DIR}/fourier_sample.comp
@@ -149,12 +140,12 @@ target_link_libraries(blackhole_v22 PRIVATE v22_core m)
 find_package(glfw3 QUIET)
 if(glfw3_FOUND)
     set(VK_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_instance.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_device.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_swapchain.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_pipeline.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_buffer.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../vulkan/vk_attractor.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_instance.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_device.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_swapchain.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_pipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_buffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan/vk_attractor.cpp
     )
 
     add_executable(blackhole_v22_visual
@@ -165,7 +156,7 @@ if(glfw3_FOUND)
     target_include_directories(blackhole_v22_visual PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/core
-        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/vulkan
     )
     target_link_libraries(blackhole_v22_visual PRIVATE
         v22_core Vulkan::Vulkan glfw m

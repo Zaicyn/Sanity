@@ -24,10 +24,10 @@ static std::vector<char> readShaderFile(const std::string& filename) {
      * be silently ignored at runtime; rooted out during the packing
      * experiment, see memory: feedback_shader_search_order.md */
     std::vector<std::string> paths = {
-        "kernels/", "../kernels/", "../../V21/kernels/",
+        "kernels/", "../kernels/",
         "shaders/compute/", "shaders/",
-        "../../vulkan/shaders/",   /* V20 tone-map SPVs */
-        "../vulkan/shaders/"
+        "../vulkan/shaders/",      /* local tone-map SPVs */
+        "../../vulkan/shaders/"    /* fallback to parent tree */
     };
     for (auto& p : paths) {
         std::ifstream file(p + filename, std::ios::ate | std::ios::binary);
@@ -208,7 +208,9 @@ int queryVramMaxParticles(VkPhysicalDevice pd) {
 
     vkGetPhysicalDeviceMemoryProperties2(pd, &memProps2);
 
-    /* Find the device-local heap with the most free space */
+    /* Find the device-local heap with the most free space.
+     * Fallback: if budget extension returns 0 (headless / no surface),
+     * use 50% of total heap size as a conservative estimate. */
     VkDeviceSize best_free = 0;
     for (uint32_t i = 0; i < memProps2.memoryProperties.memoryHeapCount; i++) {
         if (memProps2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
@@ -217,6 +219,16 @@ int queryVramMaxParticles(VkPhysicalDevice pd) {
             VkDeviceSize heap_free   = (heap_budget > heap_usage) ? (heap_budget - heap_usage) : 0;
             if (heap_free > best_free) best_free = heap_free;
         }
+    }
+    if (best_free == 0) {
+        /* Budget unavailable (headless) — fall back to 50% of total heap */
+        for (uint32_t i = 0; i < memProps2.memoryProperties.memoryHeapCount; i++) {
+            if (memProps2.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                VkDeviceSize heap_sz = memProps2.memoryProperties.memoryHeaps[i].size;
+                if (heap_sz > best_free) best_free = heap_sz;
+            }
+        }
+        best_free /= 4;  /* conservative: grid+pipeline eat ~1GB, half the rest */
     }
 
     /* 80% of free VRAM, ~44 bytes per particle */
@@ -455,7 +467,7 @@ void initPhysicsCompute(PhysicsCompute& phys, VulkanContext& ctx,
      * Layout: [pos_x][pos_y][pos_z][vel_x][vel_y][vel_z][theta][pump_scale][flags]
      *         [r][vel_r][phi][omega_orb]  (graded state for physics diagnostics)
      * 13 arrays × 100K × 4 bytes = 5.2 MB. Stays small even at 80M particles. */
-    int subset_cap = N < ORACLE_SUBSET_SIZE ? N : ORACLE_SUBSET_SIZE;
+    int subset_cap = capacity < ORACLE_SUBSET_SIZE ? capacity : ORACLE_SUBSET_SIZE;
     size_t readback_sz = (size_t)subset_cap * 13 * sizeof(float);
     VkBufferCreateInfo sbi = {};
     sbi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -585,6 +597,12 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     createSSBO(ctx.device, ctx.physicalDevice,
                phys.particleCellBuffer, phys.particleCellMemory, pcell_bytes);
 
+    /* --- Allocate bin_presence buffer (uint[V21_GRID_CELLS]) ---
+     * One uint per cell. scatter writes atomicOr(1 << bin) per particle.
+     * siphon reads bitCount() to get functional coverage. */
+    createSSBO(ctx.device, ctx.physicalDevice,
+               phys.binPresenceBuffer, phys.binPresenceMemory, grid_bytes);
+
     const char* mode_name =
         (phys.scatterMode == SCATTER_MODE_SQUARAGON) ? "squaragon" :
         (phys.scatterMode == SCATTER_MODE_UNIFORM)   ? "uniform"   : "baseline";
@@ -596,9 +614,9 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
            (double)pcell_bytes / (1024.0 * 1024.0),
            mode_name);
 
-    /* --- Descriptor set layout for set 1 (shards + particle_cell) --- */
-    VkDescriptorSetLayoutBinding set1Bindings[2] = {};
-    for (int i = 0; i < 2; i++) {
+    /* --- Descriptor set layout for set 1 (shards + particle_cell + bin_presence) --- */
+    VkDescriptorSetLayoutBinding set1Bindings[3] = {};
+    for (int i = 0; i < 3; i++) {
         set1Bindings[i].binding = i;
         set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         set1Bindings[i].descriptorCount = 1;
@@ -606,7 +624,7 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo set1Info = {};
     set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set1Info.bindingCount = 2;
+    set1Info.bindingCount = 3;
     set1Info.pBindings = set1Bindings;
     vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.scatterSet1Layout);
 
@@ -649,7 +667,7 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     /* --- Descriptor pool + set for set 1 --- */
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 2;
+    poolSize.descriptorCount = 3;
 
     VkDescriptorPoolCreateInfo dpInfo = {};
     dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -665,13 +683,14 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
     dsInfo.pSetLayouts = &phys.scatterSet1Layout;
     vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.scatterSet1);
 
-    /* --- Write descriptors for set 1: shards buffer + particle_cell --- */
-    VkDescriptorBufferInfo bufInfos[2] = {
+    /* --- Write descriptors for set 1: shards + particle_cell + bin_presence --- */
+    VkDescriptorBufferInfo bufInfos[3] = {
         { phys.gridDensityShardsBuffer, 0, VK_WHOLE_SIZE },
         { phys.particleCellBuffer,      0, VK_WHOLE_SIZE },
+        { phys.binPresenceBuffer,       0, VK_WHOLE_SIZE },
     };
-    VkWriteDescriptorSet writes[2] = {};
-    for (int i = 0; i < 2; i++) {
+    VkWriteDescriptorSet writes[3] = {};
+    for (int i = 0; i < 3; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = phys.scatterSet1;
         writes[i].dstBinding = i;
@@ -679,7 +698,7 @@ void initScatterCompute(PhysicsCompute& phys, VulkanContext& ctx) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(ctx.device, 2, writes, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 3, writes, 0, nullptr);
 
     printf("[vk-compute] Scatter compute pipeline created (%s)\n", mode_name);
 }
@@ -889,9 +908,9 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
     printf("[vk-compute] sort_index buffer: %.1f MB\n",
            (float)sortIdx_bytes / (1024 * 1024));
 
-    /* --- Descriptor set layout for set 1: 6 SSBOs --- */
-    VkDescriptorSetLayoutBinding set1Bindings[6] = {};
-    for (int i = 0; i < 6; i++) {
+    /* --- Descriptor set layout for set 1: 7 SSBOs --- */
+    VkDescriptorSetLayoutBinding set1Bindings[7] = {};
+    for (int i = 0; i < 7; i++) {
         set1Bindings[i].binding = i;
         set1Bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         set1Bindings[i].descriptorCount = 1;
@@ -899,14 +918,14 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
     }
     VkDescriptorSetLayoutCreateInfo set1Info = {};
     set1Info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    set1Info.bindingCount = 6;
+    set1Info.bindingCount = 7;
     set1Info.pBindings = set1Bindings;
     vkCreateDescriptorSetLayout(ctx.device, &set1Info, nullptr, &phys.siphonSet1Layout);
 
     /* --- Descriptor pool + set for set 1 --- */
     VkDescriptorPoolSize poolSize = {};
     poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSize.descriptorCount = 6;
+    poolSize.descriptorCount = 7;
 
     VkDescriptorPoolCreateInfo dpInfo = {};
     dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -923,16 +942,17 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
     vkAllocateDescriptorSets(ctx.device, &dsInfo, &phys.siphonSet1);
 
     /* --- Write descriptors for set 1 --- */
-    VkDescriptorBufferInfo bufInfos[6] = {
+    VkDescriptorBufferInfo bufInfos[7] = {
         { phys.particleCellBuffer,      0, VK_WHOLE_SIZE },
         { phys.pressureXBuffer,         0, VK_WHOLE_SIZE },
         { phys.pressureYBuffer,         0, VK_WHOLE_SIZE },
         { phys.pressureZBuffer,         0, VK_WHOLE_SIZE },
         { phys.gridDensityShardsBuffer, 0, (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t) },
         { phys.sortIndexBuffer,         0, VK_WHOLE_SIZE },
+        { phys.binPresenceBuffer,       0, VK_WHOLE_SIZE },
     };
-    VkWriteDescriptorSet writes[6] = {};
-    for (int i = 0; i < 6; i++) {
+    VkWriteDescriptorSet writes[7] = {};
+    for (int i = 0; i < 7; i++) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = phys.siphonSet1;
         writes[i].dstBinding = i;
@@ -940,9 +960,9 @@ void initSiphonSet1(PhysicsCompute& phys, VulkanContext& ctx) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &bufInfos[i];
     }
-    vkUpdateDescriptorSets(ctx.device, 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 7, writes, 0, nullptr);
 
-    printf("[vk-compute] Siphon set 1 (pressure grid + density + sort_index) created — 6 bindings\n");
+    printf("[vk-compute] Siphon set 1 (pressure grid + density + sort_index + bin_presence) created — 7 bindings\n");
 }
 
 /* ========================================================================
@@ -1393,8 +1413,11 @@ void dispatchPhysicsCompute(PhysicsCompute& phys, VkCommandBuffer cmd,
      * The cellOffsetBuffer has exclusive prefix sums for the reorder pass.
      */
 
-    /* Zero shard 0 of the shards buffer — scatter accumulates density here directly. */
+    /* Zero shard 0 of the shards buffer — scatter accumulates density here directly.
+     * Also zero bin_presence — scatter accumulates bin coverage via atomicOr. */
     vkCmdFillBuffer(cmd, phys.gridDensityShardsBuffer, 0,
+                    (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t), 0);
+    vkCmdFillBuffer(cmd, phys.binPresenceBuffer, 0,
                     (VkDeviceSize)V21_GRID_CELLS * sizeof(uint32_t), 0);
     if (phys.countingSortEnabled || phys.cellSortEnabled) {
         vkCmdFillBuffer(cmd, phys.writeCounterBuffer, 0,
@@ -3722,10 +3745,10 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 
     size_t sz = (size_t)count * sizeof(float);
 
-    /* Source bindings: pos(0-2), vel(3-5), theta(12), flags(14).
+    /* Source bindings: pos(0-2), vel(3-5), theta(12), omega_nat(13), flags(14).
      * Binding 7 (pump_scale) and 6 (packed_meta) are stubs — skip them.
      * Flags come from binding 14 directly (uint32, bit 0 = active). */
-    const int src_bindings[8] = {0, 1, 2, 3, 4, 5, 12, 14};
+    const int src_bindings[9] = {0, 1, 2, 3, 4, 5, 12, 13, 14};
 
     VkCommandBuffer cmd;
     VkCommandBufferAllocateInfo cba = {};
@@ -3741,7 +3764,7 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     vkBeginCommandBuffer(cmd, &begin);
 
     size_t offset = 0;
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 9; i++) {
         VkBufferCopy region = {};
         region.srcOffset = 0;
         region.dstOffset = offset;
@@ -3753,7 +3776,7 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
 
     /* Optional graded-state readback for physics diagnostics.
      * Copies r, vel_r, phi, omega_orb from graded_buffers (set 2)
-     * into staging offsets 9*sz..12*sz. */
+     * into staging offsets 10*sz..13*sz. */
     bool do_graded = (out_r && out_vel_r && out_phi && out_omega_orb);
     if (do_graded) {
         const int graded_bindings[4] = {0, 3, 5, 6};  /* r, vel_r, phi, omega_orb */
@@ -3795,21 +3818,22 @@ void readbackForOracle(PhysicsCompute& phys, VulkanContext& ctx,
     memcpy(out_vel_z,      mapped + 5 * sz, sz);
     memcpy(out_theta,      mapped + 6 * sz, sz);
 
-    /* pump_scale is a stub — fill with 1.0 for diagnostics compatibility */
-    for (int i = 0; i < count; i++) out_pump_scale[i] = 1.0f;
+    /* omega_nat from binding 13 (slot 7 in readback) — copy into pump_scale
+     * which is otherwise a stub. This lets the census read omega values. */
+    memcpy(out_pump_scale, mapped + 7 * sz, sz);
 
-    /* Flags from binding 14 (slot 7 in readback), uint32 → uint8 */
-    const uint32_t* flags32 = (const uint32_t*)(mapped + 7 * sz);
+    /* Flags from binding 14 (slot 8 in readback), uint32 → uint8 */
+    const uint32_t* flags32 = (const uint32_t*)(mapped + 8 * sz);
     for (int i = 0; i < count; i++) {
         out_flags[i] = (uint8_t)(flags32[i] & 0xFF);
     }
 
     /* Copy graded-state arrays if requested */
     if (do_graded) {
-        memcpy(out_r,         mapped +  8 * sz, sz);
-        memcpy(out_vel_r,     mapped +  9 * sz, sz);
-        memcpy(out_phi,       mapped + 10 * sz, sz);
-        memcpy(out_omega_orb, mapped + 11 * sz, sz);
+        memcpy(out_r,         mapped +  9 * sz, sz);
+        memcpy(out_vel_r,     mapped + 10 * sz, sz);
+        memcpy(out_phi,       mapped + 11 * sz, sz);
+        memcpy(out_omega_orb, mapped + 12 * sz, sz);
     }
 
     vkFreeCommandBuffers(ctx.device, ctx.commandPool, 1, &cmd);
@@ -4760,6 +4784,8 @@ void cleanupPhysicsCompute(PhysicsCompute& phys, VkDevice device) {
     vkFreeMemory(device, phys.gridDensityShardsMemory, nullptr);
     vkDestroyBuffer(device, phys.particleCellBuffer, nullptr);
     vkFreeMemory(device, phys.particleCellMemory, nullptr);
+    vkDestroyBuffer(device, phys.binPresenceBuffer, nullptr);
+    vkFreeMemory(device, phys.binPresenceMemory, nullptr);
 
     /* Scatter reduce pipeline */
     vkDestroyPipeline(device, phys.scatterReducePipeline, nullptr);

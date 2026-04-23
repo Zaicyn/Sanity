@@ -14,7 +14,7 @@
 #ifndef V21_VK_COMPUTE_H
 #define V21_VK_COMPUTE_H
 
-#include "../vulkan/vk_types.h"
+#include "vulkan/vk_types.h"
 #include <vulkan/vulkan.h>
 
 /* Push constants for siphon.comp */
@@ -213,6 +213,8 @@ struct PhysicsCompute {
     VkDeviceMemory        gridDensityShardsMemory;
     VkBuffer              particleCellBuffer;    /* uint[N] */
     VkDeviceMemory        particleCellMemory;
+    VkBuffer              binPresenceBuffer;     /* uint[V21_GRID_CELLS] — 8-bit functional coverage */
+    VkDeviceMemory        binPresenceMemory;
     VkDescriptorSetLayout scatterSet1Layout;     /* layout for set 1 (shards + particle_cell) */
     VkPipelineLayout      scatterPipelineLayout; /* uses desc set 0 (shared with siphon) + set 1 */
     VkPipeline            scatterPipeline;

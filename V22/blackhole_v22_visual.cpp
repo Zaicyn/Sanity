@@ -23,7 +23,7 @@
 #include <GLFW/glfw3.h>
 
 /* V20 Vulkan infrastructure */
-#include "../vulkan/vk_types.h"
+#include "vulkan/vk_types.h"
 
 /* Forward declarations for V20 Vulkan functions */
 namespace vk {
@@ -54,7 +54,7 @@ namespace vk {
 }
 
 /* V20 globals that the rendering code references */
-#include "../vulkan/vk_attractor.h"
+#include "vulkan/vk_attractor.h"
 AttractorPipeline g_attractor = {};
 
 /* ========================================================================
@@ -112,6 +112,86 @@ extern "C" {
 #include "core/v21_physics_diag.h"
 }
 #include "vk_compute.h"
+
+/* ========================================================================
+ * SHARED READBACK DIAGNOSTICS — called from both visual and headless paths
+ * ======================================================================== */
+
+static void readback_census(const float* rb_px, const float* rb_py, const float* rb_pz,
+                            const uint8_t* rb_flags, const float* rb_omega,
+                            int count, int frame)
+{
+    int n_alive = 0, n_nova = 0, n_crystal = 0, n_ejected = 0;
+    double omega_sum = 0, omega_max = 0;
+    int n_omega = 0;
+    double cx_sum = 0, cy_sum = 0, cz_sum = 0;
+    int n_crystal_valid = 0;  /* crystals with finite positions */
+    for (int i = 0; i < count; i++) {
+        uint8_t f = rb_flags[i];
+        if (f & 0x10) n_nova++;
+        else if (f & 0x08) {
+            n_crystal++;
+            float px = rb_px[i], py = rb_py[i], pz = rb_pz[i];
+            if (std::isfinite(px) && std::isfinite(py) && std::isfinite(pz)) {
+                cx_sum += px; cy_sum += py; cz_sum += pz;
+                n_crystal_valid++;
+            }
+        }
+        else if (f & 0x02) n_ejected++;
+        else if (f & 0x01) {
+            n_alive++;
+            if (rb_omega) {
+                float w = rb_omega[i];
+                if (std::isfinite(w)) {
+                    omega_sum += w;
+                    if (w > omega_max) omega_max = w;
+                    n_omega++;
+                }
+            }
+        }
+    }
+    printf("[death] frame=%d  alive=%d nova=%d crystal=%d ejected=%d (of %d sampled)  unclassified=%d\n",
+           frame, n_alive, n_nova, n_crystal, n_ejected, count,
+           count - n_alive - n_nova - n_crystal - n_ejected);
+    if (n_omega > 0) {
+        printf("[omega] frame=%d  mean=%.6f  max=%.6f  (of %d alive)\n",
+               frame, omega_sum / n_omega, omega_max, n_omega);
+    }
+
+    /* Crystal field: centroid + spatial concentration */
+    if (n_crystal_valid >= 10) {
+        double inv_nc = 1.0 / (double)n_crystal_valid;
+        double cx = cx_sum * inv_nc;
+        double cy = cy_sum * inv_nc;
+        double cz = cz_sum * inv_nc;
+
+        double var_sum = 0;
+        for (int i = 0; i < count; i++) {
+            if (!(rb_flags[i] & 0x08)) continue;
+            float px = rb_px[i], py = rb_py[i], pz = rb_pz[i];
+            if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz)) continue;
+            double dx = px - cx;
+            double dy = py - cy;
+            double dz = pz - cz;
+            var_sum += dx*dx + dy*dy + dz*dz;
+        }
+        double spread = sqrt(var_sum * inv_nc);
+        double crystal_frac = (double)n_crystal / (double)count;
+
+        printf("[crystal-field] frame=%d  n=%d frac=%.4f  centroid=(%.1f,%.1f,%.1f)  spread=%.1f\n",
+               frame, n_crystal, crystal_frac, cx, cy, cz, spread);
+
+        /* Nucleation test: crystal fraction above branch skew of mean,
+         * AND spatially concentrated (spread < half the domain radius).
+         * SQ2_BRANCH_SKEW = 3.0 → nucleation when crystal density is
+         * 3x what uniform distribution would predict. */
+        double expected_frac = 1.0 / 32.0;
+        if (crystal_frac > expected_frac * 3.0 && spread < 50.0) {
+            printf("[nucleation] frame=%d  CANDIDATE at (%.1f,%.1f,%.1f)  frac=%.4f  spread=%.1f\n",
+                   frame, cx, cy, cz, crystal_frac, spread);
+        }
+    }
+}
 
 /* ========================================================================
  * SIMULATION PARAMETERS
@@ -1668,6 +1748,7 @@ int main(int argc, char** argv) {
     bool  use_forward = false;  /* use forward-pass siphon (V8-style double buffer) */
     int   render_mode = 0; /* 0=all, 1=alive only, 2=nova only, 3=crystal only */
     bool  no_spawn   = false;  /* disable CPU spawn — fixed particle count for benchmarking */
+    bool  seed_shell = false;  /* init with cuboctahedral first shell instead of random */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i+1 < argc)
@@ -1737,6 +1818,9 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--no-spawn") == 0) {
             no_spawn = true;
         }
+        else if (strcmp(argv[i], "--seed-shell") == 0) {
+            seed_shell = true;
+        }
         else if (strcmp(argv[i], "--benchmark") == 0) {
             headless = true;
             benchmark = true;
@@ -1782,6 +1866,50 @@ int main(int argc, char** argv) {
     ParticleState particles;
     init_particles(particles, num_particles, seed, INIT_SORT_VIVIANI, n_galaxy, growth_capacity);
 
+    /* Cuboctahedral first shell — place 12 seeds at coherence node positions.
+     * Overwrite the first min(N, 12) particles with structured core.
+     * Scale = 50 (reference radius for omega_nat init).
+     * Each vertex gets a unique ring position spanning all 8 bins. */
+    if (seed_shell) {
+        static const float CUBOCT[12][3] = {
+            { 0.7071f,  0.7071f,  0.0f},  { 0.7071f, -0.7071f,  0.0f},
+            {-0.7071f,  0.7071f,  0.0f},  {-0.7071f, -0.7071f,  0.0f},
+            { 0.7071f,  0.0f,  0.7071f},  { 0.7071f,  0.0f, -0.7071f},
+            {-0.7071f,  0.0f,  0.7071f},  {-0.7071f,  0.0f, -0.7071f},
+            { 0.0f,  0.7071f,  0.7071f},  { 0.0f,  0.7071f, -0.7071f},
+            { 0.0f, -0.7071f,  0.7071f},  { 0.0f, -0.7071f, -0.7071f},
+        };
+        const float SHELL_R = 50.0f;
+        int n_shell = (particles.N < 12) ? particles.N : 12;
+        for (int i = 0; i < n_shell; i++) {
+            float px = CUBOCT[i][0] * SHELL_R;
+            float py = CUBOCT[i][1] * SHELL_R;
+            float pz = CUBOCT[i][2] * SHELL_R;
+            particles.pos_x[i] = px;
+            particles.pos_y[i] = py;
+            particles.pos_z[i] = pz;
+
+            /* Theta: distribute across ring — vertex i gets ring position i*32/12,
+             * ensuring all 8 bins are covered by the 12 vertices. */
+            float theta_i = (float)i * (6.28318530718f / 12.0f);
+            int gen = (int)(theta_i * (32.0f / 6.28318530718f)) & 31;
+            particles.theta[i] = theta_i;
+
+            /* Velocity: Keplerian circular orbit at SHELL_R */
+            float r_xz = sqrtf(px*px + pz*pz);
+            float v_circ = sqrtf(BH_MASS / fmaxf(r_xz, 1.0f));
+            particles.vel_x[i] = CPU_TANGENT[gen][0] * v_circ;
+            particles.vel_y[i] = CPU_TANGENT[gen][1] * v_circ;
+            particles.vel_z[i] = CPU_TANGENT[gen][2] * v_circ;
+
+            /* Omega: Keplerian at r=50 → 0.1 * (50/50)^1.5 = 0.1 */
+            particles.omega_nat[i] = 0.1f;
+            particles.flags[i] = 0x01;
+            particles.pump_scale[i] = 1.0f;
+        }
+        printf("[init] Cuboctahedral first shell: %d vertices at r=%.0f\n", n_shell, SHELL_R);
+    }
+
     /* Fill the trailing lattice slots (if enabled) before the GPU upload. */
     ConstraintLattice lattice = {};
     if (rigid_body_mode == RIGID_BODY_CUBE1000) {
@@ -1817,6 +1945,34 @@ int main(int argc, char** argv) {
         if (use_gpu_physics) {
             gpu_ok = initHeadlessVulkan(headlessCtx);
             if (gpu_ok) {
+                /* Query VRAM and grow CPU arrays — same as visual path */
+                int vram_cap = queryVramMaxParticles(headlessCtx.physicalDevice);
+                if (vram_cap > growth_capacity) growth_capacity = vram_cap;
+                if (growth_capacity < num_particles) growth_capacity = num_particles;
+                if (growth_capacity > particles.capacity) {
+                    auto grow_f = [&](float*& arr, int old_n) {
+                        float* tmp = (float*)calloc(growth_capacity, sizeof(float));
+                        memcpy(tmp, arr, (size_t)old_n * sizeof(float));
+                        free(arr); arr = tmp;
+                    };
+                    auto grow_u8 = [&](uint8_t*& arr, int old_n) {
+                        uint8_t* tmp = (uint8_t*)calloc(growth_capacity, sizeof(uint8_t));
+                        memcpy(tmp, arr, (size_t)old_n * sizeof(uint8_t));
+                        free(arr); arr = tmp;
+                    };
+                    int n = particles.N;
+                    grow_f(particles.pos_x, n); grow_f(particles.pos_y, n); grow_f(particles.pos_z, n);
+                    grow_f(particles.vel_x, n); grow_f(particles.vel_y, n); grow_f(particles.vel_z, n);
+                    grow_f(particles.pump_scale, n); grow_f(particles.pump_residual, n);
+                    grow_f(particles.pump_history, n);
+                    particles.pump_state = (int*)realloc(particles.pump_state, (size_t)growth_capacity * sizeof(int));
+                    grow_f(particles.theta, n); grow_f(particles.omega_nat, n);
+                    grow_u8(particles.flags, n); grow_u8(particles.topo_state, n);
+                    particles.capacity = growth_capacity;
+                    printf("[headless] Growth capacity: %d particles (%.1f MB VRAM)\n",
+                           growth_capacity, (float)growth_capacity * 16 * sizeof(float) / (1024*1024));
+                }
+
                 headlessCtx.particleCount = num_particles;
                 gpuPhys.headlessMode = false;  /* TODO: headless siphon variant segfaults — investigate */
                 try {
@@ -1873,7 +2029,9 @@ int main(int argc, char** argv) {
                max_frames, num_particles, gpu_ok ? "GPU" : "CPU");
         fflush(stdout);
 
-        /* Oracle readback buffers (GPU path) */
+        /* Oracle readback buffers (GPU path).
+         * Allocate at capacity (not initial N) so spawn growth doesn't overflow. */
+        int oracle_max = (particles.capacity < ORACLE_SUBSET_SIZE) ? particles.capacity : ORACLE_SUBSET_SIZE;
         int oracle_count = (num_particles < ORACLE_SUBSET_SIZE) ? num_particles : ORACLE_SUBSET_SIZE;
         float *rb_px=NULL, *rb_py=NULL, *rb_pz=NULL;
         float *rb_vx=NULL, *rb_vy=NULL, *rb_vz=NULL;
@@ -1881,11 +2039,11 @@ int main(int argc, char** argv) {
         uint8_t *rb_flags=NULL;
         float *rb_r=NULL, *rb_vel_r=NULL, *rb_phi=NULL, *rb_omega_orb=NULL;
         if (gpu_ok) {
-            size_t bf = oracle_count * sizeof(float);
+            size_t bf = oracle_max * sizeof(float);
             rb_px = (float*)malloc(bf); rb_py = (float*)malloc(bf); rb_pz = (float*)malloc(bf);
             rb_vx = (float*)malloc(bf); rb_vy = (float*)malloc(bf); rb_vz = (float*)malloc(bf);
             rb_theta_rb = (float*)malloc(bf); rb_scale = (float*)malloc(bf);
-            rb_flags = (uint8_t*)malloc(oracle_count);
+            rb_flags = (uint8_t*)malloc(oracle_max);
             rb_r = (float*)malloc(bf); rb_vel_r = (float*)malloc(bf);
             rb_phi = (float*)malloc(bf); rb_omega_orb = (float*)malloc(bf);
         }
@@ -1970,6 +2128,19 @@ int main(int argc, char** argv) {
             }
             sim_time += dt;
 
+            /* CPU-side spawn: energy well growth, every 100 frames */
+            if (gpu_ok && !no_spawn && frame > 0 && frame % 100 == 0) {
+                int spawned = spawn_step(particles, gpuPhys, headlessCtx);
+                if (spawned > 0) {
+                    printf("[spawn] frame=%d  N=%d (+%d)  capacity=%d\n",
+                           frame, particles.N, spawned, particles.capacity);
+                    headlessCtx.particleCount = particles.N;
+                    /* Update oracle_count if population grew past it */
+                    int new_oc = (particles.N < ORACLE_SUBSET_SIZE) ? particles.N : ORACLE_SUBSET_SIZE;
+                    if (new_oc != oracle_count) oracle_count = new_oc;
+                }
+            }
+
             /* Oracle — CPU direct or GPU readback every 500 frames */
             if (!gpu_ok) {
                 v21_oracle_check(&oracle,
@@ -1990,6 +2161,8 @@ int main(int argc, char** argv) {
                     rb_theta_rb, rb_scale, rb_flags,
                     particles.topo_state,
                     oracle_count, frame);
+
+                readback_census(rb_px, rb_py, rb_pz, rb_flags, rb_scale, oracle_count, frame);
 
                 /* Inline diagnostics: velocity dispersion + radial stats */
                 {
@@ -2867,17 +3040,7 @@ int main(int argc, char** argv) {
                     if (s >= 0 && s < 8) state_hist[s]++;
                 }
 
-                /* Death state census from flags */
-                int n_alive = 0, n_nova = 0, n_crystal = 0, n_ejected = 0;
-                for (int i = 0; i < oracle_count; i++) {
-                    uint8_t f = rb_flags[i];
-                    if (f & 0x10) n_nova++;
-                    else if (f & 0x08) n_crystal++;
-                    else if (f & 0x02) n_ejected++;
-                    else if (f & 0x01) n_alive++;
-                }
-                printf("[death] frame=%d  alive=%d nova=%d crystal=%d ejected=%d (of %d sampled)\n",
-                       readback_frame, n_alive, n_nova, n_crystal, n_ejected, oracle_count);
+                readback_census(rb_px, rb_py, rb_pz, rb_flags, rb_scale, oracle_count, readback_frame);
 
                 /* Physics diagnostics */
                 v21_physics_diag_compute(&phys_diag,
